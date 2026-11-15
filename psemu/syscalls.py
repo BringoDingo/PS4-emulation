@@ -1,0 +1,1366 @@
+"""FreeBSD / ORBIS syscall layer.
+
+The PS4 kernel ABI is FreeBSD 9-ish with Sony extensions. User code invokes it
+with the `syscall` instruction:
+
+    rax = syscall number
+    args: rdi, rsi, rdx, r10, r8, r9   (note r10, not rcx: syscall clobbers rcx)
+    return value in rax, carry flag set on error (errno in rax)
+
+This module provides a number->name table and a handful of real handlers
+(write, exit, and friends). Everything else is stubbed: logged and returned as
+success(0) or ENOSYS, so the module keeps running and we learn what it needs.
+"""
+from unicorn.x86_const import (
+    UC_X86_REG_RAX, UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX,
+    UC_X86_REG_R10, UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_RFLAGS,
+)
+
+# --- errno values we care about -------------------------------------------
+EPERM = 1
+ENOENT = 2
+EBADF = 9
+ENOMEM = 12
+EACCES = 13
+EFAULT = 14
+EINVAL = 22
+ENOSYS = 78
+
+# IPMI result codes. NOT_EXIST: the client exists but its service process is not
+# emulated, so a method call cannot be answered. NO_PACKET: the receive pump
+# found no packet pending (the kernel's "would block" for a receive).
+IPMI_METHOD_NOT_EXIST = 0x80020003
+IPMI_NO_PACKET = 0x80020004
+IPMI_TIMED_OUT = 0x8002003C        # ETIMEDOUT: an event-flag wait ran out
+IPMI_EVF_NOT_SET = 0x80020010      # EBUSY: polled event flag pattern not set
+
+# --- a partial FreeBSD syscall table (numbers that commonly show up) ------
+# Full table: FreeBSD sys/kern/syscalls.master. Sony renumbers some and adds
+# sce-specific ones in the 500+ range; those are logged by number.
+SYSCALLS = {
+    0: "syscall", 1: "exit", 2: "fork", 3: "read", 4: "write", 5: "open",
+    6: "close", 9: "dup", 59: "execve", 90: "dup2",
+    20: "getpid", 23: "setuid", 24: "getuid", 33: "access",
+    34: "chflags", 37: "kill", 39: "getppid", 41: "dup", 42: "pipe",
+    54: "ioctl", 58: "readlink", 362: "kqueue", 363: "kevent",
+    73: "munmap", 74: "mprotect",
+    75: "madvise", 97: "socket", 98: "connect", 105: "setsockopt",
+    118: "getsockopt", 202: "sysctl", 232: "clock_gettime",
+    253: "issetugid", 272: "getdents", 324: "mlockall", 325: "munlockall",
+    340: "sigprocmask", 416: "sigaction", 417: "sigreturn",
+    431: "thr_exit", 432: "thr_self", 433: "thr_set_name", 165: "sysarch",
+    454: "_umtx_op", 477: "mmap", 478: "lseek",
+    # Sony / ORBIS specific (names best-effort; numbers vary by firmware)
+    532: "regmgr_call", 572: "virtual_query", 533: "rtprio_thread", 557: "namedobj_create",
+    587: "get_authinfo", 599: "mdbg_service", 603: "rdup",
+}
+
+
+from .sys_dynlib import DYNLIB_SYSCALLS, DynlibSyscalls
+from .devices import DceDevice, DmemDevice, open_device
+from .sys_sync import SYNC_SYSCALLS, SyncSyscalls
+
+import struct as _struct
+
+# sysctls looked up by name (sysctl.name2oid). Values as the PS4 kernel
+# (FreeBSD 9 based, 8 CPU cores) reports them.
+NAMED_SYSCTLS = {
+    "kern.sched.cpusetsize": _struct.pack("<i", 8),     # sizeof(cpuset_t)
+    "kern.smp.cpus": _struct.pack("<i", 8),
+    "hw.ncpu": _struct.pack("<i", 8),
+    "machdep.tsc_freq": _struct.pack("<Q", 1_600_000_000),   # Jaguar @ 1.6 GHz
+    "kern.sdk_version": _struct.pack("<I", 0x05050001),      # system software 5.05
+}
+
+SYSCALLS.update(DYNLIB_SYSCALLS)
+SYSCALLS.update(SYNC_SYSCALLS)
+
+# Names for every other syscall libkernel makes, from the table decoded out of
+# libkernel.sprx / libkernel_sys.sprx (D:\Ps4Tools\ps4kernel\analysis\syscalls.csv;
+# override with PSEMU_SYSCALLS_CSV). Only fills numbers psemu has no name for,
+# so handler lookup (sys_<name>) is unchanged; unnamed Sony calls are labelled
+# with the libkernel function that issues them, e.g. "(sceKernelSetEventFlag)".
+SYSCALLS_CSV = r"D:\Ps4Tools\ps4kernel\analysis\syscalls.csv"
+
+# Calls that wait on a real kernel. They don't count as progress for the
+# idle-event-loop detector, and the plain waits hand the CPU to another
+# runnable thread (kevent and _umtx_op decide that themselves).
+WAIT_SYSCALLS = {240, 331, 363, 454, 542, 553}   # nanosleep, sched_yield, kevent,
+#                                                  _umtx_op, WaitEventFlag, WaitSema
+YIELD_SYSCALLS = {331}               # the other waits block on their own
+
+
+def _load_syscall_names():
+    import csv
+    import os
+    path = os.environ.get("PSEMU_SYSCALLS_CSV", SYSCALLS_CSV)
+    if not os.path.isfile(path):
+        return 0
+    added = 0
+    with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+        for row in csv.DictReader(fh):
+            try:
+                num = int(row.get("number", ""))
+            except ValueError:
+                continue
+            if num in SYSCALLS:
+                continue
+            exported = (row.get("ps4_exported_names") or "").split()
+            fb = (row.get("freebsd9_name") or "").strip()
+            if fb.startswith("sys_"):
+                fb = fb[4:]
+            if fb and (row.get("freebsd9_status") or "").strip() == "STD":
+                name = fb
+            elif exported:
+                name = exported[0].lstrip("_")
+                name = name[4:] if name.startswith("sys_") else name
+            else:
+                callers = (row.get("called_by") or "").split()
+                name = f"({callers[0]})" if callers else ""
+            if name:
+                SYSCALLS[num] = name
+                added += 1
+    return added
+
+
+_load_syscall_names()
+
+
+class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
+    def __init__(self, emu):
+        self.emu = emu            # back-reference for memory + stdout + stop
+        self.counts = {}          # number -> times called
+        self.trace = emu.trace
+        # Sony kernel-object model: hand out unique ids for created objects.
+        self._next_handle = 0x100
+        self._next_pid = 1001                 # children of rfork(RFPROC|RFMEM)
+        self.objects = {}         # handle -> dict(kind, name, ...)
+        # File-descriptor table: 0,1,2 are std streams; dup/open hand out the
+        # lowest free fd, which is what the module's fd-setup code expects.
+        self.fds = {0: "stdin", 1: "stdout", 2: "stderr"}
+        self.kqueues = set()
+        self.devs = {}            # fd -> devices.Device (/dev/gc, /dev/dce, ...)
+        self.files = {}           # fd -> {"data": bytes, "pos": int} for real firmware files
+        self.shms = {}            # fd -> shared-memory object (shm_open)
+        self.shm_objs = {}        # name -> {"name", "size", "addr"} POSIX shm objects
+        self.vmas = []            # mmapped ranges (see _add_vma), for virtual_query
+        self.knotes = {}          # kq fd -> {(ident, filter): knote dict}
+        self.kq_pending = {}      # kq fd -> [(ident, filter)] triggered, not yet returned
+        self._kq_wait_logged = set()
+        self._ioctl_seen = set()  # (fd, req) of unmodelled ioctls already logged
+        self._idle_waits = 0      # consecutive empty event-waits (idle detect)
+        self.idle_limit = 512
+
+    def _alloc_fd(self, desc="", base=3):
+        # The real kernel hands mini-syscore a process with more than 0/1/2
+        # open, so `open()` of a device lands at a high fd and leaves 3,4,5…
+        # free for the module's rdup/dup bring-up (which expects exactly those).
+        fd = base
+        while fd in self.fds:
+            fd += 1
+        self.fds[fd] = desc or f"fd{fd}"
+        return fd
+
+    def _new_handle(self, kind, name=""):
+        h = self._next_handle
+        self._next_handle += 1
+        self.objects[h] = {"kind": kind, "name": name}
+        return h
+
+    def _read_cstr(self, uc, ptr, maxlen=64):
+        if not ptr:
+            return ""
+        try:
+            raw = bytes(uc.mem_read(ptr, maxlen))
+        except Exception:
+            return ""
+        end = raw.find(b"\x00")
+        return raw[:end if end >= 0 else maxlen].decode("latin1", "replace")
+
+    def _args(self, uc):
+        return (
+            uc.reg_read(UC_X86_REG_RDI),
+            uc.reg_read(UC_X86_REG_RSI),
+            uc.reg_read(UC_X86_REG_RDX),
+            uc.reg_read(UC_X86_REG_R10),
+            uc.reg_read(UC_X86_REG_R8),
+            uc.reg_read(UC_X86_REG_R9),
+        )
+
+    def _ret(self, uc, value, error=False):
+        uc.reg_write(UC_X86_REG_RAX, value & 0xFFFFFFFFFFFFFFFF)
+        fl = uc.reg_read(UC_X86_REG_RFLAGS)
+        if error:
+            fl |= 1          # set carry = error, FreeBSD convention
+        else:
+            fl &= ~1
+        uc.reg_write(UC_X86_REG_RFLAGS, fl)
+
+    # ---- the hook Unicorn calls on every `syscall` instruction ----------
+    def dispatch(self, uc, user_data=None):
+        num = uc.reg_read(UC_X86_REG_RAX)
+        name = SYSCALLS.get(num, f"sys_{num}")
+        self.counts[num] = self.counts.get(num, 0) + 1
+        if num not in WAIT_SYSCALLS:  # real progress (not another wait) resets idle detection
+            self._idle_waits = 0
+        handler = getattr(self, f"sys_{name}", None)
+
+        if handler is None:
+            handler = getattr(self, "sys_" + SYSCALLS.get(num, ""), None)
+
+        if self.trace or handler is None:
+            a = self._args(uc)
+            self.emu.log(f"  [syscall {num:>3} {name}] "
+                         f"args=({a[0]:#x}, {a[1]:#x}, {a[2]:#x}, "
+                         f"{a[3]:#x}, {a[4]:#x}, {a[5]:#x})")
+
+        if handler is not None:
+            handler(uc)
+        else:
+            # unknown/unimplemented: pretend success so we keep moving
+            self._ret(uc, 0)
+        if num in YIELD_SYSCALLS:
+            self.yield_cpu()
+
+    # ---- threads ------------------------------------------------------
+    def yield_cpu(self):
+        """A call that only gives up the CPU (sched_yield, polls that would
+        spin): let another runnable thread run."""
+        sched = self.emu.sched
+        if sched is not None and any(t.state == "ready" for t in sched.threads.values()):
+            sched.request_switch()
+
+    # ---- real-ish handlers ---------------------------------------------
+    def sys_exit(self, uc):
+        code = self._args(uc)[0]
+        signed = code - 0x100000000 if code >= 0x80000000 else code
+        self.emu.log(f"  [exit] code={code} ({signed})")
+        self.emu.stop(f"module called exit({signed})")
+
+    def sys_thr_exit(self, uc):
+        # thr_exit(long *state): the kernel stores 1 to *state and wakes
+        # umtx waiters on it (pthread_join waits there), then the thread ends.
+        import struct
+        state = self._args(uc)[0]
+        sched = self.emu.sched
+        t = sched.current if sched else None
+        if state:
+            try:
+                uc.mem_write(state, struct.pack("<q", 1))
+            except Exception:
+                pass
+            self.umtx_wake(state, 1 << 30)
+        self.emu.log(f"  [thr_exit] thread {t.tid if t else 0:#x}")
+        if sched is None or not sched.multi:
+            self.emu.stop("last thread called thr_exit")
+            return
+        sched.exit_current()
+
+    def sys_thr_new(self, uc):
+        # thr_new(struct thr_param *param, int size) - amd64 FreeBSD 9:
+        #   0 start_func  8 arg  0x10 stack_base  0x18 stack_size  0x20 tls_base
+        #   0x28 tls_size  0x30 long *child_tid  0x38 long *parent_tid
+        #   0x40 int flags  0x48 struct rtprio *rtp
+        import struct
+        param, size = self._args(uc)[:2]
+        try:
+            raw = bytes(uc.mem_read(param, 0x50))
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        start, arg, stack_base, stack_size, tls_base, _tls_size, ctid, ptid = \
+            struct.unpack_from("<8Q", raw, 0)
+        sched = self.emu.sched
+        dyn = getattr(self.emu, "dyn", None)
+        lm = dyn.module_at(start) if dyn else None
+        t = sched.spawn(start, arg, stack_base + stack_size, tls_base,
+                        name=f"{lm.name}+{start - lm.base:#x}" if lm else "")
+        for p in (ctid, ptid):
+            if p:
+                try:
+                    uc.mem_write(p, struct.pack("<q", t.tid))
+                except Exception:
+                    pass
+        self.emu.log(f"  [thr_new] thread {t.tid:#x} at {start:#x} ({t.name}) "
+                     f"stack {stack_base:#x}+{stack_size:#x} tls {tls_base:#x}")
+        self._ret(uc, 0)
+
+    def sys_rfork(self, uc):
+        # rfork(flags). RFPROC|RFMEM (vfork-style, what sceKernelSpawn and
+        # rfork_thread use) makes a child that shares memory: psemu runs it as
+        # another thread, so the parent keeps going too (it may signal the
+        # child, as mini-syscore's spawn semaphore does). A child that execve()s
+        # replaces the whole image, as psemu runs one process.
+        # FreeBSD returns rax = pid, rdx = 0 in the parent; rdx = 1 in the child.
+        from unicorn.x86_const import UC_X86_REG_RAX, UC_X86_REG_RDX, UC_X86_REG_RFLAGS, UC_X86_REG_RIP
+        RFPROC, RFMEM = 0x10, 0x20
+        flags = self._args(uc)[0] & 0xFFFFFFFF
+        if not flags & RFPROC:                 # resource-sharing changes only
+            return self._ret(uc, 0)
+        sched = self.emu.sched
+        if not flags & RFMEM or sched is None:
+            # a separate address space isn't modelled: continue as the child
+            self.emu.log(f"  [rfork] flags={flags:#x}: no RFMEM - continuing as the child")
+            uc.reg_write(UC_X86_REG_RDX, 1)
+            return self._ret(uc, self.PID)
+        pid = self._next_pid
+        self._next_pid += 1
+        rip = uc.reg_read(UC_X86_REG_RIP) + 2          # past the syscall instruction
+        fl = uc.reg_read(UC_X86_REG_RFLAGS) & ~1
+        t = sched.fork_current(rip, {UC_X86_REG_RAX: self.PID, UC_X86_REG_RDX: 1,
+                                     UC_X86_REG_RFLAGS: fl}, name=f"pid{pid}")
+        self.emu.log(f"  [rfork] flags={flags:#x} -> child pid {pid} (thread {t.tid:#x}, "
+                     f"shares memory)")
+        uc.reg_write(UC_X86_REG_RDX, 0)
+        self._ret(uc, pid)
+
+    def sys_write(self, uc):
+        fd, buf, n, *_ = self._args(uc)
+        try:
+            data = uc.mem_read(buf, n) if n else b""
+        except Exception:
+            self._ret(uc, EBADF, error=True)
+            return
+        raw = bytes(data)
+        if fd > 2 and n > 160:
+            # binary device writes (notifications...): show the readable part
+            words = [w for w in raw.replace(b"\n", b" ").split(b"\x00") if len(w) >= 4]
+            text = (" | ".join(w.decode("latin1", "replace") for w in words))[:200]
+            self.emu.log(f"  [write fd={fd} len={n}] (binary) {text!r}")
+        else:
+            text = raw.decode("latin1", "replace")
+            self.emu.log(f"  [write fd={fd} len={n}] {text!r}")
+        self._ret(uc, n)
+
+    def sys_read(self, uc):
+        fd, buf, n, *_ = self._args(uc)
+        fd &= 0xFFFFFFFF
+        dev = self.devs.get(fd)
+        if dev is not None:
+            try:
+                rv = dev.read(uc, buf, n)
+            except Exception as e:
+                self.emu.log(f"  [read] {dev.path}: {e} -> EINVAL")
+                return self._ret(uc, EINVAL, error=True)
+            if rv is not None and rv < 0:
+                return self._ret(uc, -rv, error=True)   # e.g. EAGAIN: no data pending
+            return self._ret(uc, rv or 0)
+        f = self.files.get(fd)
+        if f is not None:
+            chunk = f["data"][f["pos"]:f["pos"] + (n & 0xFFFFFFFF)]
+            try:
+                if chunk:
+                    uc.mem_write(buf, chunk)
+            except Exception:
+                return self._ret(uc, EFAULT, error=True)
+            f["pos"] += len(chunk)
+            return self._ret(uc, len(chunk))
+        # no real input source yet -> EOF
+        self._ret(uc, 0)
+
+    _ipmi_kid = 0x100           # next IPMI client/session handle to hand out
+    IPMI_CREATE_SERVER = 0x0    # ipmimgr_call cmd: this process hosts a service
+    IPMI_CREATE_CLIENT = 0x2    # ipmimgr_call cmd: create a client for a service
+    IPMI_CONNECT = 0x400        # ipmimgr_call cmd: client connects to its service
+    IPMI_DISCONNECT = 0x310     # ipmimgr_call cmd: client drops its session
+    IPMI_INVOKE_SYNC = 0x320    # ipmimgr_call cmd: client invokes a sync method
+    IPMI_WAIT_EVF = 0x490       # ipmimgr_call cmd: client waits on a service event flag
+    IPMI_POLL_EVF = 0x491       # ipmimgr_call cmd: client polls a service event flag
+    IPMI_RECEIVE = 0x201        # ipmimgr_call cmd: receive-pump reads the next packet
+
+    def _ipmi_service_name(self, uc, in_ptr, size):
+        import struct
+        if not in_ptr:
+            return ""
+        try:
+            for off in range(8, min(size, 0x18), 8):
+                v = struct.unpack("<Q", bytes(uc.mem_read(in_ptr + off, 8)))[0]
+                if 0x10000 < v < 0x7FFFFFFFFFFF:
+                    s = self._read_cstr(uc, v, 48)
+                    if s and s.isprintable() and s[:3] == "Sce":
+                        return s
+        except Exception:
+            pass
+        return ""
+
+    # Response-delivery framework for IPMI sync methods (cmd 0x320).
+    #
+    # libSceIpmi's invokeSyncMethod(method, in[], numIn, out[], numOut, *result,
+    # flags) passes the kernel this struct:
+    #   {u32 method@0; u32 numIn@4; u32 numOut@8; u64 *inInfo@0x10;
+    #    u64 *outInfo@0x18; u64 *methodResult@0x20; u32 flags@0x28}
+    # with inInfo/outInfo arrays of {u64 data; u64 size} (out entries carry a
+    # third u64: the size actually returned). The method's own return value is
+    # stored through *methodResult; the syscall result is the transport status.
+    #
+    # Nothing answers these calls yet when the service is hosted by a process
+    # psemu does not run (or by this program's own server threads - the
+    # request/response loopback is not implemented). Until a method is modelled
+    # in IPMI_METHODS it gets an EMPTY SUCCESS: method result 0, out buffers
+    # zeroed, returned sizes 0. That reads as "nothing to report", which is
+    # what most init-time query/notify methods need to proceed.
+    #
+    # IPMI_METHODS maps (service, method) -> name of a handler method
+    # handler(uc, call) returning the method result;
+    # call = {"in": [(ptr, size)], "out": [(ptr, size, info)]}.
+    IPMI_METHODS = {
+        ("SceSysCoreApp", 0xAA110002): "_ipmi_syscore_app_info",
+        ("SceSysCoreApp2", 0xAA120009): "_ipmi_syscore_my_app_id",
+    }
+
+    def _ipmi_syscore_my_app_id(self, uc, call):
+        """SceSysCoreApp2 0xAA120009: out[0] = u32 app id of the calling
+        process. Launch Control registers its own app entry under this id
+        (SceLncUtilAppStatus%08x ...), and later looks the shell up by the id
+        the kernel's AppInfo reports - the two must agree."""
+        import struct
+        if call["out"]:
+            self._ipmi_out(uc, call, 0, struct.pack("<I", self.APP_ID))
+        return 0
+
+    def _ipmi_out(self, uc, call, i, data):
+        """Store `data` as out-argument i of a sync method (and its size)."""
+        import struct
+        d, cap, info = call["out"][i]
+        data = bytes(data)[:cap]
+        uc.mem_write(d, data)
+        uc.mem_write(info + 16, struct.pack("<Q", len(data)))
+
+    def _ipmi_syscore_app_info(self, uc, call):
+        """SceSysCoreApp 0xAA110002: app info for an app id. in[0] = u32 app
+        id, out[0] = the kernel's 0x48-byte AppInfo (app id first). SceSysCore
+        tracks every launched app; Launch Control asks it about its own
+        process at start-up (waitUntilAppFound) and gives up - taking PSN
+        core init down with it - if the app is unknown. We report the asked
+        app as a plain running system process."""
+        import struct
+        app_id = self.APP_ID
+        if call["in"] and call["in"][0][1] >= 4:
+            app_id = struct.unpack("<I", bytes(uc.mem_read(call["in"][0][0], 4)))[0]
+        if not call["out"]:
+            return 0
+        info = bytearray(call["out"][0][1])
+        struct.pack_into("<I", info, 0, app_id)
+        self._ipmi_out(uc, call, 0, info)
+        self.emu.log(f"  [ipmi] SceSysCoreApp app info for app {app_id:#x}")
+        return 0
+
+    def _ipmi_invoke(self, uc, name, in_ptr, size):
+        import struct
+        try:
+            a = bytes(uc.mem_read(in_ptr, 0x30))
+        except Exception:
+            return IPMI_METHOD_NOT_EXIST
+        method, n_in, n_out = struct.unpack_from("<III", a, 0)
+        p_in, p_out, p_res = struct.unpack_from("<QQQ", a, 0x10)
+        n_in, n_out = min(n_in, 16), min(n_out, 16)
+        call = {"in": [], "out": []}
+        try:
+            for i in range(n_in):
+                d, sz = struct.unpack("<QQ", bytes(uc.mem_read(p_in + i * 16, 16)))
+                call["in"].append((d, sz))
+            for i in range(n_out):
+                info = p_out + i * 24
+                d, sz = struct.unpack("<QQ", bytes(uc.mem_read(info, 16)))
+                call["out"].append((d, sz, info))
+        except Exception:
+            pass
+        handler = self.IPMI_METHODS.get((name, method))
+        if handler is not None:
+            try:
+                res = getattr(self, handler)(uc, call)
+            except Exception as e:
+                self.emu.log(f"  [ipmi] {name}.method{method:#x} handler failed: {e}")
+                res = IPMI_METHOD_NOT_EXIST
+        else:
+            res = 0
+            for d, sz, info in call["out"]:
+                try:
+                    if d and 0 < sz <= 0x10000:
+                        uc.mem_write(d, bytes(sz))
+                    uc.mem_write(info + 16, struct.pack("<Q", 0))   # bytes returned
+                except Exception:
+                    pass
+        try:
+            if p_res:
+                uc.mem_write(p_res, struct.pack("<I", res & 0xFFFFFFFF))
+        except Exception:
+            pass
+        mc = self.__dict__.setdefault("_ipmi_method_counts", {})
+        mc[(name, method)] = mc.get((name, method), 0) + 1
+        seen = self.__dict__.setdefault("_ipmi_methods_seen", set())
+        if (name, method) not in seen:
+            seen.add((name, method))
+            self.emu.log(f"  [ipmi] invoke {name}.method{method:#x} "
+                         f"in={[sz for _, sz in call['in']]} "
+                         f"out={[sz for _, sz, _ in call['out']]} -> "
+                         + ("modelled" if handler else "empty success"))
+        return 0
+
+    def _ipmi_wait_evf(self, uc, kid, name, result_ptr, in_ptr):
+        """Client waitEventFlag: {u32 index@0; u64 pattern@8; u32 mode@0x10;
+        u64 *result@0x18; u32 *timeout_us@0x20}. Nothing sets these service
+        event flags yet, so the wait runs out: the thread sleeps for the
+        timeout on the virtual clock and gets ETIMEDOUT (or parks forever when
+        no timeout was given), exactly as against an idle service."""
+        import struct
+        timeout_us = None
+        p_to = 0
+        try:
+            p_to = struct.unpack("<Q", bytes(uc.mem_read(in_ptr + 0x20, 8)))[0]
+            if p_to:
+                timeout_us = struct.unpack("<I", bytes(uc.mem_read(p_to, 4)))[0]
+        except Exception:
+            pass
+        sched = self.emu.sched
+        if sched is None or getattr(sched, "current", None) is None:
+            return IPMI_TIMED_OUT
+
+        def on_timeout(th, result_ptr=result_ptr, p_to=p_to):
+            try:
+                if result_ptr:
+                    self.emu.uc.mem_write(result_ptr, struct.pack("<I", IPMI_TIMED_OUT))
+                if p_to:
+                    self.emu.uc.mem_write(p_to, struct.pack("<I", 0))
+            except Exception:
+                pass
+
+        sched.block({"kind": "ipmi_wait_evf", "kid": kid, "name": name,
+                     "on_timeout": on_timeout},
+                    deadline_ns=None if timeout_us is None
+                    else sched.now_ns() + timeout_us * 1000,
+                    timeout_ret=(0, False))
+        return None                     # blocked: the wake-up supplies the result
+
+    def _ipmi_hosted_here(self, name):
+        """True if the running program itself hosts IPMI service `name`: its
+        name appears as a string in the main executable (a program that only
+        uses a service gets the name from the client library instead)."""
+        import re
+        cache = self.__dict__.setdefault("_ipmi_hosted_cache", {})
+        key = (self.emu.path, name)
+        if key not in cache:
+            img = self.__dict__.get("_ipmi_main_image")
+            if img is None or img[0] != self.emu.path:
+                try:
+                    with open(self.emu.path, "rb") as f:
+                        img = (self.emu.path, f.read())
+                except Exception:
+                    img = (self.emu.path, b"")
+                self._ipmi_main_image = img
+            pat = rb"(?<![A-Za-z0-9_])" + re.escape(name.encode()) + rb"\x00"
+            cache[key] = bool(name) and re.search(pat, img[1]) is not None
+        return cache[key]
+
+    def sys_ipmimgr_call(self, uc):
+        # IPMI (Sony IPC): SceShellCore creates a client per system service and
+        # then invokes methods on it. The services are separate processes we do
+        # not run, so there is nobody to answer; we hand back a valid client
+        # handle so client creation stops failing, and report success.
+        import struct
+        cmd, kid, result_ptr, in_ptr, size = self._args(uc)[:5]
+        if not hasattr(self, "_ipmi_names"):
+            self._ipmi_names = {}
+        counts = self.__dict__.setdefault("_ipmi_counts", {})
+        ckey = (cmd, self._ipmi_names.get(kid, "") if cmd != self.IPMI_CREATE_CLIENT else "")
+        counts[ckey] = counts.get(ckey, 0) + 1
+        if cmd == self.IPMI_CREATE_CLIENT:
+            name = self._ipmi_service_name(uc, in_ptr, size)
+            h = self._ipmi_kid
+            self._ipmi_kid += 1
+            self._ipmi_names[h] = name
+            if result_ptr:
+                try:
+                    uc.mem_write(result_ptr, struct.pack("<i", h))   # the new client kid
+                except Exception:
+                    pass
+            self.emu.log(f"  [ipmi] create client '{name}' -> kid {h:#x}")
+            return self._ret(uc, 0)
+        if cmd == self.IPMI_CREATE_SERVER:
+            # {u64 server_obj; u64 *service_name; u64 params}: a service hosted
+            # by this process. Remember it: clients can only connect to servers
+            # that exist.
+            name = self._ipmi_service_name(uc, in_ptr, size)
+            h = self._ipmi_kid
+            self._ipmi_kid += 1
+            self._ipmi_names[h] = name
+            self._ipmi_servers = getattr(self, "_ipmi_servers", {})
+            self._ipmi_servers[name] = h
+            if result_ptr:
+                try:
+                    uc.mem_write(result_ptr, struct.pack("<i", h))
+                except Exception:
+                    pass
+            self.emu.log(f"  [ipmi] create server '{name}' -> kid {h:#x}")
+            return self._ret(uc, 0)
+        if cmd == self.IPMI_DISCONNECT:
+            # {u64 *status}: the kernel reports the session's close status
+            # through the pointer; libSceIpmi asserts it is 0.
+            try:
+                p_status = struct.unpack("<Q", bytes(uc.mem_read(in_ptr, 8)))[0]
+                if p_status:
+                    uc.mem_write(p_status, struct.pack("<I", 0))
+                if result_ptr:
+                    uc.mem_write(result_ptr, struct.pack("<I", 0))
+            except Exception:
+                pass
+            return self._ret(uc, 0)
+        if cmd == self.IPMI_CONNECT:
+            # Connect always succeeds. Services hosted by another system process
+            # (SceSysCore, ...) would already be running on a console, so they
+            # get a stand-in session. Services this program hosts itself are
+            # often connected to by its libraries at load time, before the
+            # server object exists (libSceNpManager's module start connects to
+            # SceNpMgrIpc; failing that connect makes it tear down the NP
+            # global heap, after which every NP allocation returns NULL). The
+            # session is accepted and simply idle until the server is created:
+            # receives block and sync invokes get an empty success meanwhile.
+            nm = self._ipmi_names.get(kid, "?")
+            ok = True
+            if nm not in getattr(self, "_ipmi_servers", {}) and self._ipmi_hosted_here(nm):
+                self.emu.log(f"  [ipmi] connect '{nm}': server not created yet - "
+                             "session accepted, idle until it is")
+            code = 0 if ok else IPMI_METHOD_NOT_EXIST
+            if result_ptr:
+                try:
+                    uc.mem_write(result_ptr, struct.pack("<I", code))
+                except Exception:
+                    pass
+            self.emu.log(f"  [ipmi] connect '{nm}' (kid {kid:#x}) -> "
+                         + ("ok" if ok else "no such server yet"))
+            return self._ret(uc, 0)
+        # Other IPMI ops (connect / invoke method / event poll / ...): the target
+        # services are separate processes we do not run, so there is nobody to
+        # answer. We report success with an empty result. NOTE: this leaves the
+        # shell busy-polling SceVideoCoreServer's invoke (cmd 0x490, method 0x22)
+        # for a reply that never comes - that service's protocol is the next
+        # thing to HLE. Log each op once per (cmd,kid) so the poll does not spam.
+        nm = self._ipmi_names.get(kid, "?")
+        self._ipmi_seen = getattr(self, "_ipmi_seen", set())
+        if (cmd, kid) not in self._ipmi_seen:
+            self._ipmi_seen.add((cmd, kid))
+            self.emu.log(f"  [ipmi] cmd={cmd:#x} kid={kid:#x} ({nm}) size={size:#x}")
+        # Per-op result code (written to result_ptr; the libSceIpmi wrapper
+        # returns it to the caller). With no service process behind the client:
+        #  * Receive (0x201): SCE_IPMI_ERROR_NO_PACKET (0x80020004) - "no packet
+        #    pending". The async receive pump treats that as idle and retries;
+        #    returning 0 made it read our zeroed buffer as a type-0 packet and log
+        #    "unexpected receivePacketInfo.type".
+        #  * InvokeSyncMethod (0x490): the response-delivery framework below -
+        #    sync methods return their result (and out-data) directly through the
+        #    syscall, so we answer per (service, method).
+        #  * everything else (connect, ...): success.
+        if cmd == self.IPMI_RECEIVE:
+            # The kernel blocks a receive until a packet arrives for that
+            # client/server. Nothing sends packets yet (no request/response
+            # loopback), so the receive thread parks - like an idle service -
+            # instead of polling "no packet" in a tight loop.
+            sched = self.emu.sched
+            if sched is not None and getattr(sched, "current", None) is not None:
+                waiters = self.__dict__.setdefault("_ipmi_rx_waiters", {})
+                waiters.setdefault(kid, []).append(sched.current)
+                sched.block({"kind": "ipmi_receive", "kid": kid, "name": nm})
+                return
+            result = IPMI_NO_PACKET
+        elif cmd == self.IPMI_INVOKE_SYNC:
+            result = self._ipmi_invoke(uc, nm, in_ptr, size)
+        elif cmd == self.IPMI_WAIT_EVF:
+            result = self._ipmi_wait_evf(uc, kid, nm, result_ptr, in_ptr)
+            if result is None:
+                return
+        elif cmd == self.IPMI_POLL_EVF:
+            result = IPMI_EVF_NOT_SET
+        else:
+            result = 0
+        if result_ptr:
+            try:
+                uc.mem_write(result_ptr, struct.pack("<I", result & 0xFFFFFFFF))
+            except Exception:
+                pass
+        return self._ret(uc, 0)
+
+    PID = 1000
+    APP_ID = 0x3E8          # this process's application id (kernel AppInfo / SysCore)
+
+    def sys_getpid(self, uc):
+        self._ret(uc, self.PID)
+
+    def sys_getuid(self, uc):
+        self._ret(uc, 0)
+
+    def sys_issetugid(self, uc):
+        self._ret(uc, 0)
+
+    REALTIME_EPOCH_NS = 1_767_225_600 * 1_000_000_000   # 2026-01-01 00:00 UTC
+
+    def now_ns(self):
+        sched = self.emu.sched
+        return sched.now_ns() if sched is not None else self.emu._insn_count
+
+    def sys_clock_gettime(self, uc):
+        # clock_gettime(clockid, struct timespec *): psemu's virtual clock
+        # (1 ns per executed instruction + time skipped while all threads
+        # slept). CLOCK_REALTIME (0) adds a fixed epoch; every other clock
+        # (MONOTONIC, UPTIME, PROF...) counts from boot.
+        import struct
+        clk, ts, *_ = self._args(uc)
+        t = self.now_ns() + (self.REALTIME_EPOCH_NS if (clk & 0xFFFFFFFF) == 0 else 0)
+        try:
+            uc.mem_write(ts, struct.pack("<qq", t // 1_000_000_000, t % 1_000_000_000))
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        self._ret(uc, 0)
+
+    def sys_nanosleep(self, uc):
+        # nanosleep(const timespec *rqtp, timespec *rmtp): sleep on the
+        # virtual clock (others run; if nobody can, the clock skips ahead).
+        import struct
+        rqtp, rmtp = self._args(uc)[:2]
+        try:
+            sec, nsec = struct.unpack("<qq", bytes(uc.mem_read(rqtp, 16)))
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        if rmtp:
+            try:
+                uc.mem_write(rmtp, b"\x00" * 16)
+            except Exception:
+                pass
+        self._ret(uc, 0)
+        ns = max(0, sec) * 1_000_000_000 + max(0, nsec)
+        sched = self.emu.sched
+        if sched is not None and ns:
+            sched.block({"kind": "sleep", "ns": ns}, deadline_ns=sched.now_ns() + ns,
+                        timeout_ret=(0, False))
+
+    def sys_execve(self, uc):
+        # mini-syscore's job is early boot, then hand off to the next stage.
+        # We can't chain-load that separate firmware module, so report the
+        # handoff as a clean terminal state instead of returning into a fallback
+        # exit(-1).
+        path_ptr, argv_ptr, _env = self._args(uc)[:3]
+        path = self._read_cstr(uc, path_ptr, 128)
+        argv = []
+        try:
+            import struct
+            for i in range(8):
+                p = struct.unpack("<Q", bytes(uc.mem_read(argv_ptr + 8 * i, 8)))[0]
+                if not p:
+                    break
+                argv.append(self._read_cstr(uc, p, 64))
+        except Exception:
+            pass
+        self.emu.log(f"  [execve] '{path}' argv={argv}")
+        if not self.emu.exec_module(path, argv):
+            # exec_module already set a stop reason (module not found)
+            pass
+
+    def sys_kqueue(self, uc):
+        fd = self._alloc_fd("kqueue", base=16)
+        self.kqueues.add(fd)
+        self.emu.log(f"  [kqueue] -> fd {fd}")
+        self._ret(uc, fd)
+
+    # ---- kqueue: registrations + events raised by devices -------------
+    # struct kevent (FreeBSD 9): u64 ident; i16 filter; u16 flags; u32 fflags;
+    #                            i64 data; u64 udata          (32 bytes)
+    EV_ADD, EV_DELETE, EV_ENABLE, EV_DISABLE, EV_ONESHOT, EV_CLEAR = 1, 2, 4, 8, 0x10, 0x20
+    EVFILT_USER = -11
+    NOTE_TRIGGER = 0x01000000
+
+    def trigger(self, filt, ident=None, data=None):
+        """Raise an event on every kqueue that registered (ident, filt);
+        ident None matches all idents of that filter. Returns how many."""
+        n = 0
+        for kq, notes in self.knotes.items():
+            for (ident_, filt_), kn in notes.items():
+                if filt_ != filt or (ident is not None and ident_ != ident):
+                    continue
+                if data is not None:
+                    kn["data"] = data
+                pend = self.kq_pending.setdefault(kq, [])
+                if (ident_, filt_) not in pend:
+                    pend.append((ident_, filt_))
+                n += 1
+        if n:
+            self._wake_kq_waiters()
+        return n
+
+    def _wake_kq_waiters(self):
+        """Threads blocked in kevent on a queue that now has events: copy the
+        events into their buffers and make them runnable."""
+        sched = self.emu.sched
+        if sched is None:
+            return
+        for t in list(sched.threads.values()):
+            w = t.wait
+            if t.state == "blocked" and isinstance(w, dict) and w.get("kind") == "kevent" \
+                    and self.kq_pending.get(w["kq"]):
+                out = self._copy_events(self.emu.uc, w["kq"], w["evbuf"], w["nev"])
+                if out:
+                    sched.wake(t, out)
+
+    def sys_kevent_deliver(self, uc, kq, evbuf, nev):
+        self._ret(uc, self._copy_events(uc, kq, evbuf, nev))
+
+    def _copy_events(self, uc, kq, evbuf, nev):
+        """Copy pending events of `kq` out to an event list; returns the count."""
+        import struct
+        notes = self.knotes.get(kq, {})
+        pend = self.kq_pending.get(kq, [])
+        out = 0
+        while pend and out < nev:
+            key = pend.pop(0)
+            kn = notes.get(key)
+            if kn is None:
+                continue
+            ident, filt = key
+            uc.mem_write(evbuf + 32 * out, struct.pack(
+                "<QhHIqQ", ident, filt, kn["flags"] & 0xFFFF, kn["fflags"],
+                kn["data"], kn["udata"]))
+            if kn["flags"] & self.EV_ONESHOT:
+                notes.pop(key, None)
+            out += 1
+        self._delivered = getattr(self, "_delivered", 0) + out
+        if self._delivered <= 32 or self._delivered % 500 == 0:
+            self.emu.log(f"  [kevent] kq {kq}: delivered {out} event(s) "
+                         f"(total {self._delivered})")
+        return out
+
+    def sys_kevent(self, uc):
+        # kevent(kq, changelist, nchanges, eventlist, nevents, timeout)
+        # Changes register knotes; events come from trigger() (GPU EOP from
+        # /dev/gc, user events). With nothing pending the call returns 0 (as
+        # if the timeout expired) and a run of those is how an idle event
+        # loop is detected.
+        import struct
+        kq, chl, nch, evbuf, nev, timeout = self._args(uc)
+        kq, nch, nev = kq & 0xFFFFFFFF, nch & 0xFFFFFFFF, nev & 0xFFFFFFFF   # C ints
+        if self.trace or self.counts.get(363, 0) <= 64:
+            self.emu.log(f"  [kevent] kq={kq} nchanges={nch} nevents={nev} timeout={timeout:#x}")
+        notes = self.knotes.setdefault(kq, {})
+        for i in range(min(nch, 64)):
+            try:
+                ident, filt, flags, fflags, data, udata = struct.unpack(
+                    "<QhHIqQ", bytes(uc.mem_read(chl + 32 * i, 32)))
+            except Exception:
+                return self._ret(uc, EFAULT, error=True)
+            key = (ident, filt)
+            if flags & self.EV_DELETE:
+                notes.pop(key, None)
+                continue
+            if flags & self.EV_ADD or key not in notes:
+                notes[key] = {"flags": flags, "fflags": fflags, "data": data, "udata": udata}
+            kn = notes[key]
+            if flags & self.EV_ADD:
+                kn.update(flags=flags, udata=udata)
+            if filt == self.EVFILT_USER and fflags & self.NOTE_TRIGGER:
+                self.trigger(self.EVFILT_USER, ident)
+        if nev and self.kq_pending.get(kq):
+            return self.sys_kevent_deliver(uc, kq, evbuf, nev)
+        if not nev:
+            return self._ret(uc, 0)
+        # Nothing pending but the queue waits for vblank: the display keeps
+        # refreshing, so the next vblank arrives (one per wait).
+        dce = self.device_of_kind(DceDevice)
+        if dce is not None and dce.wants_vblank(kq) and not self.kq_pending.get(kq):
+            if dce.vblank():
+                return self.sys_kevent_deliver(uc, kq, evbuf, nev)
+        if notes and kq not in self._kq_wait_logged:
+            self._kq_wait_logged.add(kq)
+            self.emu.log(f"  [kevent] kq {kq} waits; registered: " + ", ".join(
+                f"({i:#x},{f})" for i, f in list(notes)[:8]) + " - nothing pending")
+        # Nothing to deliver. A NULL timeout sleeps until an event arrives and
+        # a positive one until it expires (virtual clock); {0, 0} polls.
+        wait_ns = None
+        if timeout:
+            try:
+                sec, nsec = struct.unpack("<qq", bytes(uc.mem_read(timeout, 16)))
+                wait_ns = max(0, sec) * 1_000_000_000 + max(0, nsec)
+            except Exception:
+                wait_ns = 0
+        sched = self.emu.sched
+        if sched is not None and wait_ns != 0:
+            self._ret(uc, 0)          # value if it times out
+            sched.block({"kind": "kevent", "kq": kq, "evbuf": evbuf, "nev": nev},
+                        deadline_ns=None if wait_ns is None else sched.now_ns() + wait_ns,
+                        timeout_ret=(0, False))
+            self._idle_waits += 1
+            if self._idle_waits >= self.idle_limit:
+                self.emu.log(f"  [kevent] no events after {self._idle_waits} waits "
+                             f"-> module is idle in its event loop")
+                self.emu.stop("module booted; idle in event loop (no events to deliver)")
+            return
+        self.yield_cpu()
+        self._idle_waits += 1
+        if self._idle_waits >= self.idle_limit:
+            self.emu.log(f"  [kevent] no events after {self._idle_waits} waits "
+                         f"-> module is idle in its event loop")
+            self.emu.stop("module booted; idle in event loop (no events to deliver)")
+            return
+        self._ret(uc, 0)
+
+    def sys_rdup(self, uc):
+        # ORBIS sys_603: duplicate a descriptor to the lowest free fd. The
+        # module's fd-setup loop requires these to come back as 3, 4, 5, ...
+        fd = self._alloc_fd("rdup")
+        self.emu.log(f"  [rdup] -> fd {fd}")
+        self._ret(uc, fd)
+
+    def sys_open(self, uc):
+        path_ptr = self._args(uc)[0]
+        path = self._read_cstr(uc, path_ptr, 128)
+        fd = self._alloc_fd(path, base=16)      # devices open high
+        dev = open_device(self, path)
+        kind = ""
+        if dev is not None:
+            self.devs[fd] = dev
+            kind = " (device)"
+        elif not path.startswith("/dev/"):
+            # Back the fd with the real firmware file so read()/fstat() work.
+            real = self.emu.resolve_path(path)
+            if real:
+                try:
+                    with open(real, "rb") as f:
+                        self.files[fd] = {"data": f.read(), "pos": 0}
+                    kind = f" (file {len(self.files[fd]['data'])}B)"
+                except Exception:
+                    pass
+        self.emu.log(f"  [open] '{path}' -> fd {fd}{kind}")
+        self._ret(uc, fd)
+
+    def sys_close(self, uc):
+        fd = self._args(uc)[0] & 0xFFFFFFFF
+        self.fds.pop(fd, None)
+        self.devs.pop(fd, None)
+        self.files.pop(fd, None)
+        self.shms.pop(fd, None)
+        self.emu.log(f"  [close] fd {fd}")
+        self._ret(uc, 0)
+
+    # PS4/FreeBSD struct stat: st_mode@0x08 (u16), st_nlink@0x0a, st_size@0x48
+    # (i64), st_blksize@0x58 (i32). Enough for callers that size a read buffer.
+    def _write_stat(self, uc, buf, size, isdir=False):
+        st = bytearray(0x78)
+        _struct.pack_into("<H", st, 0x08, (0x4000 if isdir else 0x8000) | 0o644)
+        _struct.pack_into("<H", st, 0x0A, 1)                 # st_nlink
+        _struct.pack_into("<q", st, 0x48, size & 0x7FFFFFFFFFFFFFFF)
+        _struct.pack_into("<i", st, 0x58, 0x4000)            # st_blksize
+        _struct.pack_into("<q", st, 0x50, (size + 0x1FF) // 0x200)  # st_blocks
+        try:
+            uc.mem_write(buf, bytes(st))
+            return True
+        except Exception:
+            return False
+
+    # ---- POSIX shared memory (shm_open / ftruncate / fstat / mmap) -----
+    # A named object with a size; every mmap of it returns the same guest
+    # memory (psemu runs one address space, so "shared" is literal). Objects
+    # another system process would have created (opened here without O_CREAT)
+    # get a one-page stand-in, like external event flags and semaphores.
+    SHM_DEFAULT_SIZE = 0x1000
+
+    def sys_shm_open(self, uc):
+        path_ptr, flags, mode = self._args(uc)[:3]
+        flags &= 0xFFFFFFFF
+        O_CREAT = 0x200
+        name = "(anon)" if path_ptr == 1 else self._read_cstr(uc, path_ptr, 128)
+        obj = self.shm_objs.get(name) if path_ptr != 1 else None
+        note = ""
+        if obj is None:
+            obj = {"name": name, "size": 0, "addr": None}
+            if path_ptr != 1:
+                self.shm_objs[name] = obj
+            if not flags & O_CREAT:
+                obj["size"] = self.SHM_DEFAULT_SIZE
+                note = " (owned by another system process -> stand-in)"
+        fd = self._alloc_fd(f"shm:{name}", base=16)
+        self.shms[fd] = obj
+        self.emu.log(f"  [shm_open] '{name}' flags={flags:#x} -> fd {fd} "
+                     f"size={obj['size']:#x}{note}")
+        self._ret(uc, fd)
+
+    def sys_ftruncate(self, uc):
+        fd, length = self._args(uc)[:2]
+        fd &= 0xFFFFFFFF
+        obj = self.shms.get(fd)
+        if obj is not None:
+            obj["size"] = length
+            self.emu.log(f"  [ftruncate] shm '{obj['name']}' -> {length:#x}")
+        self._ret(uc, 0)
+
+    def sys_fstat(self, uc):
+        fd, buf = self._args(uc)[:2]
+        fd &= 0xFFFFFFFF
+        if fd in self.shms:
+            size = self.shms[fd]["size"]
+        else:
+            size = len(self.files[fd]["data"]) if fd in self.files else 0
+        if not self._write_stat(uc, buf, size):
+            return self._ret(uc, EFAULT, error=True)
+        self._ret(uc, 0)
+
+    def sys_stat(self, uc):
+        import os
+        path = self._read_cstr(uc, self._args(uc)[0], 256)
+        buf = self._args(uc)[1]
+        real = self.emu.resolve_path(path) if not path.startswith("/dev/") else None
+        if real and os.path.isfile(real):
+            self._write_stat(uc, buf, os.path.getsize(real))
+            return self._ret(uc, 0)
+        if real and os.path.isdir(real):
+            self._write_stat(uc, buf, 0, isdir=True)
+            return self._ret(uc, 0)
+        self._ret(uc, ENOENT, error=True)
+
+    def sys_lseek(self, uc):
+        fd, off, whence = self._args(uc)[:3]
+        fd &= 0xFFFFFFFF
+        f = self.files.get(fd)
+        if f is None:
+            return self._ret(uc, 0)
+        off = off - (1 << 64) if off >= (1 << 63) else off
+        base = {0: 0, 1: f["pos"], 2: len(f["data"])}.get(whence & 0xFFFFFFFF, 0)
+        f["pos"] = max(0, min(len(f["data"]), base + off))
+        self._ret(uc, f["pos"])
+
+    def sys_dup(self, uc):
+        oldfd = self._args(uc)[0]
+        fd = self._alloc_fd(self.fds.get(oldfd, f"dup{oldfd}"))
+        if oldfd in self.devs:
+            self.devs[fd] = self.devs[oldfd]
+        self._ret(uc, fd)
+
+    def sys_dup2(self, uc):
+        # dup2(oldfd, newfd): make newfd refer to oldfd; return newfd.
+        oldfd, newfd, *_ = self._args(uc)
+        self.fds[newfd] = self.fds.get(oldfd, f"dup{oldfd}")
+        if oldfd in self.devs:
+            self.devs[newfd] = self.devs[oldfd]
+        self.emu.log(f"  [dup2] {oldfd} -> {newfd}")
+        self._ret(uc, newfd)
+
+    def device_of_kind(self, cls):
+        return next((d for d in self.devs.values() if isinstance(d, cls)), None)
+
+    def sys_ioctl(self, uc):
+        fd, req, argp = self._args(uc)[:3]
+        fd &= 0xFFFFFFFF          # int fd: upper register bits are garbage
+        req &= 0xFFFFFFFF
+        dev = self.devs.get(fd)
+        if dev is None:
+            if self.trace or (fd, req) not in self._ioctl_seen:
+                self._ioctl_seen.add((fd, req))
+                self.emu.log(f"  [ioctl] fd {fd} ({self.fds.get(fd, '?')}) "
+                             f"req={req:#010x} arg={argp:#x} -> 0")
+            return self._ret(uc, 0)
+        try:
+            rv = dev.ioctl(uc, req, argp)
+        except Exception as e:                   # bad guest pointer etc.
+            self.emu.log(f"  [ioctl] {dev.path} req={req:#010x}: {e} -> EINVAL")
+            return self._ret(uc, EINVAL, error=True)
+        if rv and rv < 0:
+            return self._ret(uc, -rv, error=True)
+        self._ret(uc, rv or 0)
+
+    def sys_namedobj_create(self, uc):
+        # ORBIS sys_557: create a named kernel object (event flag, mutex, …).
+        # args: (name, attr_ptr, type, ...). Return a fresh unique handle.
+        name_ptr, attr, otype, _a3, _a4, _a5 = self._args(uc)
+        name = self._read_cstr(uc, name_ptr)
+        h = self._new_handle(f"namedobj:{otype:#x}", name)
+        self.emu.log(f"  [namedobj_create] '{name}' type={otype:#x} -> handle 0x{h:x}")
+        self._ret(uc, h)
+
+    # Program authority IDs (SELF "paid") of processes we know. Anything else
+    # gets a system ID that none of libkernel's inlined sceKernelIsXxx()
+    # identity checks match.
+    AUTHORITY_IDS = {
+        "sceshellcore": 0x3800000000000010,
+    }
+    DEFAULT_AUTHORITY_ID = 0x38000000000000FF
+
+    def sys_get_authinfo(self, uc):
+        # sys_587 get_authinfo(pid, SceAuthInfo *out): the calling process's
+        # SELF authentication info, 0x88 bytes:
+        #   u64 paid; u64 caps[4]; u64 attrs[4]; u64 ucred[8]
+        # Libraries test capability bits (VideoOut: caps[0] bit 62 enables the
+        # display-server port features GnmCompositor needs). The decrypted
+        # ELFs no longer carry their SELF headers, so grant the all-ones
+        # capability set that PS4 system code is known to run with.
+        import os
+        import struct
+        _pid, buf, *_ = self._args(uc)
+        if not buf:
+            return self._ret(uc, EINVAL, error=True)
+        name = os.path.splitext(os.path.basename(getattr(self.emu, "path", "") or ""))[0].lower()
+        paid = self.AUTHORITY_IDS.get(name, self.DEFAULT_AUTHORITY_ID)
+        caps = [0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0, 0]
+        info = struct.pack("<Q4Q4Q", paid, *caps, 0, 0, 0, 0) + b"\x00" * 0x40
+        try:
+            uc.mem_write(buf, info)
+        except Exception:
+            return self._ret(uc, EINVAL, error=True)
+        self._ret(uc, 0)
+
+    def sys_mmap(self, uc):
+        # FreeBSD: mmap(addr, len, prot, flags, fd, offset)
+        addr, length, prot, flags, fd, offset = self._args(uc)
+        prot, flags = prot & 0xFFFFFFFF, flags & 0xFFFFFFFF
+        fd = fd & 0xFFFFFFFF
+        fd = fd - (1 << 32) if fd >= 0x80000000 else fd          # int fd (-1 = none)
+        from unicorn import UC_PROT_NONE, UC_PROT_READ, UC_PROT_WRITE, UC_PROT_EXEC
+        uprot = UC_PROT_NONE
+        if prot & 1: uprot |= UC_PROT_READ
+        if prot & 2: uprot |= UC_PROT_WRITE
+        if prot & 4: uprot |= UC_PROT_EXEC
+        if uprot == UC_PROT_NONE:
+            uprot = UC_PROT_READ | UC_PROT_WRITE
+        MAP_ANON = 0x1000
+        dev = self.devs.get(fd) if not flags & MAP_ANON else None
+        shm = self.shms.get(fd) if not flags & MAP_ANON else None
+        if shm is not None:
+            if shm["addr"] is None:
+                span = max(length, shm["size"], 0x1000)
+                # Always read+write: later mappers of the same object may ask
+                # for more access than the first one did (client maps it
+                # read-only, the owner read-write) and all share this memory.
+                got = self.emu.map_anon(span, addr_hint=addr,
+                                        prot=UC_PROT_READ | UC_PROT_WRITE)
+                if got == 0xFFFFFFFFFFFFFFFF:
+                    return self._ret(uc, ENOMEM, error=True)
+                shm["addr"], shm["span"] = got, span
+                self._add_vma(got, span, prot, flags, 0, False)
+            if length <= shm.get("span", 0):
+                self.emu.log(f"  [mmap] shm '{shm['name']}' -> 0x{shm['addr']:x} (len={length:#x})")
+                return self._ret(uc, shm["addr"])
+        if dev is not None:
+            got = dev.mmap(uc, length, prot, offset)
+            if got is not None:
+                self.emu.log(f"  [mmap] {dev.path} off={offset:#x} -> 0x{got:x} (len={length:#x})")
+                self._add_vma(got, length, prot, flags, 0, False)
+                return self._ret(uc, got)
+        MAP_FIXED = 0x10
+        if flags & MAP_FIXED and addr:
+            got = self.emu.map_fixed(addr, length, prot=uprot)
+        else:
+            got = self.emu.map_anon(length, addr_hint=addr, prot=uprot)
+        if got == 0xFFFFFFFFFFFFFFFF:
+            self.emu.log(f"  [mmap] FAILED len={length:#x}")
+            self._ret(uc, ENOMEM, error=True)
+            return
+        direct = isinstance(dev, DmemDevice)
+        self._add_vma(got, length, prot, flags, offset if direct else 0, direct)
+        self.emu.log(f"  [mmap] -> 0x{got:x} (len={length:#x}, prot={prot:#x}, "
+                     f"flags={flags:#x}, hint={addr:#x}, fd={fd if fd < 0x10000 else -1}"
+                     + (f", phys={offset:#x}" if direct else "") + ")")
+        self._ret(uc, got)
+
+    # ---- virtual memory areas: what virtual_query reports -------------
+    # [start, end, prot (incl. GPU bits 0x10/0x20), flags, phys offset, direct]
+    def _add_vma(self, start, length, prot, flags, offset, direct):
+        end = start + ((length + 0x3FFF) & ~0x3FFF)
+        self._cut_vmas(start, end)
+        self.vmas.append([start, end, prot, flags, offset, direct])
+        self.vmas.sort()
+
+    def _cut_vmas(self, lo, hi):
+        out = []
+        for v in self.vmas:
+            s, e = v[0], v[1]
+            if e <= lo or hi <= s:
+                out.append(v)
+                continue
+            if s < lo:
+                out.append([s, lo] + v[2:])
+            if hi < e:
+                out.append([hi, e, v[2], v[3], v[4] + (hi - s) if v[5] else 0, v[5]])
+        self.vmas = sorted(out)
+
+    def sys_virtual_query(self, uc):
+        # sys_572 virtual_query(addr, flags, OrbisVirtualQueryInfo *info, size):
+        #   u64 start, end, offset; i32 protection, memory_type;
+        #   u8 is_flexible:1, is_direct:1, is_stack:1, is_pooled:1, is_committed:1;
+        #   char name[32]
+        # flags & 1: if addr is unmapped, report the next mapping above it.
+        import struct
+        addr, qflags, info, size = self._args(uc)[:4]
+        hit = next((v for v in self.vmas if v[0] <= addr < v[1]), None)
+        if hit is None and qflags & 1:
+            hit = next((v for v in self.vmas if v[0] > addr), None)
+        if hit is None:
+            return self._ret(uc, EACCES, error=True)
+        s, e, prot, mflags, off, direct = hit
+        mtype = DmemDevice.allocator.type_at(off) if direct else 0
+        bits = (0 if direct else 1) | (2 if direct else 0) | (4 if mflags & 0x400 else 0) | 0x10
+        rec = struct.pack("<QQQiiB", s, e, off, prot, mtype, bits).ljust(0x48, b"\x00")
+        uc.mem_write(info, rec[:max(0, min(size, 0x48))])
+        self._ret(uc, 0)
+
+    def sys_munmap(self, uc):
+        addr, length, *_ = self._args(uc)
+        for obj in list(self.shm_objs.values()) + list(self.shms.values()):
+            if obj.get("addr") is not None and obj["addr"] <= addr < obj["addr"] + obj["span"]:
+                # A shared-memory object's pages belong to the object, not to
+                # one mapper: keep them so its contents survive and the next
+                # mmap of the object sees the same memory.
+                self.emu.log(f"  [munmap] shm '{obj['name']}' at {addr:#x}: kept (object still exists)")
+                return self._ret(uc, 0)
+        self.emu.unmap_anon(addr, length)
+        self._cut_vmas(addr, addr + length)
+        self._ret(uc, 0)
+
+    def sys_mprotect(self, uc):
+        # honoured loosely: Unicorn can change perms, but for a scaffold we
+        # accept it as success without tightening (keeps the module running).
+        self._ret(uc, 0)
+
+    # sysctl MIBs we answer (CTL_KERN=1, CTL_HW=6)
+    # sysarch(op, parms): AMD64_GET/SET_FSBASE (128/129), GET/SET_GSBASE (130/131).
+    # libkernel installs its own TCB / struct pthread this way.
+    def sys_sysarch(self, uc):
+        import struct
+        from unicorn.x86_const import UC_X86_REG_FS_BASE, UC_X86_REG_GS_BASE
+        op, parms = self._args(uc)[:2]
+        reg = UC_X86_REG_FS_BASE if op in (128, 129) else UC_X86_REG_GS_BASE
+        try:
+            if op in (128, 130):
+                uc.mem_write(parms, struct.pack("<Q", uc.reg_read(reg)))
+            elif op in (129, 131):
+                base = struct.unpack("<Q", bytes(uc.mem_read(parms, 8)))[0]
+                uc.reg_write(reg, base)
+                self.emu.log(f"  [sysarch] {'fs' if op == 129 else 'gs'}_base <- {base:#x}")
+            else:
+                return self._ret(uc, EINVAL, error=True)
+        except Exception:
+            return self._ret(uc, EINVAL, error=True)
+        self._ret(uc, 0)
+
+    # thr_self(long *id): the calling thread's kernel thread id
+    def sys_thr_self(self, uc):
+        import struct
+        from .emulator import DEFAULT_TID
+        ptr = self._args(uc)[0]
+        sched = self.emu.sched
+        tid = sched.current.tid if sched and sched.current else DEFAULT_TID
+        try:
+            uc.mem_write(ptr, struct.pack("<q", tid))
+        except Exception:
+            return self._ret(uc, EINVAL, error=True)
+        self._ret(uc, 0)
+
+    def sys_sysctl(self, uc):
+        import struct
+        from .emulator import STACK_TOP
+        name, namelen, oldp, oldlenp, newp, newlen = self._args(uc)
+        mib = []
+        try:
+            for i in range(min(namelen, 8)):
+                mib.append(struct.unpack_from("<i", bytes(uc.mem_read(name + 4 * i, 4)))[0])
+        except Exception:
+            self._ret(uc, EINVAL, error=True)
+            return
+
+        def give(value_bytes):
+            # honour oldlenp / oldp if provided
+            if oldlenp:
+                try:
+                    avail = struct.unpack("<Q", bytes(uc.mem_read(oldlenp, 8)))[0]
+                except Exception:
+                    avail = len(value_bytes)
+                n = min(avail, len(value_bytes)) if avail else len(value_bytes)
+                if oldp:
+                    uc.mem_write(oldp, value_bytes[:n])
+                uc.mem_write(oldlenp, struct.pack("<Q", len(value_bytes)))
+            elif oldp:
+                uc.mem_write(oldp, value_bytes)
+            self._ret(uc, 0)
+
+        # kern.arnd (CTL_KERN=1, KERN_ARND=37): return the requested number of
+        # random bytes. The runtime uses this to seed the stack canary; failing
+        # it sends the module into its abort stub.
+        if tuple(mib[:2]) == (1, 37):
+            import os
+            want = 0
+            if oldlenp:
+                try:
+                    want = struct.unpack("<Q", bytes(uc.mem_read(oldlenp, 8)))[0]
+                except Exception:
+                    want = 0
+            want = want or 8
+            self.emu.log(f"  [sysctl] kern.arnd -> {want} random bytes")
+            # seeded, so runs are reproducible; PSEMU_RANDOM=1 for real entropy
+            if os.environ.get("PSEMU_RANDOM") == "1":
+                give(os.urandom(want))
+            else:
+                if not hasattr(self, "_arnd"):
+                    import random
+                    self._arnd = random.Random(0x5053454D)
+                give(self._arnd.randbytes(want))
+            return
+
+        # sysctl.name2oid {0, 3}: `newp` holds a name; answer with a private
+        # OID {0x7F00, i} that the query below then serves from NAMED_SYSCTLS.
+        if tuple(mib[:2]) == (0, 3):
+            try:
+                sname = bytes(uc.mem_read(newp, newlen)).split(b"\x00")[0].decode()
+            except Exception:
+                sname = ""
+            names = list(NAMED_SYSCTLS)
+            if sname in NAMED_SYSCTLS:
+                self.emu.log(f"  [sysctl] name2oid '{sname}' -> served")
+                give(struct.pack("<ii", 0x7F00, names.index(sname)))
+                return
+            self.emu.log(f"  [sysctl] name2oid '{sname}' -> ENOENT (unknown name)")
+            self._ret(uc, ENOENT, error=True)
+            return
+        if len(mib) >= 2 and mib[0] == 0x7F00 and 0 <= mib[1] < len(NAMED_SYSCTLS):
+            sname = list(NAMED_SYSCTLS)[mib[1]]
+            self.emu.log(f"  [sysctl] {sname} -> served")
+            give(NAMED_SYSCTLS[sname])
+            return
+
+        if tuple(mib[:3]) == (1, 14, 35):
+            # kern.proc.appinfo.<pid> (sceKernelGetAppInfo): the 0x48-byte
+            # AppInfo, app id first. The same id is what SceSysCore reports for
+            # this process (see _ipmi_syscore_my_app_id).
+            info = bytearray(0x48)
+            struct.pack_into("<I", info, 0, self.APP_ID)
+            self.emu.log(f"  [sysctl] kern.proc.appinfo.{mib[3] if len(mib) > 3 else '?'} "
+                         f"-> app id {self.APP_ID:#x}")
+            give(bytes(info))
+            return
+
+        known = {
+            (1, 33): struct.pack("<Q", STACK_TOP),      # kern.usrstack
+            (6, 7): struct.pack("<Q", 0x4000),          # hw.pagesize-ish (phys?)
+            (6, 3): struct.pack("<i", 1),               # hw.ncpu = 1
+            (1, 14): struct.pack("<i", 1000),           # kern.securelevel-ish
+        }
+        key = tuple(mib[:2]) if len(mib) >= 2 else tuple(mib)
+        if key in known:
+            self.emu.log(f"  [sysctl] mib={mib} -> served")
+            give(known[key])
+            return
+        self.emu.log(f"  [sysctl] mib={mib} -> ENOENT (unserved)")
+        self._ret(uc, ENOENT, error=True)
+
+    def summary(self):
+        if not self.counts:
+            return "no syscalls were made."
+        lines = ["syscalls made:"]
+        for num in sorted(self.counts):
+            name = SYSCALLS.get(num, f"sys_{num}")
+            lines.append(f"  {num:>4} {name:<18} x{self.counts[num]}")
+        sync = self.sync_summary()
+        if sync:
+            lines.append(sync)
+        ipmi = self.__dict__.get("_ipmi_counts")
+        if ipmi:
+            top = sorted(ipmi.items(), key=lambda kv: -kv[1])[:8]
+            lines.append("IPMI calls (cmd service xN): " + ", ".join(
+                f"{c:#x} {n or '-'} x{k}" for (c, n), k in top))
+        mc = self.__dict__.get("_ipmi_method_counts")
+        if mc:
+            top = sorted(mc.items(), key=lambda kv: -kv[1])[:6]
+            lines.append("IPMI sync methods: " + ", ".join(
+                f"{n}.{m:#x} x{k}" for (n, m), k in top))
+        return "\n".join(lines)

@@ -1,0 +1,51 @@
+"""CLI entry point for the psemu scaffold.
+
+    python -m psemu.run path/to/mini-syscore.elf
+    python -m psemu.run mini-syscore.elf --trace --max 500
+    python -m psemu.run mini-syscore.elf --start 0x400080
+
+Run untrusted modules with `python -I -m psemu.run ...` so the interpreter does
+not import stray modules from the firmware's directory.
+"""
+import argparse
+from .emulator import Emulator
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Sandboxed PS4/FreeBSD ELF emulator (scaffold).")
+    ap.add_argument("file")
+    ap.add_argument("--trace", action="store_true",
+                    help="print every instruction and every syscall")
+    ap.add_argument("--max", type=int, default=2_000_000,
+                    help="instruction budget before forced stop (default 2e6)")
+    ap.add_argument("--start", default=None,
+                    help="override start address (hex, e.g. 0x400080)")
+    ap.add_argument("--fw-root", default=None,
+                    help="firmware root for resolving execve() paths "
+                         "(default: the directory of the first module)")
+    ap.add_argument("--max-modules", type=int, default=8,
+                    help="stop after chain-loading this many modules")
+    ap.add_argument("--no-gpu", action="store_true",
+                    help="accept /dev/gc submits without running them on the host GPU")
+    ap.add_argument("--frames", default=None,
+                    help="save displayed frames (VideoOut flips) as PNGs in this directory")
+    ap.add_argument("--frame-every", type=int, default=60,
+                    help="with --frames: save every Nth flip (default 60, and the first)")
+    ap.add_argument("--gpu-profile", action="store_true",
+                    help="log per-phase GPU executor time after every /dev/gc submit")
+    args = ap.parse_args()
+
+    start = int(args.start, 0) if args.start else None
+    emu = Emulator(args.file, trace=args.trace, max_insns=args.max,
+                   fw_root=args.fw_root)
+    emu.max_modules = args.max_modules
+    emu.gpu_enabled = not args.no_gpu
+    emu.gpu_profile = args.gpu_profile
+    if args.frames:
+        emu.frame_dir = args.frames
+        emu.frame_every = max(1, args.frame_every)
+    emu.run(start=start)
+
+
+if __name__ == "__main__":
+    main()

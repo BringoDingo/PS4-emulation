@@ -1,0 +1,44 @@
+# Build artifacts
+**/build/
+**/out/
+*.dll
+*.lib
+*.exp
+*.obj
+*.o
+*.a
+*.so
+*.pyd
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Vendored / third-party dependencies (fetch separately; see README)
+**/third_party/
+psemu_deps/
+shadPS4/
+
+# PS4 firmware and any console dumps  ---  NEVER commit (copyrighted Sony material)
+*.sprx
+*.prx
+*.self
+*.elf
+*.bin
+firmware/
+*.PUP
+*.pup
+
+# Generated test output / captured frames
+frames/
+*.png
+scan_report.txt
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
