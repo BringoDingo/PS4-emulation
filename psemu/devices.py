@@ -187,6 +187,9 @@ class GcDevice(Device):
 # ---------------------------------------------------------------- /dev/dce
 
 DCE_IOCTL = 0xc0308203
+DCE_CMD_RESOLUTION_STATUS = 0x13   # sub-command: out = raw 0x2c-byte display record
+DISPLAY_W, DISPLAY_H = 1920, 1080  # the display the stand-in HDMI sink reports
+DISPLAY_REFRESH_HZ = 59.94         # raw record carries the rate as a float32 in Hz
 DCE_SET_ATTRIBUTE = 0xc0308207   # {u32 handle,..; buffer attribute: format, w, h, pitch,..}
 DCE_REGISTER_BUFFER = 0xc0308206  # {u32 handle,..; u64 index?; u64 address; ...}
 DCE_SUBMIT_FLIP = 0xc0488204     # {u64 handle; i64 buffer; u32 mode; u64 arg; u64 0;
@@ -310,6 +313,26 @@ class DceDevice(Device):
                 self.w64(uc, a2, DCE_STATUS_OFFSET)
             if a3:
                 self.w64(uc, a3, DCE_STATUS_SIZE)
+            return 0
+        if cmd == DCE_CMD_RESOLUTION_STATUS:
+            # sceVideoOutGetResolutionStatus (libSceVideoOut export 8XGijEoThE0 ->
+            # ioctl cmd 0x13): a2 = out buffer, a3 = 0x2c bytes (the raw display
+            # record behind SceVideoOutResolutionStatus). Answered with nothing it was an
+            # all-zero "0x0, refresh rate UNKNOWN" display, which libScePsm copies
+            # straight into its graphics setup ("VideoOutResolutionStatus UNKNOWN :
+            # refresh rate 0") -- it has a 1080p fallback, but only for a FAILED
+            # query, not for a successful all-zero one.
+            if a2:
+                # The raw record is NOT the SDK struct: libSceVideoOut's converter
+                # (+0x2ee0) copies the first 16 bytes verbatim and reads the
+                # refresh rate at +0x10 as a float32 in Hz (it compares against
+                # 59.94f = 0x426fc28f, 60.0f, 120.0f, ...), mapping it to the
+                # SDK's SCE_VIDEO_OUT_REFRESH_RATE_* enum itself.
+                status = struct.pack("<IIIIf", DISPLAY_W, DISPLAY_H, DISPLAY_W,
+                                     DISPLAY_H, DISPLAY_REFRESH_HZ).ljust(0x2C, b"\0")
+                self.emu.uc.mem_write(a2, status[:a3] if a3 else status)
+            if self.cmds[cmd] == 1:
+                self.log(f"resolution status -> {DISPLAY_W}x{DISPLAY_H} @ 59.94Hz")
             return 0
         if self.cmds[cmd] == 1:
             self.log(f"cmd {cmd:#x} handle={handle:#x} a2={a2:#x} a3={a3:#x} "

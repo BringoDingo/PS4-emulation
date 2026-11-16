@@ -229,6 +229,37 @@ class DynamicProcess:
             self._np_utility_once(lm)
         elif name.startswith("libmonosgen"):
             self._mono_icall_stub(lm)
+        elif name.startswith("libsceaudioout"):
+            self._audioout_null_client(lm)
+
+    def _audioout_null_client(self, lm):
+        """libSceAudioOut keeps its IPMI client to the audio server in a global
+        (+0x1c320) that only sceAudioOutInit fills in; every export loads it and
+        calls client->invokeSyncMethod through the vtable (+0x58). The library
+        has no module_start, so nothing initialises it until a program calls
+        sceAudioOutInit -- and the shell's voice-recognition init
+        (shell_ui/recognition/voice Initialize -> export rho9DH-0ehs) calls into
+        audio before that ever happens (PSM's sound init, which would call it,
+        fails first on the unmodelled /dev/ajm decoder device). With the global
+        NULL that is `mov rax,[0]`: a crash, where the library on a console would
+        hand back an error.
+
+        Pre-install a stub client whose every vtable slot returns an AudioOut
+        error, so audio calls made with no audio server fail cleanly ("no audio
+        device") instead of killing the process. sceAudioOutInit, if it is ever
+        called, overwrites the global with a real client."""
+        emu = self.emu
+        page = emu.map_anon(0x1000)
+        if page == 0xFFFFFFFFFFFFFFFF:
+            return
+        ERR = 0x80260001                       # generic 0x8026xxxx AudioOut error
+        stub, vtbl, obj = page + 0x200, page + 0x100, page
+        emu.uc.mem_write(stub, b"\xb8" + struct.pack("<I", ERR) + b"\xc3")   # mov eax,ERR; ret
+        emu.uc.mem_write(vtbl, struct.pack("<32Q", *([stub] * 32)))
+        emu.uc.mem_write(obj, struct.pack("<Q", vtbl))
+        emu.uc.mem_write(lm.base + 0x1C320, struct.pack("<Q", obj))
+        emu.log("  [audio] libSceAudioOut: no audio server -> stub IPMI client "
+                f"(calls fail with {ERR:#x} instead of crashing)")
 
     def _mono_icall_stub(self, lm):
         """libmonosgen g_errors ("Unregistered icall '%s'") and aborts when

@@ -120,6 +120,7 @@ NAMED_SYSCTLS = {
 
 SYSCALLS.update(DYNLIB_SYSCALLS)
 SYSCALLS.update(SYNC_SYSCALLS)
+SYSCALLS[548] = "batch_map"          # sceKernelBatchMap (else labelled "(sceKernelBatchMap)")
 
 # Names for every other syscall libkernel makes, from the table decoded out of
 # libkernel.sprx / libkernel_sys.sprx (D:\Ps4Tools\ps4kernel\analysis\syscalls.csv;
@@ -190,6 +191,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         self.fds = {0: "stdin", 1: "stdout", 2: "stderr"}
         self.kqueues = set()
         self.devs = {}            # fd -> devices.Device (/dev/gc, /dev/dce, ...)
+        # AF_UNIX endpoints served in-process (see unixsock.py): the system
+        # processes that would own the listening end are not emulated.
+        self.unix_servers = {}
+        from .unixsock import install_default_servers
+        install_default_servers(self)
         self.files = {}           # fd -> {"data": bytearray, "pos", "append", "path"} open files
         # Writable file layer: guest path -> contents. Firmware files are copied
         # in on first open, so writes never touch the dump on disk; files the
@@ -380,6 +386,16 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             self._ret(uc, EBADF, error=True)
             return
         raw = bytes(data)
+        dev = self.devs.get(fd & 0xFFFFFFFF)
+        if dev is not None and hasattr(dev, "write"):
+            # a device that takes writes (UNIX sockets); plain devices have no
+            # write() and fall through to the logging path below
+            try:
+                rv = dev.write(uc, buf, n)
+            except Exception as e:
+                self.emu.log(f"  [write] {dev.path}: {e} -> EINVAL")
+                return self._ret(uc, EINVAL, error=True)
+            return self._ret(uc, n if rv is None else rv)
         f = self.files.get(fd & 0xFFFFFFFF)
         if f is not None:
             pos = len(f["data"]) if f.get("append") else f["pos"]
@@ -421,6 +437,35 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             f["pos"] += len(chunk)
             return self._ret(uc, len(chunk))
         # no real input source yet -> EOF
+        self._ret(uc, 0)
+
+    # ---- sockets -------------------------------------------------------
+    AF_UNIX = 1
+
+    def sys_socket(self, uc):
+        # socket(domain, type, protocol). AF_UNIX gets a real endpoint served
+        # in-process (unixsock.py); every other family keeps the old behaviour
+        # of the generic stub (return 0) so SceNet and friends are unchanged.
+        domain = self._args(uc)[0] & 0xFFFFFFFF
+        if domain != self.AF_UNIX:
+            return self._ret(uc, 0)
+        from .unixsock import UnixSocket
+        fd = self._alloc_fd("unix-socket", base=16)
+        self.devs[fd] = UnixSocket(self)
+        self.emu.log(f"  [socket] AF_UNIX -> fd {fd}")
+        self._ret(uc, fd)
+
+    def sys_connect(self, uc):
+        # connect(fd, sockaddr *, len): FreeBSD sockaddr_un = {u8 len; u8 family;
+        # char path[104]}.
+        fd, addr, alen = self._args(uc)[:3]
+        sock = self.devs.get(fd & 0xFFFFFFFF)
+        if not hasattr(sock, "connect"):
+            return self._ret(uc, 0)
+        path = self._read_cstr(uc, addr + 2, 104)
+        err = sock.connect(path)
+        if err:
+            return self._ret(uc, err, error=True)
         self._ret(uc, 0)
 
     _ipmi_kid = 0x100           # next IPMI client/session handle to hand out
@@ -480,7 +525,27 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     IPMI_METHODS = {
         ("SceSysCoreApp", 0xAA110002): "_ipmi_syscore_app_info",
         ("SceSysCoreApp2", 0xAA120009): "_ipmi_syscore_my_app_id",
+        ("SceUserService", 0x3000F): "_ipmi_user_id_list",
     }
+
+    USER_ID = 1                 # the one registered/logged-in user
+    USER_ID_INVALID = 0xFFFFFFFF  # SCE_USER_SERVICE_USER_ID_INVALID (-1)
+
+    def _ipmi_user_id_list(self, uc, call):
+        """SceUserService 0x3000f: out[0] = 0x50 bytes = 20 x i32 user ids,
+        unused slots -1. The shell's per-user setup walks it:
+        `if (GetUserIdList(ids) == 0) for (i < 20) if (ids[i] != -1)
+        createPerUserTables(ids[i])` (eboot+0x478669). Left as an unfilled
+        reply buffer it was stale stack -- stack-pointer halves and a string
+        fragment -- so the notification thread built a full set of tables,
+        indexes and triggers (~130M instructions each) for up to 20 bogus
+        users and ate ~90% of the CPU for billions of instructions, starving
+        the UI thread. Report the single registered user."""
+        import struct
+        if call["out"]:
+            ids = [self.USER_ID] + [self.USER_ID_INVALID] * 19
+            self._ipmi_out(uc, call, 0, struct.pack("<20I", *ids))
+        return 0
 
     def _ipmi_syscore_my_app_id(self, uc, call):
         """SceSysCoreApp2 0xAA120009: out[0] = u32 app id of the calling
@@ -1550,6 +1615,49 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                      f"flags={flags:#x}, hint={addr:#x}, fd={fd if fd < 0x10000 else -1}"
                      + (f", phys={offset:#x}" if direct else "") + ")")
         self._ret(uc, got)
+
+    # sceKernelBatchMap(entries, count, &processed): map/unmap/protect many ranges
+    # in one call. Syscall 548 is called as (fd/flags?, 0x410, entries, count,
+    # &processed) -- args[2:5]. Entry (0x20 bytes): {u64 start; u64 offset (a
+    # direct-memory offset for MAP_DIRECT); u64 length; u8 protection; u8 type;
+    # u16 pad; u32 operation}. libSceComposite maps its shared 2MB chunks this
+    # way (operation 0) into the window the GnmCompositor server told it about.
+    BATCH_MAP_DIRECT, BATCH_UNMAP, BATCH_PROTECT, BATCH_MAP_FLEXIBLE, BATCH_TYPE_PROTECT = range(5)
+
+    def sys_batch_map(self, uc):
+        import struct
+        from unicorn import UC_PROT_READ, UC_PROT_WRITE
+        entries, count, p_done = self._args(uc)[2:5]
+        count &= 0xFFFFFFFF
+        done = 0
+        for i in range(count):
+            try:
+                start, off, length, prot, _typ, _pad, op = struct.unpack(
+                    "<QQQBBHI", bytes(uc.mem_read(entries + 0x20 * i, 0x20)))
+            except Exception:
+                return self._ret(uc, EFAULT, error=True)
+            if op in (self.BATCH_MAP_DIRECT, self.BATCH_MAP_FLEXIBLE):
+                if start:
+                    got = self.emu.map_fixed(start, length, prot=UC_PROT_READ | UC_PROT_WRITE)
+                else:
+                    got = self.emu.map_anon(length, prot=UC_PROT_READ | UC_PROT_WRITE)
+                if got == 0xFFFFFFFFFFFFFFFF:
+                    self.emu.log(f"  [batch_map] entry {i}: map {length:#x} @ {start:#x} FAILED")
+                    break
+                self._add_vma(start or got, length, prot, 0,
+                              off if op == self.BATCH_MAP_DIRECT else 0,
+                              op == self.BATCH_MAP_DIRECT)
+            elif op == self.BATCH_UNMAP:
+                self._cut_vmas(start, start + length)      # pages are left mapped
+            # PROTECT / TYPE_PROTECT: x86 has no per-use protection to change here
+            done += 1
+        if p_done:
+            try:
+                uc.mem_write(p_done, struct.pack("<I", done))
+            except Exception:
+                pass
+        self.emu.log(f"  [batch_map] {done}/{count} entries")
+        self._ret(uc, 0 if done == count else ENOMEM, error=done != count)
 
     # ---- virtual memory areas: what virtual_query reports -------------
     # [start, end, prot (incl. GPU bits 0x10/0x20), flags, phys offset, direct]
