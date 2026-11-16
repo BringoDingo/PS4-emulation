@@ -50,8 +50,34 @@ def _imp_eqid_from_handle(emu, uc):
     return 0
 
 
+def _imp_load_start_module(emu, uc):
+    # sceKernelLoadStartModule(path, args, argp, flags, opt, int *pRes) -> handle.
+    # Mono's AOT dl backend (libmonosgen mono_dl_open -> 0x358ba0) calls this and
+    # uses the RETURN VALUE as the module handle: a 0 return reads as a NULL
+    # MonoDl* and makes load_aot_module g_error with "assemblies built without
+    # AOT enabled". The generic unresolved-import stub returned 0, so every AOT
+    # module load failed. Load the PRX like sys_dynlib_load_prx and return its
+    # (positive) handle; a negative SceKernelError on failure so the caller's
+    # `cmovs` turns it into NULL.
+    rdi = emu.hle.args(uc)[0]
+    r9 = emu.hle.args(uc)[5]
+    path = emu.syscalls._read_cstr(uc, rdi, 256)
+    dyn = emu.dyn
+    lm = dyn.by_name(path) if dyn else None
+    if lm is None and dyn is not None:
+        lm = dyn.load_runtime(path)
+    if lm is None:
+        emu.log(f"  [import] sceKernelLoadStartModule '{path}' -> not found")
+        return 0x80020002              # SCE_KERNEL_ERROR_ENOENT (negative -> NULL)
+    if r9:
+        uc.mem_write(r9, struct.pack("<i", 0))   # module-start result
+    emu.log(f"  [import] sceKernelLoadStartModule '{path}' -> handle {lm.handle} ({lm.name})")
+    return lm.handle
+
+
 BUILTIN_IMPORTS = {
     "QyrxcdBrb0M": ("sceKernelGetEqueueId", _imp_eqid_from_handle),
+    "Y1nEpkCieOY": ("sceKernelLoadStartModule", _imp_load_start_module),
 }
 
 

@@ -170,11 +170,20 @@ class DynlibSyscalls:
         handle, name_p, out = self._args(uc)[:3]
         dyn = self._dyn()
         name = self._cstr(uc, name_p, 256)
-        key = name if (len(name) == 11 and " " not in name) else nid(name)
         lm = self._module(uc, handle)
         # strictly per module: libkernel probes every module for e.g.
         # module_start and must not get another module's symbol
-        addr = lm.mod.exports.get(key) if lm else None
+        exports = lm.mod.exports if lm else {}
+        # An 11-char name may be a pre-encoded NID or a plain symbol that is just
+        # 11 characters long (e.g. Mono AOT's "call_filter"). Try the raw key
+        # first, then fall back to the hashed NID so both resolve.
+        addr = None
+        key = name
+        if len(name) == 11 and " " not in name:
+            addr = exports.get(name)
+        if addr is None:
+            key = nid(name)
+            addr = exports.get(key)
         if addr is None:
             self.emu.log(f"  [dynlib] dlsym '{name}' ({key}) -> not found")
             return self._ret(uc, ENOENT, error=True)

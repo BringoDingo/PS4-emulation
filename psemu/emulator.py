@@ -162,7 +162,16 @@ class Emulator:
         self.lo, self.hi = lk.lo, lk.hi
         rsp = self._map_stack_and_tls()
         rsp = self.dyn.initial_stack(rsp, [self.dyn.path_guest()])
-        self.uc.reg_write(UC_X86_REG_RSP, rsp)
+        # PS4 enters the interpreter as if it had been CALLed: rsp must be
+        # 8 (mod 16) at the entry point, so that after libkernel's prologue
+        # (`sub rsp,0x18`) the first `call` is made from a 16-aligned rsp and
+        # every callee's `push rbp` yields a 16-aligned frame. initial_stack
+        # returns a 16-aligned (0 mod 16) block pointer; entering with that as
+        # rsp leaves the whole process 8 bytes misaligned (tolerated by most
+        # code via unaligned moves, but it trips Mono AOT's deliberate stack-
+        # alignment assertion deep in managed init). The argc/argv/auxv block
+        # pointer is passed in rdi (libkernel reads it there: `mov r12,rdi`).
+        self.uc.reg_write(UC_X86_REG_RSP, rsp - 8)
         self.uc.reg_write(UC_X86_REG_RDI, rsp)
         self._install_hooks()
         # libthr lives in libkernel: detect its hooks there
@@ -232,9 +241,18 @@ class Emulator:
             if not self._is_mapped(h, size):
                 addr = h
         if addr == 0:
-            a = self._mmap_next
+            # Natural alignment: allocators (notably Mono SGen's lock-free
+            # allocator, which masks any address with ~(block_size-1) to find
+            # the superblock header) assume a power-of-2-sized anonymous mapping
+            # comes back aligned to its size - the usual OS behaviour. Our bump
+            # allocator only 4K-aligns, so honour size alignment for power-of-2
+            # requests (capped so a huge request can't waste the whole region).
+            align = PAGE4K
+            if size and (size & (size - 1)) == 0 and size <= 0x0100_0000:
+                align = size
+            a = (self._mmap_next + align - 1) & ~(align - 1)
             while self._is_mapped(a, size):
-                a += size
+                a += align
             if a + size > MMAP_END:
                 return 0xFFFFFFFFFFFFFFFF
             addr = a

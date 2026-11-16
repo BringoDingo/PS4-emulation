@@ -27,6 +27,51 @@ EFAULT = 14
 EINVAL = 22
 ENOSYS = 78
 
+
+def _embedded_cil(sprx):
+    """Extract the embedded managed (.NET CIL) assembly PE from a PS4 AOT
+    `<name>.dll.sprx`. PS4 ships managed assemblies only as AOT modules that
+    embed the original assembly image; Mono opens `<name>.dll` to read the CIL
+    metadata. Scans for a valid managed PE (MZ + PE header + a CLI 'BSJB'
+    metadata root) and returns its bytes (computed from the section table), or
+    None if there is no embedded CIL."""
+    import struct
+    n = len(sprx)
+    i = 0
+    while True:
+        i = sprx.find(b"MZ", i)
+        if i < 0:
+            return None
+        start = i
+        i += 2
+        if start + 0x40 > n:
+            continue
+        e_lfanew = struct.unpack_from("<I", sprx, start + 0x3C)[0]
+        pe = start + e_lfanew
+        if not (0 < e_lfanew < 0x400 and pe + 24 <= n and sprx[pe:pe + 4] == b"PE\x00\x00"):
+            continue
+        machine, nsec = struct.unpack_from("<HH", sprx, pe + 4)
+        optsz = struct.unpack_from("<H", sprx, pe + 20)[0]
+        if machine not in (0x14C, 0x8664) or not (0 < nsec <= 96):
+            continue
+        sect = pe + 24 + optsz
+        end = 0
+        ok = True
+        for s in range(nsec):
+            base = sect + s * 40
+            if base + 40 > n:
+                ok = False
+                break
+            rawsz, rawptr = struct.unpack_from("<II", sprx, base + 16)
+            if rawptr + rawsz > end:
+                end = rawptr + rawsz
+        if not ok or end == 0 or start + end > n:
+            continue
+        pe_bytes = sprx[start:start + end]
+        if b"BSJB" in pe_bytes:        # a managed (CLI) image, not a native stub
+            return pe_bytes
+
+
 # IPMI result codes. NOT_EXIST: the client exists but its service process is not
 # emulated, so a method call cannot be answered. NO_PACKET: the receive pump
 # found no packet pending (the kernel's "would block" for a receive).
@@ -153,6 +198,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         self.vdirs = set()        # directories the guest created
         self.vgone = set()        # firmware paths the guest deleted
         self.dirfds = set()       # fds opened on a directory
+        self._cil_cache = {}      # .dll path -> CIL bytes extracted from .dll.sprx
         self.shms = {}            # fd -> shared-memory object (shm_open)
         self.shm_objs = {}        # name -> {"name", "size", "addr"} POSIX shm objects
         self.vmas = []            # mmapped ranges (see _add_vma), for virtual_query
@@ -386,6 +432,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     IPMI_WAIT_EVF = 0x490       # ipmimgr_call cmd: client waits on a service event flag
     IPMI_POLL_EVF = 0x491       # ipmimgr_call cmd: client polls a service event flag
     IPMI_RECEIVE = 0x201        # ipmimgr_call cmd: receive-pump reads the next packet
+    IPMI_USER_GET_EVENT = 0x252 # ipmimgr_call cmd: SceUserService getEvent try-receive
+    # Service event flags (cmd 0x490 waitEventFlag) satisfied immediately instead
+    # of parking: the compositor fires a vblank/flip event every frame on a
+    # console, so the UI render thread's wait must complete for frames to flow.
+    IPMI_EVF_SATISFY = frozenset({"SceVideoCoreServer"})
 
     def _ipmi_service_name(self, uc, in_ptr, size):
         import struct
@@ -539,6 +590,51 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         sched = self.emu.sched
         if sched is None or getattr(sched, "current", None) is None:
             return IPMI_TIMED_OUT
+        # SceVideoCoreServer is the compositor: the UI's render thread waits on
+        # its event flag (idx 0, pattern 0xff, OR|CLEAR) for a vblank/flip/
+        # composite-done event. On a console the compositor sets these bits
+        # every vblank; nothing does here, so the thread just keeps timing out
+        # and the render loop never advances. Deliver a SUCCESS wake with the
+        # requested bits set, paced at one frame (~16.7ms, 60Hz) - this still
+        # BLOCKS (so the scheduler runs the init/render threads and the thread
+        # does not hog the CPU) but wakes as if a vblank fired instead of
+        # ETIMEDOUT. {u32 idx@0; u64 pattern@8; u32 mode@0x10; u64 *result@0x18;
+        # u32 *timeout@0x20}.
+        if name in self.IPMI_EVF_SATISFY:
+            try:
+                pattern = struct.unpack("<Q", bytes(uc.mem_read(in_ptr + 8, 8)))[0]
+            except Exception:
+                pattern = 0xff
+            try:
+                p_bits = struct.unpack("<Q", bytes(uc.mem_read(in_ptr + 0x18, 8)))[0]
+            except Exception:
+                p_bits = 0
+            frame_ns = 16_666_667           # 60 Hz vblank
+            if timeout_us is not None:
+                frame_ns = min(frame_ns, timeout_us * 1000)
+
+            def on_frame(th, result_ptr=result_ptr, p_to=p_to,
+                         p_bits=p_bits, pattern=(pattern or 0xff)):
+                try:
+                    if result_ptr:
+                        self.emu.uc.mem_write(result_ptr, struct.pack("<I", 0))
+                    if p_bits:
+                        self.emu.uc.mem_write(p_bits, struct.pack("<Q", pattern))
+                    if p_to:
+                        self.emu.uc.mem_write(p_to, struct.pack("<I", 0))
+                except Exception:
+                    pass
+
+            seen = self.__dict__.setdefault("_ipmi_evf_sat_seen", set())
+            if name not in seen:
+                seen.add(name)
+                self.emu.log(f"  [ipmi] wait_evf {name}: driving at 60Hz "
+                             "(compositor vblank fired on wake)")
+            sched.block({"kind": "ipmi_wait_evf", "kid": kid, "name": name,
+                         "on_timeout": on_frame},
+                        deadline_ns=sched.now_ns() + frame_ns,
+                        timeout_ret=(0, False))
+            return None                     # blocked; on_frame delivers success
 
         def on_timeout(th, result_ptr=result_ptr, p_to=p_to):
             try:
@@ -674,6 +770,25 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         #    sync methods return their result (and out-data) directly through the
         #    syscall, so we answer per (service, method).
         #  * everything else (connect, ...): success.
+        if cmd == self.IPMI_USER_GET_EVENT and nm == "SceUserService":
+            # SceUserService getEvent try-receive (libSceUserService getEvent
+            # @+0x1cb0: in+0x08 = 8-byte event buf, in+0x10 = size-out, in+0x18
+            # = max 8). The shell_ui main thread DRAINS this in a loop
+            # (`call getEvent; test eax,eax; je loop` - loops while getEvent
+            # returns 0 = "processed an event"). Reporting empty-success made
+            # getEvent read a zeroed 8-byte buffer as a null event id 0, keep
+            # "processing" it, return 0, and spin forever (logging "tryGetMsg:
+            # size is 0"). getEvent explicitly treats 0x80020023 as "no event"
+            # (@+0x1d65) and then returns non-zero (NO_EVENT), so the drain loop
+            # exits and system init proceeds. No user is logged in on a console
+            # until one is selected; an empty queue is the correct boot state.
+            result = 0x80020023            # SCE_KERNEL_ERROR no-data / no event
+            if result_ptr:
+                try:
+                    uc.mem_write(result_ptr, struct.pack("<I", result))
+                except Exception:
+                    pass
+            return self._ret(uc, 0)
         if cmd == self.IPMI_RECEIVE:
             # The kernel blocks a receive until a packet arrives for that
             # client/server. Nothing sends packets yet (no request/response
@@ -1021,6 +1136,52 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 data = self.vfs[p] = bytearray()
                 self.vgone.discard(p)
                 kind = " (created)"
+            elif path.endswith(".la") and self._vfile(p[:-3]) is not None:
+                # Mono's AOT-only loader opens a libtool '<name>.dll.sprx.la'
+                # descriptor to locate the AOT module; the dump has none.
+                # Synthesize a minimal libtool .la pointing at the .sprx that
+                # IS present (psemu resolves it by basename), so Mono dlopens it
+                # and dlsym's mono_aot_file_info. Keys Mono parses: dlname,
+                # libdir, installed.
+                import os as _os
+                base = _os.path.basename(p[:-3])
+                libdir = _os.path.dirname(path) or "/"
+                la = (
+                    f"# {base}.la - a libtool library file (generated by psemu)\n"
+                    f"dlname='{base}'\n"
+                    f"library_names='{base}'\n"
+                    f"old_library=''\n"
+                    f"inherited_linker_flags=''\n"
+                    f"dependency_libs=''\n"
+                    f"weak_library_names=''\n"
+                    f"current=0\n"
+                    f"age=0\n"
+                    f"revision=0\n"
+                    f"installed=yes\n"
+                    f"shouldnotlink=no\n"
+                    f"dlopen=''\n"
+                    f"dlpreopen=''\n"
+                    f"libdir='{libdir}'\n"
+                ).encode()
+                data = bytearray(la)
+                kind = f" (generated .la -> {base})"
+            elif path.endswith((".dll", ".exe")) and self._vfile(p + ".sprx") is not None:
+                # A managed assembly whose CIL .dll isn't in the dump, only its
+                # AOT module .dll.sprx. PS4 AOT embeds the original managed PE
+                # inside the .sprx, so extract and serve it as the .dll Mono
+                # opens (otherwise Mono reads an empty file -> "invalid CIL
+                # image"). Cached: the scan is over a multi-MB blob.
+                cil = self._cil_cache.get(p)
+                if cil is None:
+                    cil = _embedded_cil(bytes(self._vfile(p + ".sprx")))
+                    self._cil_cache[p] = cil if cil is not None else b""
+                if cil:
+                    data = bytearray(cil)
+                    kind = f" (CIL from .sprx {len(data)}B)"
+                else:
+                    self.fds.pop(fd, None)
+                    self.emu.log(f"  [open] '{path}' -> ENOENT (no embedded CIL in .sprx)")
+                    return self._ret(uc, ENOENT, error=True)
             else:
                 # Not in the dump and not being created. Kept permissive (an
                 # empty file) like before; reads see EOF.
@@ -1342,6 +1503,25 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             if length <= shm.get("span", 0):
                 self.emu.log(f"  [mmap] shm '{shm['name']}' -> 0x{shm['addr']:x} (len={length:#x})")
                 return self._ret(uc, shm["addr"])
+        fil = self.files.get(fd) if not flags & MAP_ANON else None
+        if fil is not None:
+            # File-backed mmap: anonymous pages with the file's bytes copied in
+            # from `offset`. Mono maps assembly (.dll) images this way to read
+            # their CIL; without this it would see zeroed pages ("invalid CIL
+            # image"). MAP_PRIVATE semantics are fine - these are read as data.
+            got = self.emu.map_anon(length, addr_hint=addr,
+                                    prot=UC_PROT_READ | UC_PROT_WRITE)
+            if got == 0xFFFFFFFFFFFFFFFF:
+                return self._ret(uc, ENOMEM, error=True)
+            chunk = bytes(fil["data"])[offset:offset + length]
+            try:
+                uc.mem_write(got, chunk)
+            except Exception:
+                return self._ret(uc, ENOMEM, error=True)
+            self._add_vma(got, length, prot, flags, offset, False)
+            self.emu.log(f"  [mmap] file '{fil.get('path', '')}' off={offset:#x} "
+                         f"-> 0x{got:x} (len={length:#x})")
+            return self._ret(uc, got)
         if dev is not None:
             got = dev.mmap(uc, length, prot, offset)
             if got is not None:
