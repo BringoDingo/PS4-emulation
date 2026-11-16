@@ -96,7 +96,11 @@ def _load_syscall_names():
     import os
     path = os.environ.get("PSEMU_SYSCALLS_CSV", SYSCALLS_CSV)
     if not os.path.isfile(path):
-        return 0
+        # fall back to a table generated next to this file:
+        #   python -m psemu.tools_syscall_scan libkernel.sprx -o psemu/syscalls.csv
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "syscalls.csv")
+        if not os.path.isfile(path):
+            return 0
     added = 0
     with open(path, newline="", encoding="utf-8", errors="replace") as fh:
         for row in csv.DictReader(fh):

@@ -772,83 +772,35 @@ class Emulator:
         return None
 
     def run(self, start=None):
+        """Single-process driver: start, step to completion, summarise. A
+        ProcessManager interleaves several processes by calling begin_run once
+        per process and then round-robining _run_segment (see MULTIPROCESS.md)."""
         if self._dynamic_block:
             self.log(f"\n== stopped: {self._stop_reason} ==")
             return self._stop_reason
+        cur = self.begin_run(start)
+        while cur is not None:
+            cur = self._run_segment(cur)
+        return self.end_run()
+
+    def begin_run(self, start=None):
+        """Prologue of a run: set up the thread scheduler and return the RIP to
+        start stepping from, or None if there is nothing to run. Split out from
+        run() so a ProcessManager can start several processes and then
+        round-robin their _run_segment (see MULTIPROCESS.md)."""
+        if self._dynamic_block:
+            return None
         if start is None:
             start = self.entry_point
         self.log(f"\n== running module #{self.module_index} from 0x{start:x} "
                  f"(max {self.max_insns} insns) ==")
-        cur = start
         from .threads import Scheduler
         self.sched = Scheduler(self)
         self.sched.adopt_main(DEFAULT_TID)
-        # Emulation runs in segments: an HLE hook stops the CPU, an execve
-        # queues a new image, a thread switch changes the CPU context, and we
-        # restart. A real stop reason ends the loop.
-        native = self.native
-        while True:
-            self._hle_pending = False
-            if native is not None:
-                ns = native.s
-                ns.reason = 0
-                before = ns.count
-                # stop for the budget or the end of this thread's time slice
-                ns.limit = min(self.max_insns, before + max(self.sched.slice_left, 1))
-            try:
-                self.uc.emu_start(cur, 0)
-            except UcError as e:
-                rip = self.uc.reg_read(UC_X86_REG_RIP)
-                if self._stop_reason is None:
-                    self._stop_reason = f"UcError: {e} at rip=0x{rip:x}"
-                break
-            if native is not None:
-                self.sched.slice_left -= ns.count - before
-                if ns.reason:
-                    if (self._stop_reason is None and not self.sched.switch_pending
-                            and not self._exec_next):
-                        cur = self._native_stop()
-                        if (self._stop_reason is None and not self.sched.switch_pending
-                                and not self._exec_next):
-                            continue
-                    else:
-                        ns.reason = 0
-            if self.sched.switch_pending and self._stop_reason is None and not self._exec_next:
-                nxt = self.sched.switch()
-                if nxt is None:
-                    ts = self.sched.threads.values()
-                    if all(t.state == "exited" for t in ts):
-                        self._stop_reason = "all threads exited"
-                    elif any(isinstance(t.wait, dict) and t.wait.get("kind") == "kevent"
-                             for t in ts):
-                        # every thread sleeps; at least one waits for events
-                        # that nothing in the emulated system will produce
-                        self._stop_reason = ("module booted; idle in event loop (no events "
-                                             "to deliver) - " + self.sched.describe())
-                    else:
-                        self._stop_reason = "deadlock: " + self.sched.describe()
-                    break
-                cur = nxt
-                continue
-            if self._exec_next and self._stop_reason is None:
-                path, argv = self._exec_next
-                self._exec_next = None
-                if self.module_index + 1 >= self.max_modules:
-                    self._stop_reason = (f"reached max-modules={self.max_modules} "
-                                         f"(next was {os.path.basename(path)})")
-                    break
-                self.module_index += 1
-                self._build_image(path)   # fresh address space; fds inherited
-                self.sched = Scheduler(self)          # a new process: one thread
-                self.sched.adopt_main(DEFAULT_TID)
-                if self._dynamic_block:   # next stage is dynamically linked
-                    break
-                cur = self.entry_point
-                continue
-            if self._hle_pending and self._stop_reason is None:
-                cur = self.uc.reg_read(UC_X86_REG_RIP)
-                continue
-            break
+        return start
+
+    def end_run(self):
+        """Epilogue of a run: print the summaries and return the stop reason."""
         self.log(f"\n== stopped: {self._stop_reason or 'clean exit'} ==")
         self.log(f"   ran {self.module_index + 1} module(s), "
                  f"{self._insn_count} instructions total, "
@@ -860,3 +812,72 @@ class Emulator:
         self.log(self.hle.summary())
         self.log(self.sched.summary())
         return self._stop_reason
+
+    def _run_segment(self, cur):
+        """One scheduling segment: run the CPU from `cur` until the native/HLE
+        hook, a thread switch, an execve, or a stop interrupts it, then do the
+        corresponding bookkeeping. Returns the RIP to resume at next, or None
+        when this process is finished (a stop reason has been set). Extracted
+        from run()'s loop body unchanged so the behaviour is identical; it is
+        the per-process step a multi-process ProcessManager drives (see
+        MULTIPROCESS.md)."""
+        from .threads import Scheduler
+        native = self.native
+        self._hle_pending = False
+        if native is not None:
+            ns = native.s
+            ns.reason = 0
+            before = ns.count
+            # stop for the budget or the end of this thread's time slice
+            ns.limit = min(self.max_insns, before + max(self.sched.slice_left, 1))
+        try:
+            self.uc.emu_start(cur, 0)
+        except UcError as e:
+            rip = self.uc.reg_read(UC_X86_REG_RIP)
+            if self._stop_reason is None:
+                self._stop_reason = f"UcError: {e} at rip=0x{rip:x}"
+            return None
+        if native is not None:
+            self.sched.slice_left -= ns.count - before
+            if ns.reason:
+                if (self._stop_reason is None and not self.sched.switch_pending
+                        and not self._exec_next):
+                    cur = self._native_stop()
+                    if (self._stop_reason is None and not self.sched.switch_pending
+                            and not self._exec_next):
+                        return cur
+                else:
+                    ns.reason = 0
+        if self.sched.switch_pending and self._stop_reason is None and not self._exec_next:
+            nxt = self.sched.switch()
+            if nxt is None:
+                ts = self.sched.threads.values()
+                if all(t.state == "exited" for t in ts):
+                    self._stop_reason = "all threads exited"
+                elif any(isinstance(t.wait, dict) and t.wait.get("kind") == "kevent"
+                         for t in ts):
+                    # every thread sleeps; at least one waits for events
+                    # that nothing in the emulated system will produce
+                    self._stop_reason = ("module booted; idle in event loop (no events "
+                                         "to deliver) - " + self.sched.describe())
+                else:
+                    self._stop_reason = "deadlock: " + self.sched.describe()
+                return None
+            return nxt
+        if self._exec_next and self._stop_reason is None:
+            path, argv = self._exec_next
+            self._exec_next = None
+            if self.module_index + 1 >= self.max_modules:
+                self._stop_reason = (f"reached max-modules={self.max_modules} "
+                                     f"(next was {os.path.basename(path)})")
+                return None
+            self.module_index += 1
+            self._build_image(path)   # fresh address space; fds inherited
+            self.sched = Scheduler(self)          # a new process: one thread
+            self.sched.adopt_main(DEFAULT_TID)
+            if self._dynamic_block:   # next stage is dynamically linked
+                return None
+            return self.entry_point
+        if self._hle_pending and self._stop_reason is None:
+            return self.uc.reg_read(UC_X86_REG_RIP)
+        return None

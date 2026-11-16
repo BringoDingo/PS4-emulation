@@ -116,6 +116,8 @@ class SyncSyscalls:
             self.evfs = {}             # handle -> EventFlag
             self.sems = {}             # handle -> Semaphore
             self.umtx_ops = {}         # op -> count (summary)
+            from .ext_policy import get_policy
+            self.ext_policy = get_policy(self.emu.log)   # opened-only objects
 
     def _rd32(self, uc, a):
         return struct.unpack("<I", bytes(uc.mem_read(a, 4)))[0]
@@ -165,6 +167,17 @@ class SyncSyscalls:
 
     def _tid(self):
         return self.emu.sched.current.tid
+
+    def _caller(self, uc):
+        """Best-effort 'rip / stack top' of the syscall site, for the audit log
+        (the stack top is usually the libkernel wrapper's return address)."""
+        try:
+            from unicorn.x86_const import UC_X86_REG_RIP, UC_X86_REG_RSP
+            rip = uc.reg_read(UC_X86_REG_RIP)
+            top = struct.unpack("<Q", bytes(uc.mem_read(uc.reg_read(UC_X86_REG_RSP), 8)))[0]
+            return f"rip={rip:#x} ret?={top:#x}"
+        except Exception:
+            return ""
 
     # ---- _umtx_op --------------------------------------------------------
     def sys__umtx_op(self, uc):
@@ -409,19 +422,23 @@ class SyncSyscalls:
             return self._ret(uc, EPERM, error=True)
         timeout_us = self._rd32(uc, timeout_p) if timeout_p else None
         if ef.external:
-            # The owner process isn't emulated; on a booted console it has
-            # set these bits (boot status, service ready...). Stand in for it.
-            # This holds whether or not the caller passed a timeout: the bits
-            # would be set on real hardware, so satisfy the wait immediately
-            # instead of blocking/polling until the timeout fires.
-            if (bits, mode) not in ef.assumed:
-                ef.assumed.add((bits, mode))
-                self.emu.log(f"  [evf] '{ef.name}': no owner process here - assuming "
-                             f"bits {bits:#x} are set (as on a booted system)")
-            ef.bits |= bits
-            self._evf_result(uc, result, ef.bits)
-            ef.consume(bits, mode)
-            return self._ret(uc, 0)
+            # The owner process isn't emulated; on a booted console it has set
+            # these bits (boot status, service ready...). ext_policy decides, per
+            # object name, whether to stand in for it (see ext_policy.py). The
+            # default is the old behaviour: assume the bits asked for are set,
+            # with or without a timeout (they would be on real hardware).
+            verdict = self.ext_policy.evf_wait(ef.name, bits, bool(mode & EVF_WAITMODE_AND),
+                                               self._caller(uc))
+            if verdict.action == "timeout":
+                self._evf_result(uc, result, ef.bits)
+                return self._ret(uc, ETIMEDOUT, error=True)
+            if verdict.action == "satisfy":
+                ef.bits |= verdict.set_bits
+                if ef.satisfied(bits, mode):
+                    self._evf_result(uc, result, ef.bits)
+                    ef.consume(bits, mode)
+                    return self._ret(uc, 0)
+            # "block", or the owner's bits don't meet this wait: wait for real
         if timeout_us == 0:
             self._evf_result(uc, result, ef.bits)
             return self._ret(uc, ETIMEDOUT, error=True)
@@ -563,15 +580,16 @@ class SyncSyscalls:
             sem.count -= need
             return self._ret(uc, 0)
         timeout_us = self._rd32(uc, timeout_p) if timeout_p else None
-        if sem.external and timeout_us is None and not sem.assumed:
-            # The owner process isn't emulated; stand in for its signal ONCE,
-            # so a start-up handshake completes. After that nobody posts it: a
-            # semaphore used as an event queue ("wait, then fetch the event")
-            # must block like an idle queue rather than be granted forever.
-            sem.assumed = True
-            self.emu.log(f"  [sema] '{sem.name}': no owner process here - "
-                         f"assuming it is signalled once")
-            return self._ret(uc, 0)
+        if sem.external:
+            # Owner not emulated. Default (no policy): stand in for its signal
+            # ONCE, untimed, so a start-up handshake completes; afterwards a
+            # semaphore used as an event queue blocks like an idle queue.
+            act = self.ext_policy.sema_wait(sem.name, timeout_us is not None,
+                                            self._caller(uc))
+            if act == "satisfy":
+                return self._ret(uc, 0)
+            if act == "timeout":
+                return self._ret(uc, ETIMEDOUT, error=True)
         if timeout_us == 0:
             return self._ret(uc, ETIMEDOUT, error=True)
         sched = self.emu.sched

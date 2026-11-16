@@ -1,0 +1,10 @@
+{
+  "_how_to": "Copy to a file and set PSEMU_EXT_POLICY=<path>. First matching rule wins. Run once with no policy, read the [ext] lines / exit report, then pin what matters. Unlisted objects keep the old behaviour.",
+  "_fields": "name (glob), kind evf|sema|any, action satisfy|block|timeout, bits (evf: owner's bits), signals (sema: assumed grants, -1 = unlimited), timed (sema: also grant timed waits), note",
+  "_examples": [
+    {"name": "SceBootStatusFlags", "kind": "evf", "action": "satisfy", "bits": "0x0", "note": "REPLACE 0x0 with the bits that mean 'booted OK' once you've read the guest's handling"},
+    {"name": "SceNp*", "action": "timeout", "note": "offline console: network/PSN owners never answer"},
+    {"name": "SceSomeEventQueueSema", "kind": "sema", "action": "block", "note": "used as an idle event queue"}
+  ],
+  "rules": []
+}

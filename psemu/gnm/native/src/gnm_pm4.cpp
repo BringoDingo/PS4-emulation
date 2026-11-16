@@ -436,6 +436,9 @@ struct Processor {
             if (dst_sel == 1 && (at(3) % gds.size()) + bytes > gds.size()) {
                 Fail("DMA_DATA past the end of GDS");
             }
+            if (src_sel == 1 && (at(1) % gds.size()) + bytes > gds.size()) {
+                Fail("DMA_DATA source past the end of GDS");   // was an unchecked heap over-read
+            }
             if (src_sel == 2) { // fill with a constant dword
                 for (u32 k = 0; k + 4 <= bytes; k += 4) {
                     std::memcpy(dptr + k, &b[1], 4);
