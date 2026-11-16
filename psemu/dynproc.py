@@ -227,6 +227,52 @@ class DynamicProcess:
             self._np_shared_heap(lm)
         elif name.startswith("libscenputility"):
             self._np_utility_once(lm)
+        elif name.startswith("libmonosgen"):
+            self._mono_icall_stub(lm)
+
+    def _mono_icall_stub(self, lm):
+        """libmonosgen g_errors ("Unregistered icall '%s'") and aborts when
+        managed code calls an [InternalCall] method whose native implementation
+        was never registered via mono_add_internal_call. On a console the Sce
+        native libraries register their icalls at startup; psemu runs the
+        managed side but not every native registrant, so some icalls (e.g.
+        Sce.Cdlg.Framework.Util.NativeFunc:GetCompileSdkVersion, reached deep in
+        the system-UI init) are missing and abort the whole process.
+
+        mono_lookup_internal_call (+0x24200) puts the resolved icall pointer in
+        r14 and, at +0x24289, a NULL r14 falls through to the g_error. Point a
+        NULL r14 at a return-0 guest stub instead, so the call returns 0 rather
+        than aborting. The stub's value may be wrong for a given icall and show
+        up as odd behaviour later, but it turns a hard abort into forward
+        progress -- the right fix is to register the real icalls."""
+        emu = self.emu
+        from unicorn.x86_const import UC_X86_REG_R14, UC_X86_REG_RBX
+        stub = getattr(emu, "_icall_stub_addr", 0)
+        if not stub:
+            stub = emu.map_anon(0x1000)
+            if stub == 0xFFFFFFFFFFFFFFFF:
+                return
+            # xor eax,eax; xor edx,edx; ret  -> returns 0 (int / ptr / void)
+            emu.uc.mem_write(stub, b"\x31\xc0\x31\xd2\xc3")
+            emu._icall_stub_addr = stub
+        seen = emu.__dict__.setdefault("_icall_stubbed", set())
+
+        def icall_stub(emu, uc):
+            if uc.reg_read(UC_X86_REG_R14) == 0:
+                uc.reg_write(UC_X86_REG_R14, emu._icall_stub_addr)
+                try:
+                    meth = struct.unpack("<Q", bytes(uc.mem_read(
+                        uc.reg_read(UC_X86_REG_RBX) + 0x20, 8)))[0]
+                except Exception:
+                    meth = 0
+                if meth not in seen:
+                    seen.add(meth)
+                    emu.log(f"  [mono] unregistered icall (MonoMethod {meth:#x})"
+                            f" -> return-0 stub")
+            return None
+
+        emu.hle.register(lm.base + 0x24289, icall_stub,
+                         name="mono_icall_stub", mode="fixup")
 
     def _np_utility_once(self, lm):
         """libSceNpUtility's module start (+0x1acc0) calls sceNpUtilityInit
