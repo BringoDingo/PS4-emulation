@@ -38,6 +38,7 @@ class Thread:
         self.timeout_ret = None   # (value, error) delivered when the deadline passes
         self.insns = 0
         self.switches_in = 0
+        self.spawn_child = False   # created by rfork() for a process spawn
 
     def __repr__(self):
         return f"<thread {self.tid:#x} {self.name!r} {self.state}>"

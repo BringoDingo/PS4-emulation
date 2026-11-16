@@ -25,6 +25,11 @@ def main():
                          "(default: the directory of the first module)")
     ap.add_argument("--max-modules", type=int, default=8,
                     help="stop after chain-loading this many modules")
+    ap.add_argument("--spawn-mode", default=None,
+                    help="process-spawn policy for execve() from an rfork'd child: "
+                         "'follow' (default, chain-load/replace the image), 'stay' "
+                         "(keep running the parent, retire spawned children), or a "
+                         "path substring to follow only matching children (e.g. NPXS20001)")
     ap.add_argument("--no-gpu", action="store_true",
                     help="accept /dev/gc submits without running them on the host GPU")
     ap.add_argument("--frames", default=None,
@@ -39,6 +44,7 @@ def main():
     emu = Emulator(args.file, trace=args.trace, max_insns=args.max,
                    fw_root=args.fw_root)
     emu.max_modules = args.max_modules
+    emu.spawn_mode = args.spawn_mode
     emu.gpu_enabled = not args.no_gpu
     emu.gpu_profile = args.gpu_profile
     if args.frames:

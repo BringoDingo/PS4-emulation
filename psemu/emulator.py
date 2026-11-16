@@ -85,6 +85,13 @@ class Emulator:
         self.sched = None                          # threads.Scheduler, set by run()
         self.module_index = 0
         self.max_modules = 8                       # chain-load safety cap
+        # process-spawn policy for execve() from an rfork'd child (see
+        # SyscallDispatcher.sys_execve). None/"follow" = chain-load the child,
+        # replacing the image (the default, and how boot handoffs work);
+        # "stay" = keep running the parent process and retire the spawned
+        # child; any other string = a path substring to follow (chain-load a
+        # child whose path contains it, otherwise stay with the parent).
+        self.spawn_mode = None
         self._rip_history = collections.deque(maxlen=24)
 
         # --- per-image state (reset by _build_image) ---

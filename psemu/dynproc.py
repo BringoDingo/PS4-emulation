@@ -35,6 +35,26 @@ AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_BASE, AT_FLAGS, AT_ENTRY = 0
 AT_EXECPATH = 15
 
 
+# Correct implementations for imports that live in firmware libraries psemu
+# doesn't load (e.g. libkernel_sys variants), so they'd otherwise fall back to
+# the generic return-0 stub and misbehave. handler(emu, uc) -> rax; read args
+# with emu.hle.args(uc) = (rdi, rsi, rdx, rcx, r8, r9).
+def _imp_eqid_from_handle(emu, uc):
+    # libkernel_sys QyrxcdBrb0M(handle, int *out): out = (u32)handle; 0 (or
+    # EINVAL for a NULL out). SceSysCore's process_monitor extracts an event-
+    # queue id this way and asserts it is >= 0.
+    rdi, rsi = emu.hle.args(uc)[:2]
+    if not rsi:
+        return 0x80020016          # SCE_KERNEL_ERROR_EINVAL
+    uc.mem_write(rsi, struct.pack("<I", rdi & 0xFFFFFFFF))
+    return 0
+
+
+BUILTIN_IMPORTS = {
+    "QyrxcdBrb0M": ("sceKernelGetEqueueId", _imp_eqid_from_handle),
+}
+
+
 def _up(x, a=PAGE):
     return (x + a - 1) & ~(a - 1)
 
@@ -179,6 +199,31 @@ class DynamicProcess:
         name = lm.name.lower()
         if name.startswith("libscenpmanager"):
             self._np_shared_heap(lm)
+        elif name.startswith("libscenputility"):
+            self._np_utility_once(lm)
+
+    def _np_utility_once(self, lm):
+        """libSceNpUtility's module start (+0x1acc0) calls sceNpUtilityInit
+        (+0x1aa80) itself unless its start argument's first byte says not to;
+        psemu starts libraries with (0, NULL), so it does. ScePsnCore then
+        calls sceNpUtilityInit explicitly, and its sceNpLookupInit (+0xb150)
+        finds its "initialised" byte (+0x2cbac) set and returns
+        ALREADY_INITIALIZED (0x80550701) - "Failed to init PsnCore", then the
+        shell null-derefs at SceShellCore+0x62af44. Same single-process
+        collision as the NP heap: the library is up, so a second
+        sceNpUtilityInit reports success instead of re-running."""
+        emu = self.emu
+        base = lm.base
+        LOOKUP_INITED = base + 0x2cbac         # sceNpLookupInit's guard byte
+
+        def utility_init_once(emu, uc):
+            if bytes(uc.mem_read(LOOKUP_INITED, 1))[0]:
+                emu.log("  [np] sceNpUtilityInit again: already up -> 0")
+                return 0
+            return None
+
+        emu.hle.register(base + 0x1aa80, utility_init_once,
+                         name="np_utility_init_once", mode="guard")
 
     def _np_shared_heap(self, lm):
         """libSceNpManager's NP global-heap init (sub_13e10) is a process-wide
@@ -245,10 +290,15 @@ class DynamicProcess:
             self.unresolved[nid] = a
             self.stubs[a] = nid
 
-            def unresolved_import(emu, uc, nid=nid):
-                emu.log(f"  [import] unresolved NID {nid} called -> returning 0")
-                return 0
-            self.emu.hle.register(a, unresolved_import, name="import:" + nid)
+            builtin = BUILTIN_IMPORTS.get(nid)
+            if builtin is not None:
+                name, handler = builtin
+                self.emu.hle.register(a, handler, name="import:" + name)
+            else:
+                def unresolved_import(emu, uc, nid=nid):
+                    emu.log(f"  [import] unresolved NID {nid} called -> returning 0")
+                    return 0
+                self.emu.hle.register(a, unresolved_import, name="import:" + nid)
         return a
 
     def _relocate(self, lm, counts):

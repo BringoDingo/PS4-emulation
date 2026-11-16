@@ -105,6 +105,19 @@ class AvxShim:
         mn = insn.mnemonic
         handler = getattr(self, f"op_{mn}", None)
         if handler is None:
+            # Not one of this shim's own ops - try the VexEngine (avx_ops),
+            # which covers the wide VEX form set (vpermilps, ...).
+            from .avx_ops import VexEngine
+            if not hasattr(self, "_vex"):
+                self._vex = VexEngine(self)
+            self.uc = uc
+            try:
+                if self._vex.emulate(insn):
+                    self.handled[mn] = self.handled.get(mn, 0) + 1
+                    uc.reg_write(self._uc_reg("rip"), rip + insn.size)
+                    return True
+            except Exception as e:
+                self.emu.log(f"  [avx] 0x{rip:x}: {mn} {insn.op_str} via VexEngine failed: {e!r}")
             raw = " ".join(f"{b:02x}" for b in insn.bytes)
             self.emu.log(f"  [avx UNHANDLED] 0x{rip:x}: {raw}  {mn} {insn.op_str}")
             self.emu.stop(f"unhandled AVX insn '{mn}' at 0x{rip:x}")

@@ -34,7 +34,9 @@ class HleHooks:
     def register(self, addr, handler, name=None, mode="replace"):
         """mode='replace': handler returns rax; the shim performs `ret` so the
         native body never runs. mode='fixup': handler patches memory/regs at
-        the entry, then the native function executes normally."""
+        the entry, then the native function executes normally. mode='guard':
+        a handler returning None lets the native function run; any other value
+        returns it immediately (like 'replace')."""
         self.table[addr] = (name or f"hle_{addr:x}", handler, mode)
         native = getattr(self.emu, "native", None)
         if native is not None:
@@ -66,8 +68,8 @@ class HleHooks:
             a = self.args(uc)
             self.emu.log(f"  [hle {name}/{mode}] args=({a[0]:#x}, {a[1]:#x}, {a[2]:#x})")
         ret = handler(self.emu, uc)
-        if mode == "fixup":
-            return False
+        if mode == "fixup" or (mode == "guard" and ret is None):
+            return False     # guard: None = let the native function run
         # replace: perform the ret: pop return address
         rsp = uc.reg_read(UC_X86_REG_RSP)
         retaddr = struct.unpack("<Q", bytes(uc.mem_read(rsp, 8)))[0]

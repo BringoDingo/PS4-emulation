@@ -334,6 +334,47 @@ class VexEngine:
             out.append(cat[imm:imm + 16])
         self.put(insn, insn.operands[0], np.concatenate(out).tobytes())
 
+    def op_vpermilps(self, insn, w):
+        # In-lane permute of 4 f32 per 128-bit lane. Two forms: immediate
+        # (op2 = imm8, two bits select each lane) or variable (op2 = a vector
+        # whose low 2 bits of each dword select). Permuting bit patterns, so
+        # read/write as u32.
+        ops = insn.operands
+        src = _np(self.pad(self.get(insn, ops[1], w), w), U32)
+        out = np.zeros(w // 4, U32)
+        if ops[2].type == X86_OP_IMM:
+            imm = ops[2].imm
+            for l in range(w // 16):
+                s = src[4 * l:4 * l + 4]
+                for i in range(4):
+                    out[4 * l + i] = s[(imm >> (2 * i)) & 3]
+        else:
+            ctrl = _np(self.pad(self.get(insn, ops[2], w), w), U32)
+            for l in range(w // 16):
+                s = src[4 * l:4 * l + 4]
+                for i in range(4):
+                    out[4 * l + i] = s[ctrl[4 * l + i] & 3]
+        self.put(insn, ops[0], out.tobytes())
+
+    def op_vpermilpd(self, insn, w):
+        # In-lane permute of 2 f64 per 128-bit lane; one bit selects each lane.
+        ops = insn.operands
+        src = _np(self.pad(self.get(insn, ops[1], w), w), U64)
+        out = np.zeros(w // 8, U64)
+        if ops[2].type == X86_OP_IMM:
+            imm = ops[2].imm
+            for l in range(w // 16):
+                s = src[2 * l:2 * l + 2]
+                out[2 * l] = s[imm >> (2 * l) & 1]
+                out[2 * l + 1] = s[(imm >> (2 * l + 1)) & 1]
+        else:
+            ctrl = _np(self.pad(self.get(insn, ops[2], w), w), U64)
+            for l in range(w // 16):
+                s = src[2 * l:2 * l + 2]
+                out[2 * l] = s[(ctrl[2 * l] >> 1) & 1]
+                out[2 * l + 1] = s[(ctrl[2 * l + 1] >> 1) & 1]
+        self.put(insn, ops[0], out.tobytes())
+
     def op_vpmuludq(self, insn, w):
         a, b = self._ab(insn, w, U32)
         r = a[0::2].astype(np.uint64) * b[0::2].astype(np.uint64)

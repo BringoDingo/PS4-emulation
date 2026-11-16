@@ -20,6 +20,7 @@ from unicorn.x86_const import (
 EPERM = 1
 ENOENT = 2
 EBADF = 9
+EEXIST = 17
 ENOMEM = 12
 EACCES = 13
 EFAULT = 14
@@ -140,7 +141,14 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         self.fds = {0: "stdin", 1: "stdout", 2: "stderr"}
         self.kqueues = set()
         self.devs = {}            # fd -> devices.Device (/dev/gc, /dev/dce, ...)
-        self.files = {}           # fd -> {"data": bytes, "pos": int} for real firmware files
+        self.files = {}           # fd -> {"data": bytearray, "pos", "append", "path"} open files
+        # Writable file layer: guest path -> contents. Firmware files are copied
+        # in on first open, so writes never touch the dump on disk; files the
+        # guest creates (databases, journals, flags) live here for the run.
+        self.vfs = {}
+        self.vdirs = set()        # directories the guest created
+        self.vgone = set()        # firmware paths the guest deleted
+        self.dirfds = set()       # fds opened on a directory
         self.shms = {}            # fd -> shared-memory object (shm_open)
         self.shm_objs = {}        # name -> {"name", "size", "addr"} POSIX shm objects
         self.vmas = []            # mmapped ranges (see _add_vma), for virtual_query
@@ -308,6 +316,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         fl = uc.reg_read(UC_X86_REG_RFLAGS) & ~1
         t = sched.fork_current(rip, {UC_X86_REG_RAX: self.PID, UC_X86_REG_RDX: 1,
                                      UC_X86_REG_RFLAGS: fl}, name=f"pid{pid}")
+        t.spawn_child = True                           # an execve() here spawns a process
         self.emu.log(f"  [rfork] flags={flags:#x} -> child pid {pid} (thread {t.tid:#x}, "
                      f"shares memory)")
         uc.reg_write(UC_X86_REG_RDX, 0)
@@ -321,6 +330,13 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             self._ret(uc, EBADF, error=True)
             return
         raw = bytes(data)
+        f = self.files.get(fd & 0xFFFFFFFF)
+        if f is not None:
+            pos = len(f["data"]) if f.get("append") else f["pos"]
+            self._vwrite(f["data"], pos, raw)
+            f["pos"] = pos + len(raw)
+            self.emu.log(f"  [write] '{f.get('path', fd)}' +{len(raw):#x} @ {pos:#x}")
+            return self._ret(uc, n)
         if fd > 2 and n > 160:
             # binary device writes (notifications...): show the readable part
             words = [w for w in raw.replace(b"\n", b" ").split(b"\x00") if len(w) >= 4]
@@ -346,7 +362,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             return self._ret(uc, rv or 0)
         f = self.files.get(fd)
         if f is not None:
-            chunk = f["data"][f["pos"]:f["pos"] + (n & 0xFFFFFFFF)]
+            chunk = bytes(f["data"][f["pos"]:f["pos"] + (n & 0xFFFFFFFF)])
             try:
                 if chunk:
                     uc.mem_write(buf, chunk)
@@ -472,10 +488,15 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 self.emu.log(f"  [ipmi] {name}.method{method:#x} handler failed: {e}")
                 res = IPMI_METHOD_NOT_EXIST
         else:
+            # Unmodelled method: an empty reply. Zero only small out fields
+            # (counts, results). The out size is the caller's declared
+            # capacity, not the real buffer size: SceShellCore passes a
+            # 0x500-byte stack array as 2048, so filling it all overwrote the
+            # stack canary (__stack_chk_fail after SceNpMgrIpc method 0x22).
             res = 0
             for d, sz, info in call["out"]:
                 try:
-                    if d and 0 < sz <= 0x10000:
+                    if d and 0 < sz <= 0x40:
                         uc.mem_write(d, bytes(sz))
                     uc.mem_write(info + 16, struct.pack("<Q", 0))   # bytes returned
                 except Exception:
@@ -748,6 +769,24 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 argv.append(self._read_cstr(uc, p, 64))
         except Exception:
             pass
+        # Process-spawn policy: on PS4, a service like SceSysCore forks (rfork)
+        # a child that execve()s a separate process (daemon, or the UI app) and
+        # the PARENT keeps running. psemu runs one image at a time, so by
+        # default execve chain-loads the child (replacing the image - correct
+        # for boot handoffs like mini-syscore -> SceSysAvControl). When the
+        # caller is an rfork'd spawn child and spawn_mode says not to follow
+        # this one, retire the child thread instead and let the parent run on.
+        sched = self.emu.sched
+        cur = sched.current if sched else None
+        mode = self.emu.spawn_mode
+        if cur is not None and getattr(cur, "spawn_child", False) and mode not in (None, "follow"):
+            follow = (mode != "stay") and (mode in path)
+            if not follow:
+                self.emu.log(f"  [execve] spawn '{path}' (pid child) -> staying with parent, "
+                             f"child retired")
+                sched.exit_current()
+                return
+            self.emu.log(f"  [execve] spawn '{path}' matches follow target -> chain-loading")
         self.emu.log(f"  [execve] '{path}' argv={argv}")
         if not self.emu.exec_module(path, argv):
             # exec_module already set a stop reason (module not found)
@@ -905,8 +944,54 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         self.emu.log(f"  [rdup] -> fd {fd}")
         self._ret(uc, fd)
 
+    # ---- writable file layer (see self.vfs) ----------------------------
+    O_APPEND, O_CREAT, O_TRUNC, O_EXCL = 0x8, 0x200, 0x400, 0x800
+
+    @staticmethod
+    def _vnorm(path):
+        import posixpath
+        return posixpath.normpath("/" + path.replace("\\", "/").lstrip("/"))
+
+    def _vfile(self, path):
+        """The contents of the regular file at `path` (a shared bytearray),
+        loading a firmware file on first use; None if there is none."""
+        import os
+        p = self._vnorm(path)
+        if p in self.vfs:
+            return self.vfs[p]
+        if p in self.vgone or p.startswith("/dev/"):
+            return None
+        real = self.emu.resolve_path(p)
+        if real and os.path.isfile(real):
+            try:
+                with open(real, "rb") as fh:
+                    self.vfs[p] = bytearray(fh.read())
+                return self.vfs[p]
+            except OSError:
+                return None
+        return None
+
+    def _visdir(self, path):
+        import os
+        p = self._vnorm(path)
+        if p == "/" or p in self.vdirs:
+            return True
+        if p in self.vgone:
+            return False
+        if os.path.isdir(os.path.join(self.emu.fw_root, p.lstrip("/"))):
+            return True
+        pre = p + "/"
+        return any(k.startswith(pre) for k in self.vfs) or any(d.startswith(pre) for d in self.vdirs)
+
+    @staticmethod
+    def _vwrite(data, pos, raw):
+        if pos > len(data):
+            data.extend(bytes(pos - len(data)))
+        data[pos:pos + len(raw)] = raw
+
     def sys_open(self, uc):
-        path_ptr = self._args(uc)[0]
+        path_ptr, flags = self._args(uc)[:2]
+        flags &= 0xFFFFFFFF
         path = self._read_cstr(uc, path_ptr, 128)
         fd = self._alloc_fd(path, base=16)      # devices open high
         dev = open_device(self, path)
@@ -915,17 +1000,110 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             self.devs[fd] = dev
             kind = " (device)"
         elif not path.startswith("/dev/"):
-            # Back the fd with the real firmware file so read()/fstat() work.
-            real = self.emu.resolve_path(path)
-            if real:
-                try:
-                    with open(real, "rb") as f:
-                        self.files[fd] = {"data": f.read(), "pos": 0}
-                    kind = f" (file {len(self.files[fd]['data'])}B)"
-                except Exception:
-                    pass
+            p = self._vnorm(path)
+            data = self._vfile(p)
+            if data is not None:
+                if flags & self.O_CREAT and flags & self.O_EXCL:
+                    self.fds.pop(fd, None)
+                    self.emu.log(f"  [open] '{path}' O_EXCL -> EEXIST")
+                    return self._ret(uc, EEXIST, error=True)
+                if flags & self.O_TRUNC:
+                    del data[:]
+                kind = f" (file {len(data)}B)"
+            elif self._visdir(p):
+                self.dirfds.add(fd)
+                kind = " (dir)"
+            elif flags & self.O_CREAT:
+                data = self.vfs[p] = bytearray()
+                self.vgone.discard(p)
+                kind = " (created)"
+            else:
+                # Not in the dump and not being created. Kept permissive (an
+                # empty file) like before; reads see EOF.
+                kind = " (missing)"
+            if data is not None:
+                self.files[fd] = {"data": data, "pos": 0, "path": p,
+                                  "append": bool(flags & self.O_APPEND)}
         self.emu.log(f"  [open] '{path}' -> fd {fd}{kind}")
         self._ret(uc, fd)
+
+    def _pio_args(self, uc):
+        fd, buf, n, off = self._args(uc)[:4]
+        return fd & 0xFFFFFFFF, buf, n & 0xFFFFFFFF, off
+
+    def sys_pread(self, uc):
+        fd, buf, n, off = self._pio_args(uc)
+        f = self.files.get(fd)
+        if f is None:
+            return self._ret(uc, 0)
+        chunk = bytes(f["data"][off:off + n])
+        try:
+            if chunk:
+                uc.mem_write(buf, chunk)
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        self._ret(uc, len(chunk))
+
+    def sys_pwrite(self, uc):
+        fd, buf, n, off = self._pio_args(uc)
+        f = self.files.get(fd)
+        try:
+            raw = bytes(uc.mem_read(buf, n)) if n else b""
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        if f is not None:
+            self._vwrite(f["data"], off, raw)
+            self.emu.log(f"  [pwrite] '{f['path']}' +{n:#x} @ {off:#x}")
+        self._ret(uc, n)
+
+    def _path_arg(self, uc, i=0):
+        return self._vnorm(self._read_cstr(uc, self._args(uc)[i], 256))
+
+    def sys_unlink(self, uc):
+        p = self._path_arg(uc)
+        if self._vfile(p) is None:
+            return self._ret(uc, ENOENT, error=True)
+        self.vfs.pop(p, None)
+        self.vgone.add(p)
+        self.emu.log(f"  [unlink] '{p}'")
+        self._ret(uc, 0)
+
+    def sys_rename(self, uc):
+        src, dst = self._path_arg(uc, 0), self._path_arg(uc, 1)
+        data = self._vfile(src)
+        if data is None:
+            if self._visdir(src):
+                self.vdirs.discard(src)
+                self.vdirs.add(dst)
+                return self._ret(uc, 0)
+            return self._ret(uc, ENOENT, error=True)
+        self.vfs.pop(src, None)
+        self.vgone.add(src)
+        self.vfs[dst] = data
+        self.vgone.discard(dst)
+        self.emu.log(f"  [rename] '{src}' -> '{dst}'")
+        self._ret(uc, 0)
+
+    def sys_mkdir(self, uc):
+        p = self._path_arg(uc)
+        if self._visdir(p) or self._vfile(p) is not None:
+            return self._ret(uc, EEXIST, error=True)
+        self.vdirs.add(p)
+        self.vgone.discard(p)
+        self._ret(uc, 0)
+
+    def sys_rmdir(self, uc):
+        p = self._path_arg(uc)
+        if not self._visdir(p):
+            return self._ret(uc, ENOENT, error=True)
+        self.vdirs.discard(p)
+        self.vgone.add(p)
+        self._ret(uc, 0)
+
+    def sys_access(self, uc):
+        p = self._path_arg(uc)
+        ok = self._vfile(p) is not None or self._visdir(p)
+        self._ret(uc, 0) if ok else self._ret(uc, ENOENT, error=True)
 
     def sys_close(self, uc):
         fd = self._args(uc)[0] & 0xFFFFFFFF
@@ -933,13 +1111,25 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         self.devs.pop(fd, None)
         self.files.pop(fd, None)
         self.shms.pop(fd, None)
+        self.dirfds.discard(fd)
         self.emu.log(f"  [close] fd {fd}")
         self._ret(uc, 0)
 
     # PS4/FreeBSD struct stat: st_mode@0x08 (u16), st_nlink@0x0a, st_size@0x48
     # (i64), st_blksize@0x58 (i32). Enough for callers that size a read buffer.
-    def _write_stat(self, uc, buf, size, isdir=False):
+    # st_dev@0x00 / st_ino@0x04 (u32 each) identify the file: SQLite keys its
+    # per-inode lock table on them, so every path needs its own inode number.
+    ST_DEV = 0x59
+
+    def _inode(self, path):
+        inos = self.__dict__.setdefault("_inodes", {})
+        if path is None:
+            return 0
+        return inos.setdefault(self._vnorm(path), 2 + len(inos))
+
+    def _write_stat(self, uc, buf, size, isdir=False, path=None):
         st = bytearray(0x78)
+        _struct.pack_into("<II", st, 0x00, self.ST_DEV, self._inode(path))
         _struct.pack_into("<H", st, 0x08, (0x4000 if isdir else 0x8000) | 0o644)
         _struct.pack_into("<H", st, 0x0A, 1)                 # st_nlink
         _struct.pack_into("<q", st, 0x48, size & 0x7FFFFFFFFFFFFFFF)
@@ -985,6 +1175,13 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if obj is not None:
             obj["size"] = length
             self.emu.log(f"  [ftruncate] shm '{obj['name']}' -> {length:#x}")
+        f = self.files.get(fd)
+        if f is not None:
+            d = f["data"]
+            if length < len(d):
+                del d[length:]
+            else:
+                d.extend(bytes(length - len(d)))
         self._ret(uc, 0)
 
     def sys_fstat(self, uc):
@@ -994,21 +1191,22 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             size = self.shms[fd]["size"]
         else:
             size = len(self.files[fd]["data"]) if fd in self.files else 0
-        if not self._write_stat(uc, buf, size):
+        path = self.files[fd]["path"] if fd in self.files else self.fds.get(fd, f"fd{fd}")
+        if not self._write_stat(uc, buf, size, isdir=fd in self.dirfds, path=path):
             return self._ret(uc, EFAULT, error=True)
         self._ret(uc, 0)
 
     def sys_stat(self, uc):
-        import os
         path = self._read_cstr(uc, self._args(uc)[0], 256)
         buf = self._args(uc)[1]
-        real = self.emu.resolve_path(path) if not path.startswith("/dev/") else None
-        if real and os.path.isfile(real):
-            self._write_stat(uc, buf, os.path.getsize(real))
-            return self._ret(uc, 0)
-        if real and os.path.isdir(real):
-            self._write_stat(uc, buf, 0, isdir=True)
-            return self._ret(uc, 0)
+        if not path.startswith("/dev/"):
+            data = self._vfile(path)
+            if data is not None:
+                self._write_stat(uc, buf, len(data), path=path)
+                return self._ret(uc, 0)
+            if self._visdir(path):
+                self._write_stat(uc, buf, 0, isdir=True, path=path)
+                return self._ret(uc, 0)
         self._ret(uc, ENOENT, error=True)
 
     def sys_lseek(self, uc):
@@ -1019,7 +1217,9 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             return self._ret(uc, 0)
         off = off - (1 << 64) if off >= (1 << 63) else off
         base = {0: 0, 1: f["pos"], 2: len(f["data"])}.get(whence & 0xFFFFFFFF, 0)
-        f["pos"] = max(0, min(len(f["data"]), base + off))
+        if base + off < 0:
+            return self._ret(uc, EINVAL, error=True)
+        f["pos"] = base + off                   # past EOF is allowed (sparse write)
         self._ret(uc, f["pos"])
 
     def sys_dup(self, uc):
@@ -1112,6 +1312,12 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if prot & 1: uprot |= UC_PROT_READ
         if prot & 2: uprot |= UC_PROT_WRITE
         if prot & 4: uprot |= UC_PROT_EXEC
+        # x86 has no write-only (or exec-only) page: writable/executable memory
+        # is always readable. PS4 code maps direct memory CPU_WRITE-only (prot
+        # 0x2) and then reads it back (e.g. libc object guards), so a literal
+        # write-only mapping faults on read - grant READ whenever W or X is set.
+        if uprot & (UC_PROT_WRITE | UC_PROT_EXEC):
+            uprot |= UC_PROT_READ
         if uprot == UC_PROT_NONE:
             uprot = UC_PROT_READ | UC_PROT_WRITE
         MAP_ANON = 0x1000
