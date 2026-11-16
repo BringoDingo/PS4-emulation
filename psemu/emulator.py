@@ -701,6 +701,8 @@ class Emulator:
             emu.stop(f"ScePthread fatal: '{msg}' at {fname}:{line}")
             return 0
 
+        MUTEX_WARMUP = 100_000
+
         def mutex_lock_fixup(emu, uc):
             # The owned-mutex TAILQ is only used for robust/PI mutexes, whose
             # unlock dequeues via _umtx_op in the kernel -- which we stub, so a
@@ -708,6 +710,33 @@ class Emulator:
             # the 'mutex is on list' panic. Single-threaded we never need that
             # list: at lock entry clear the incoming mutex's link and reset
             # curthread's TAILQs, then let the real lock code run.
+            #
+            # This hook fires on EVERY mutex lock -- tens of thousands of times
+            # in managed (Mono) code, each a native->Python round trip, which
+            # profiling shows is the single biggest emulation cost. So it tracks
+            # whether it ever has real work to do (a stale incoming link, or a
+            # non-empty owned-mutex list), and once a process has locked
+            # MUTEX_WARMUP times with none, it DISARMS itself (removes the trap):
+            # that process uses no robust/PI mutexes, so the fixup is pure
+            # overhead. If that guess is ever wrong, a later robust mutex trips
+            # the pthread_fatal hook -- a clean stop, never silent corruption.
+            # Count every lock and, once a process has locked MUTEX_WARMUP
+            # times without the fixup ever doing real work, disarm. Most calls
+            # early-return below (a libthr-managed thread, left alone), so the
+            # counter lives here at the top, before any return.
+            self._mutex_calls += 1
+            if (not self._mutex_needed and self.native is not None
+                    and self._mutex_calls >= MUTEX_WARMUP):
+                for ent in self._mutex_lock_entries:
+                    try:
+                        self.native.trap_remove(ent)
+                        self.hle.table.pop(ent, None)
+                    except Exception:
+                        pass
+                self._mutex_lock_entries = []
+                emu.log(f"  [perf] mutex_lock_fixup disarmed after "
+                        f"{self._mutex_calls} locks (no robust/PI mutexes seen)")
+                return None
             m = uc.reg_read(UC_X86_REG_RDI)
             try:
                 # the live curthread (libthr installs its own TCB via sysarch)
@@ -724,21 +753,30 @@ class Emulator:
                     if tqe or tqn:
                         uc.mem_write(internal + 0x40, b"\x00" * 16)
                         self._mutex_fixups += 1
-                # the live curthread (libthr installs its own TCB via sysarch)
-                fsb = uc.reg_read(UC_X86_REG_FS_BASE)
-                ct = struct.unpack("<Q", bytes(uc.mem_read(fsb + 0x10, 8)))[0] or self.curthread
+                        self._mutex_needed = True
+                ct = struct.unpack("<Q", bytes(uc.mem_read(fsb0 + 0x10, 8)))[0] or self.curthread
                 if ct != self.curthread:
                     # libthr runs on its own, fully initialised struct pthread:
                     # its owned-mutex lists are consistent, leave them alone
                     return None
+                # An empty TAILQ head is {first=0, last=&first}. Reset only a
+                # head that is NOT already empty -- and remember that we did, so
+                # a process that genuinely uses the list keeps the hook armed.
                 for head in (CT_MQ1, CT_MQ2):
-                    uc.mem_write(ct + head, struct.pack("<Q", 0))
-                    uc.mem_write(ct + head + 8, struct.pack("<Q", ct + head))
+                    first = struct.unpack("<Q", bytes(uc.mem_read(ct + head, 8)))[0]
+                    last = struct.unpack("<Q", bytes(uc.mem_read(ct + head + 8, 8)))[0]
+                    if first != 0 or last != ct + head:
+                        self._mutex_needed = True
+                        uc.mem_write(ct + head, struct.pack("<Q", 0))
+                        uc.mem_write(ct + head + 8, struct.pack("<Q", ct + head))
             except Exception:
                 pass
             return None
 
         self._mutex_fixups = 0
+        self._mutex_calls = 0
+        self._mutex_needed = False
+        self._mutex_lock_entries = []
         fatal, lock_entries = self._detect_libthr_hooks()
         if getattr(self, "dyn", None) is not None:
             # dynamic process: the lock functions are exported by name from
@@ -753,6 +791,7 @@ class Emulator:
             lock_entries = sorted({exports[nid(n)] for n in names if nid(n) in exports})
         if fatal is not None:
             self.hle.register(fatal, pthread_fatal, name="pthread_fatal")
+        self._mutex_lock_entries = list(lock_entries)
         for ent in lock_entries:
             self.hle.register(ent, mutex_lock_fixup,
                               name="mutex_lock_fixup", mode="fixup")
