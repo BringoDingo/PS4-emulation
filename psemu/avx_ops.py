@@ -500,6 +500,69 @@ class VexEngine:
         a[0] = F64(b[0])
         self.put(insn, ops[0], a.tobytes())
 
+    # ---- packed float <-> int / float <-> double conversions -----------------
+    @staticmethod
+    def _to_i32(a, truncate):
+        """float array -> int32 like cvtps2dq/cvttps2dq: round to nearest even
+        (MXCSR default) or truncate; overflow and NaN give the x86 "integer
+        indefinite" value 0x80000000."""
+        with np.errstate(all="ignore"):
+            r = np.trunc(a) if truncate else np.rint(a)
+            ok = (r >= -2147483648.0) & (r <= 2147483647.0)    # False for NaN too
+            return np.where(ok, r, -2147483648.0).astype(np.int32)
+
+    def op_vcvtpd2ps(self, insn, w):
+        # vcvtpd2ps xmm1, xmm2/m128 (2 doubles) | xmm1, ymm2/m256 (4 doubles):
+        # the result is always an xmm (upper lanes zero).
+        ops = insn.operands
+        n = 4 if ops[1].size == 32 else 2
+        src = _np(self.pad(self.get(insn, ops[1], n * 8), n * 8), F64)[:n]
+        with np.errstate(all="ignore"):
+            out = src.astype(F32)
+        self.put(insn, ops[0], out.tobytes())
+
+    def op_vcvtdq2pd(self, insn, w):
+        # vcvtdq2pd xmm1, xmm2/m64 (2 int32) | ymm1, xmm2/m128 (4 int32)
+        ops = insn.operands
+        n = 4 if ops[0].size == 32 else 2
+        src = _np(self.pad(self.get(insn, ops[1], n * 4), n * 4), np.int32)[:n]
+        self.put(insn, ops[0], src.astype(F64).tobytes())
+
+    def op_vcvtdq2ps(self, insn, w):
+        ops = insn.operands
+        n = ops[0].size // 4
+        src = _np(self.pad(self.get(insn, ops[1], n * 4), n * 4), np.int32)[:n]
+        with np.errstate(all="ignore"):
+            self.put(insn, ops[0], src.astype(F32).tobytes())
+
+    def _cvt_ps2dq(self, insn, truncate):
+        ops = insn.operands
+        n = ops[0].size // 4
+        src = _np(self.pad(self.get(insn, ops[1], n * 4), n * 4), F32)[:n]
+        self.put(insn, ops[0], self._to_i32(src, truncate).tobytes())
+
+    def op_vcvtps2dq(self, insn, w): self._cvt_ps2dq(insn, False)
+    def op_vcvttps2dq(self, insn, w): self._cvt_ps2dq(insn, True)
+
+    def _cvt_pd2dq(self, insn, truncate):
+        # vcvt[t]pd2dq xmm1, xmm2/m128 (2 doubles) | xmm1, ymm2/m256 (4): xmm result
+        ops = insn.operands
+        n = 4 if ops[1].size == 32 else 2
+        src = _np(self.pad(self.get(insn, ops[1], n * 8), n * 8), F64)[:n]
+        self.put(insn, ops[0], self._to_i32(src, truncate).tobytes())
+
+    def op_vcvtpd2dq(self, insn, w): self._cvt_pd2dq(insn, False)
+    def op_vcvttpd2dq(self, insn, w): self._cvt_pd2dq(insn, True)
+
+    def op_vcvtps2pd(self, insn, w):
+        # vcvtps2pd xmm1, xmm2/m64   : 2 floats -> 2 doubles
+        # vcvtps2pd ymm1, xmm2/m128  : 4 floats -> 4 doubles
+        # float32 -> float64 is exact, so there is no rounding to get wrong.
+        ops = insn.operands
+        lanes = 4 if ops[0].size == 32 else 2
+        src = _np(self.pad(self.get(insn, ops[1], lanes * 4), lanes * 4), F32)[:lanes]
+        self.put(insn, ops[0], src.astype(F64).tobytes())
+
     def op_vcvtsd2ss(self, insn, w):
         ops = insn.operands
         a = _np(self.pad(self.get(insn, ops[1], 16), 16), F32)
