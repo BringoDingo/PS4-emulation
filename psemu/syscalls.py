@@ -432,7 +432,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     IPMI_WAIT_EVF = 0x490       # ipmimgr_call cmd: client waits on a service event flag
     IPMI_POLL_EVF = 0x491       # ipmimgr_call cmd: client polls a service event flag
     IPMI_RECEIVE = 0x201        # ipmimgr_call cmd: receive-pump reads the next packet
-    IPMI_USER_GET_EVENT = 0x252 # ipmimgr_call cmd: SceUserService getEvent try-receive
+    IPMI_USER_GET_EVENT = 0x252 # ipmimgr_call cmd: getEvent try-receive
+    # Client "try-receive an event" ipmimgr_call cmds that must report "no event"
+    # (0x80020023) instead of empty-success, or their drain loops spin forever
+    # (SceUserService getEvent 0x252, SceVideoCoreServer 0x252, SceAppDbIpc 0x251).
+    IPMI_TRY_RECEIVE = frozenset({0x251, 0x252})
     # Service event flags (cmd 0x490 waitEventFlag) satisfied immediately instead
     # of parking: the compositor fires a vblank/flip event every frame on a
     # console, so the UI render thread's wait must complete for frames to flow.
@@ -770,18 +774,21 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         #    sync methods return their result (and out-data) directly through the
         #    syscall, so we answer per (service, method).
         #  * everything else (connect, ...): success.
-        if cmd == self.IPMI_USER_GET_EVENT and nm == "SceUserService":
-            # SceUserService getEvent try-receive (libSceUserService getEvent
-            # @+0x1cb0: in+0x08 = 8-byte event buf, in+0x10 = size-out, in+0x18
-            # = max 8). The shell_ui main thread DRAINS this in a loop
-            # (`call getEvent; test eax,eax; je loop` - loops while getEvent
-            # returns 0 = "processed an event"). Reporting empty-success made
-            # getEvent read a zeroed 8-byte buffer as a null event id 0, keep
-            # "processing" it, return 0, and spin forever (logging "tryGetMsg:
-            # size is 0"). getEvent explicitly treats 0x80020023 as "no event"
-            # (@+0x1d65) and then returns non-zero (NO_EVENT), so the drain loop
-            # exits and system init proceeds. No user is logged in on a console
-            # until one is selected; an empty queue is the correct boot state.
+        if cmd in self.IPMI_TRY_RECEIVE:
+            # Client "try-receive an event" ops (getEvent / tryReceive):
+            # {.., event_buf, size_out_ptr, max_size, ..}. Their callers DRAIN
+            # in a tight loop (e.g. SceUserService getEvent @+0x1cb0:
+            # `call getEvent; test eax,eax; je loop` - loops while it returns 0
+            # = "processed an event"). Reporting empty-SUCCESS makes the caller
+            # read a zeroed buffer as a null event, "process" it, and re-poll
+            # forever -- the single biggest cycle sink once the UI is up
+            # (SceVideoCoreServer 0x252 and SceAppDbIpc 0x251 together spun
+            # ~945K ipmimgr_call in an 800M run). The kernel's "no event / no
+            # data" code 0x80020023, which these loops test for, makes them stop
+            # draining and park/back off instead. Nothing feeds these queues
+            # (the real event-source services are not emulated), so an empty
+            # queue is the correct steady state. Verified first for
+            # SceUserService getEvent (@+0x1d65 branches on exactly this code).
             result = 0x80020023            # SCE_KERNEL_ERROR no-data / no event
             if result_ptr:
                 try:
