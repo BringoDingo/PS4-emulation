@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <immintrin.h>      /* _mm_cvtps_ph (F16C) for VCVTPS2PH */
 #include <unicorn/unicorn.h>
 
 #include "vex.h"
@@ -267,7 +268,8 @@ static int same_as_legacy(const Dec *d) {
         }
         return 1;
     }
-    return d->map == 2 && d->op != 0x18 && d->op != 0x19 && d->op != 0x1A;
+    return d->map == 2 && d->op != 0x18 && d->op != 0x19 && d->op != 0x1A &&
+           d->op != 0x0C && d->op != 0x0D;
 }
 
 static int classify(const Dec *d) {
@@ -315,6 +317,8 @@ static int classify_emu(const Dec *d) {
     if (d->map == 2) {
         if (op >= 0xF0) return V_PASS;                       /* BMI1/BMI2: QEMU has them */
         if (pp == 1 && is_map2_binop(op)) return V_EMU;
+        if (pp == 1 && !d->W && (op == 0x0C || op == 0x0D))
+            return V_EMU;                                     /* vpermilps/vpermilpd (variable) */
         if (pp == 1 && (op == 0x18 || (d->L && (op == 0x19 || (op == 0x1A && mem)))))
             return V_EMU;                                     /* broadcasts */
         return V_PY;
@@ -332,6 +336,10 @@ static int classify_emu(const Dec *d) {
         return d->L ? V_EMU : V_PY;
     case 0x14: case 0x15: case 0x16: case 0x17:
         return d->L ? V_PY : V_PASS;
+    case 0x04: case 0x05:                                     /* vpermilps/vpermilpd (imm8) */
+        return d->W ? V_PY : V_EMU;
+    case 0x1D:                                                /* vcvtps2ph (F16C) */
+        return d->W ? V_PY : V_EMU;
     }
     return V_PY;
 }
@@ -466,6 +474,25 @@ static int exec_map2(int op, V *r, const V *a, const V *b, int w) {
     default: return 0;
     }
     return 1;
+}
+
+/* VCVTPS2PH: n (4 or 8) floats -> n halves. imm[2]=1 would use MXCSR.RC; as everywhere
+   else in this file (see rnd()) that is treated as round-to-nearest-even. The host's
+   F16C instruction does the conversion, so NaN/denormal/saturation behaviour is
+   the hardware's. */
+static void cvtps2ph(uint16_t *out, const float *in, int n, int imm) {
+    int mode = (imm & 4) ? 0 : (imm & 3);
+    for (int h = 0; h < n; h += 4) {
+        __m128 x = _mm_loadu_ps(in + h);
+        __m128i y;
+        switch (mode) {
+        case 0: y = _mm_cvtps_ph(x, _MM_FROUND_TO_NEAREST_INT); break;
+        case 1: y = _mm_cvtps_ph(x, _MM_FROUND_TO_NEG_INF); break;
+        case 2: y = _mm_cvtps_ph(x, _MM_FROUND_TO_POS_INF); break;
+        default: y = _mm_cvtps_ph(x, _MM_FROUND_TO_ZERO); break;
+        }
+        _mm_storel_epi64((__m128i *)(out + h), y);
+    }
 }
 
 /* Execute; 1 = done (caller sets RIP to addr + len), 0 = leave it to Python. */
@@ -643,6 +670,19 @@ int vex_exec(uc_engine *uc, const Dec *d, uint64_t addr) {
             vwrite(uc, d->reg, &r, w);
             return 1;
         }
+        if (op == 0x0C || op == 0x0D) {          /* vpermilps/pd: source = vvvv, control = r/m */
+            vread(uc, d->vvvv, &a);
+            if (!rmread(uc, d, addr, &b, w)) return 0;
+            for (int l = 0; l < w / 16; l++) {
+                if (op == 0x0C) {
+                    for (k = 0; k < 4; k++) r.d[4 * l + k] = a.d[4 * l + (b.d[4 * l + k] & 3)];
+                } else {
+                    for (k = 0; k < 2; k++) r.q[2 * l + k] = a.q[2 * l + ((b.q[2 * l + k] >> 1) & 1)];
+                }
+            }
+            vwrite(uc, d->reg, &r, w);
+            return 1;
+        }
         vread(uc, d->vvvv, &a);
         if (!rmread(uc, d, addr, &b, w)) return 0;
         if (!exec_map2(op, &r, &a, &b, w)) return 0;
@@ -708,6 +748,26 @@ int vex_exec(uc_engine *uc, const Dec *d, uint64_t addr) {
         else if (d->W) r.q[d->imm & 1] = v;
         else r.d[d->imm & 3] = (uint32_t)v;
         vwrite(uc, d->reg, &r, 16);
+        return 1;
+    }
+    case 0x04: case 0x05:                                    /* vpermilps/pd, imm8 */
+        if (!rmread(uc, d, addr, &b, w)) return 0;
+        for (int l = 0; l < w / 16; l++) {
+            if (op == 0x04) {
+                for (k = 0; k < 4; k++) r.d[4 * l + k] = b.d[4 * l + ((d->imm >> (2 * k)) & 3)];
+            } else {
+                r.q[2 * l] = b.q[2 * l + ((d->imm >> (2 * l)) & 1)];
+                r.q[2 * l + 1] = b.q[2 * l + ((d->imm >> (2 * l + 1)) & 1)];
+            }
+        }
+        vwrite(uc, d->reg, &r, w);
+        return 1;
+    case 0x1D: {                                             /* vcvtps2ph xmm1/m, xmm2|ymm2, imm8 */
+        int n = d->L ? 8 : 4;
+        vread(uc, d->reg, &a);
+        cvtps2ph(r.w, a.f, n, d->imm);
+        if (mem) return uc_mem_write(uc, ea(uc, d, addr), &r, n * 2) == UC_ERR_OK;
+        vwrite(uc, d->rm, &r, 16);
         return 1;
     }
     case 0x18:                                               /* vinsertf128 */
