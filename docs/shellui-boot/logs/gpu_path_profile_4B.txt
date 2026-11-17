@@ -1,0 +1,25 @@
+wall 391s, 12136 samples
+ntdll.dll                    24.8 %  (3012)
+unicorn.dll                  18.4 %  (2232)
+vcruntime140.dll             15.5 %  (1878)
+gnm_native.dll               14.3 %  (1740)
+psemu_cpu.dll                 9.2 %  (1121)
+python312.dll                 6.9 %  (839)
+win32u.dll                    4.5 %  (550)
+jit                           2.7 %  (322)
+_multiarray_umath.cp312-win_amd64.pyd    1.6 %  (192)
+amdvlk64.dll                  1.1 %  (133)
+_ctypes.pyd                   0.4 %  (50)
+ucrtbase.dll                  0.4 %  (43)
+stacks passing through gnm_native.dll: 58.9 % of samples
+-- backend functions (inclusive, %% of all samples)
+   58.9 %  ?
+-- innermost backend function -> module where the time is spent
+   24.6 %  ntdll.dll              <- ?
+   14.3 %  gnm_native.dll         <- ?
+   14.0 %  vcruntime140.dll       <- ?
+    4.5 %  win32u.dll             <- ?
+    1.1 %  amdvlk64.dll           <- ?
+    0.3 %  ucrtbase.dll           <- ?
+    0.0 %  kernelbase.dll         <- ?
+    0.0 %  kernel32.dll           <- ?
