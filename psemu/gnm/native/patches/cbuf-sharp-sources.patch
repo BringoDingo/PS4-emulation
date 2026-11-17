@@ -1,0 +1,178 @@
+diff --git a/a/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp b/b/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
+index bca8ae8..8fd3698 100644
+--- a/a/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
++++ b/b/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
+@@ -7,6 +7,7 @@
+ #include "shader_recompiler/ir/breadth_first_search.h"
+ #include "shader_recompiler/ir/ir_emitter.h"
+ #include "shader_recompiler/ir/operand_helper.h"
++#include "shader_recompiler/ir/passes/srt.h"
+ #include "shader_recompiler/ir/program.h"
+ #include "shader_recompiler/ir/reinterpret.h"
+ #include "shader_recompiler/profile.h"
+@@ -365,9 +366,50 @@ std::pair<const IR::Inst*, bool> TryDisableAnisoLod0(const IR::Inst* inst) {
+ 
+ using SharpSources = boost::container::small_vector<const IR::Inst*, 4>;
+ 
++// psemu patch: a descriptor dword loaded with s_buffer_load_dword* from a V# held in
++// user data (base pointer in sgprs r, r+1) at an immediate offset is the same read as
++// an s_load through that pointer, so it can be flattened like a ReadConst.
++// ReadConstBuffer insts whose V# is user-data sgprs (base_sgpr, base_sgpr+1,..) read at an
++// immediate dword; captured before PatchBufferSharp replaces the handle operand.
++struct CbufDword {
++    u32 base_sgpr;
++    u32 dword;
++};
++thread_local std::map<const IR::Inst*, CbufDword> g_cbuf_dwords;
++
++void CaptureCbufDwords(IR::Program& program) {
++    g_cbuf_dwords.clear();
++    for (IR::Block* const block : program.blocks) {
++        for (IR::Inst& inst : block->Instructions()) {
++            if (inst.GetOpcode() != IR::Opcode::ReadConstBuffer || inst.Arg(0).IsImmediate() ||
++                !inst.Arg(1).IsImmediate()) {
++                continue;
++            }
++            const IR::Inst* composite = inst.Arg(0).InstRecursive();
++            if (composite->NumArgs() < 2 || composite->Arg(0).IsImmediate() ||
++                composite->Arg(1).IsImmediate()) {
++                continue;
++            }
++            const IR::Inst* lo = composite->Arg(0).InstRecursive();
++            const IR::Inst* hi = composite->Arg(1).InstRecursive();
++            if (lo->GetOpcode() == IR::Opcode::GetUserData &&
++                hi->GetOpcode() == IR::Opcode::GetUserData &&
++                static_cast<u32>(hi->Arg(0).ScalarReg()) ==
++                    static_cast<u32>(lo->Arg(0).ScalarReg()) + 1) {
++                g_cbuf_dwords[&inst] = {static_cast<u32>(lo->Arg(0).ScalarReg()),
++                                        inst.Arg(1).U32()};
++            }
++        }
++    }
++}
++
++bool IsUdCbufSharpDword(const IR::Inst* inst) {
++    return inst->GetOpcode() == IR::Opcode::ReadConstBuffer && g_cbuf_dwords.contains(inst);
++}
++
+ bool IsSharpSource(const IR::Inst* inst) {
+     return inst->GetOpcode() == IR::Opcode::GetUserData ||
+-           inst->GetOpcode() == IR::Opcode::ReadConst;
++           inst->GetOpcode() == IR::Opcode::ReadConst || IsUdCbufSharpDword(inst);
+ }
+ 
+ SharpSources FindSharpSources(const IR::Inst* handle, u32 pc) {
+@@ -448,15 +490,43 @@ bool IsCfgBlockDominatedBy(const Shader::Gcn::Block* maybe_dominator,
+     return true;
+ }
+ 
+-SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
++// psemu patch: reserve `ndw` flattened dwords for a descriptor stored in a user-data
++// constant buffer and record the pointer walk that fills them (Push the V# base from
++// user data, Copy the descriptor dwords, Pop), then refresh the flattened buffer.
++SharpLocation AllocCbufSharp(Info& info, const IR::Inst* src, u32 ndw) {
++    const CbufDword& cd = g_cbuf_dwords.at(src);
++    const u32 base_sgpr = cd.base_sgpr;
++    const u32 dword = cd.dword;
++    PersistentSrtInfo& srt = info.srt_info;
++    const std::array<u32, 3> key{base_sgpr, dword, ndw};
++    if (const auto it = srt.cbuf_sharp_slots.find(key); it != srt.cbuf_sharp_slots.end()) {
++        return it->second;
++    }
++    const u32 dst = srt.flattened_bufsize_dw;
++    srt.walker_func.ops.push_back({SrtWalkerOp::Kind::Push, base_sgpr, 0});
++    for (u32 k = 0; k < ndw; ++k) {
++        srt.walker_func.ops.push_back({SrtWalkerOp::Kind::Copy, dword + k, dst + k});
++    }
++    srt.walker_func.ops.push_back({SrtWalkerOp::Kind::Pop, 0, 0});
++    srt.flattened_bufsize_dw += ndw;
++    srt.walker_func_size = srt.walker_func.ops.size();
++    srt.cbuf_sharp_slots[key] = dst;
++    info.RefreshFlatBuf();
++    return dst;
++}
++
++SharpLocation SharpLocationFromSource(Info& info, u32 ndw, const IR::Inst* inst) {
+     if (inst->GetOpcode() == IR::Opcode::GetUserData) {
+         return static_cast<SharpLocation>(inst->Arg(0).ScalarReg());
++    } else if (inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
++        return AllocCbufSharp(info, inst, ndw);
+     } else {
+         return inst->Flags<u32>();
+     }
+ }
+ 
+-SharpLocation TrackSharp(const IR::Inst* inst, const IR::Block& current_parent, u32 pc = 0) {
++SharpLocation TrackSharp(Info& info, u32 ndw, const IR::Inst* inst,
++                        const IR::Block& current_parent, u32 pc = 0) {
+     auto sources = FindSharpSources(inst, pc);
+     size_t num_sources = sources.size();
+     ASSERT(current_parent.cfg_block);
+@@ -487,7 +557,7 @@ SharpLocation TrackSharp(const IR::Inst* inst, const IR::Block& current_parent,
+     }
+ 
+     ASSERT_MSG(sources.size() == 1, "Unable to deduce sharp source");
+-    return SharpLocationFromSource(sources[0]);
++    return SharpLocationFromSource(info, ndw, sources[0]);
+ }
+ 
+ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& descriptors,
+@@ -519,7 +589,7 @@ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
+         // Normal buffer resource.
+         IR::Inst* buffer_handle = handle->Arg(0).InstRecursive();
+         const auto inst_info = inst.Flags<IR::BufferInstInfo>();
+-        const auto sharp_idx = TrackSharp(buffer_handle, block, inst_info.pc);
++        const auto sharp_idx = TrackSharp(info, sizeof(AmdGpu::Buffer) / 4, buffer_handle, block, inst_info.pc);
+         const auto buffer = info.ReadUdSharp<AmdGpu::Buffer>(sharp_idx);
+         buffer_binding = descriptors.Add(BufferResource{
+             .sharp_idx = sharp_idx,
+@@ -541,7 +611,7 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
+     // Read image sharp.
+     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
+     const IR::Inst* image_handle = inst.Arg(0).InstRecursive();
+-    const auto tsharp = TrackSharp(image_handle, block, inst_info.pc);
++    const auto tsharp = TrackSharp(info, sizeof(AmdGpu::Image) / 4, image_handle, block, inst_info.pc);
+     const bool is_atomic = IsImageAtomicInstruction(inst);
+     const bool is_written = inst.GetOpcode() == IR::Opcode::ImageWrite || is_atomic;
+     const bool is_storage =
+@@ -650,7 +720,7 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
+             // Normal sampler resource.
+             const auto& [sampler_handle, disable_aniso] =
+                 TryDisableAnisoLod0(sampler->Arg(0).InstRecursive());
+-            const auto ssharp = TrackSharp(sampler_handle, block, inst_info.pc);
++            const auto ssharp = TrackSharp(info, sizeof(AmdGpu::Sampler) / 4, sampler_handle, block, inst_info.pc);
+             sampler_binding = descriptors.Add(SamplerResource{
+                 .sharp_idx = ssharp,
+                 .is_inline_sampler = false,
+@@ -1189,6 +1259,8 @@ void ResourceTrackingPass(IR::Program& program, const Profile& profile) {
+     // Iterate resource instructions and patch them after finding the sharp.
+     auto& info = program.info;
+ 
++    CaptureCbufDwords(program);
++
+     // Pass 1: Track resource sharps
+     Descriptors descriptors{info};
+     for (IR::Block* const block : program.blocks) {
+diff --git a/a/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/ir/passes/srt.h b/b/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/ir/passes/srt.h
+index a528cb1..e4ddcb6 100644
+--- a/a/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/ir/passes/srt.h
++++ b/b/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/ir/passes/srt.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <map>
+ #include <boost/container/set.hpp>
+ #include <boost/container/small_vector.hpp>
+ #include <vector>
+@@ -46,6 +48,9 @@ struct PersistentSrtInfo {
+     SrtWalker walker_func{};
+     size_t walker_func_size{};
+     u32 flattened_bufsize_dw = 16; // NumUserDataRegs
++    // psemu patch: flattened-buffer slots handed out to descriptors the shader
++    // loads from a user-data constant buffer, keyed (sgpr_base, dword, count)
++    std::map<std::array<u32, 3>, u32> cbuf_sharp_slots;
+ 
+     void Serialize(Serialization::Archive& ar) const;
+     bool Deserialize(Serialization::Archive& ar);
