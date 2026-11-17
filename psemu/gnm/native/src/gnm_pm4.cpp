@@ -174,8 +174,21 @@ struct Processor {
             d.z_read_only = regs.depth_view.z_read_only;
             d.stencil_read_only = regs.depth_view.stencil_read_only;
         }
+        if (job.targets.empty() && !job.depth && regs.color_target_mask.raw == 0) {
+            // CB_TARGET_MASK=0 and no depth/stencil buffer: the draw writes nothing
+            // observable (a colour-masked pre-pass), so there is nothing to execute.
+            Skipped(0x2D);
+            return;
+        }
         if (job.targets.empty() && !job.depth) {
-            Fail("draw with neither a colour nor a depth/stencil target bound");
+            const auto& c0 = regs.color_buffers[0];
+            Fail(fmt::format("draw with neither a colour nor a depth/stencil target bound "
+                             "[target_mask={:08x} cb0.base={:08x} cb0.info={:08x} z_fmt={} z_addr={:x} "
+                             "depth_en={} stencil_en={} ps={:x}]",
+                             regs.color_target_mask.raw, c0.base_address,
+                             u32(*reinterpret_cast<const u32*>(&c0.info)), u32(db.z_info.format),
+                             u64(db.DepthAddress()), u32(dc.depth_enable), u32(dc.stencil_enable),
+                             u64(uintptr_t(regs.ps_program.template Address<const u32*>()))));
         }
 
         job.prim_type = u32(regs.primitive_type);
