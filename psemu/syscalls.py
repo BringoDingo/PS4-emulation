@@ -276,15 +276,29 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             out += chunk
         return out.decode("latin1", "replace")
 
+    _ARG_REGS = (UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX,
+                 UC_X86_REG_R10, UC_X86_REG_R8, UC_X86_REG_R9)
+
     def _args(self, uc):
-        return (
-            uc.reg_read(UC_X86_REG_RDI),
-            uc.reg_read(UC_X86_REG_RSI),
-            uc.reg_read(UC_X86_REG_RDX),
-            uc.reg_read(UC_X86_REG_R10),
-            uc.reg_read(UC_X86_REG_R8),
-            uc.reg_read(UC_X86_REG_R9),
-        )
+        # The six syscall argument registers are read on every syscall. Unicorn's
+        # Python wrapper spends ~2us per register choosing a register class; calling
+        # its batched C entry point with preallocated buffers reads all six in ~2us.
+        rd = self.__dict__.get("_argrd")
+        if rd is None or rd[0] is not uc:
+            try:
+                import ctypes
+                n = len(self._ARG_REGS)
+                ids = (ctypes.c_int * n)(*self._ARG_REGS)
+                vals = (ctypes.c_uint64 * n)()
+                ptrs = (ctypes.c_void_p * n)(
+                    *[ctypes.addressof(vals) + 8 * k for k in range(n)])
+                rd = self._argrd = (uc, uc._do_reg_read_batch, ids, ptrs,
+                                    ctypes.c_int(n), vals)
+            except Exception:
+                rd = self._argrd = (uc, None, None, None, None, None)
+        if rd[1] is not None and rd[1](rd[2], rd[3], rd[4]) == 0:
+            return tuple(rd[5])
+        return tuple(uc.reg_read(r) for r in self._ARG_REGS)
 
     def _ret(self, uc, value, error=False):
         uc.reg_write(UC_X86_REG_RAX, value & 0xFFFFFFFFFFFFFFFF)
@@ -809,11 +823,25 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                     timeout_ret=(0, False))
         return None                     # blocked: the wake-up supplies the result
 
+    @staticmethod
+    def _has_cstring(data, needle):
+        """`needle` + NUL occurs in `data` not preceded by [A-Za-z0-9_]. A plain
+        find() loop: the equivalent lookbehind regex was ~100x slower on a large image."""
+        pat = needle + b"\x00"
+        pos = data.find(pat)
+        while pos >= 0:
+            if pos == 0:
+                return True
+            c = data[pos - 1]
+            if not (48 <= c <= 57 or 65 <= c <= 90 or 97 <= c <= 122 or c == 95):
+                return True
+            pos = data.find(pat, pos + 1)
+        return False
+
     def _ipmi_hosted_here(self, name):
         """True if the running program itself hosts IPMI service `name`: its
         name appears as a string in the main executable (a program that only
         uses a service gets the name from the client library instead)."""
-        import re
         cache = self.__dict__.setdefault("_ipmi_hosted_cache", {})
         key = (self.emu.path, name)
         if key not in cache:
@@ -825,8 +853,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 except Exception:
                     img = (self.emu.path, b"")
                 self._ipmi_main_image = img
-            pat = rb"(?<![A-Za-z0-9_])" + re.escape(name.encode()) + rb"\x00"
-            cache[key] = bool(name) and re.search(pat, img[1]) is not None
+            cache[key] = bool(name) and self._has_cstring(img[1], name.encode())
         return cache[key]
 
     def sys_ipmimgr_call(self, uc):
