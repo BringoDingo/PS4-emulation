@@ -132,6 +132,8 @@ NAMED_SYSCTLS = {
 SYSCALLS.update(DYNLIB_SYSCALLS)
 SYSCALLS.update(SYNC_SYSCALLS)
 SYSCALLS[548] = "batch_map"          # sceKernelBatchMap (else labelled "(sceKernelBatchMap)")
+SYSCALLS[638] = "convert_utc_to_localtime"    # sceKernelConvertUtcToLocaltime
+SYSCALLS[639] = "convert_localtime_to_utc"    # sceKernelConvertLocaltimeToUtc
 # libkernel's pthread_{suspend,resume,get,set}_user_context_np: stop another
 # thread and read/write its registers (Mono's stop-the-world uses them)
 SYSCALLS.update({632: "thr_suspend_ucontext", 633: "thr_resume_ucontext",
@@ -206,6 +208,10 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         # lowest free fd, which is what the module's fd-setup code expects.
         self.fds = {0: "stdin", 1: "stdout", 2: "stderr"}
         self.kqueues = set()
+        self.sig_actions = {}     # signal -> (handler, flags, mask bytes): sigaction()
+        self.sig_altstack = {}    # tid -> (sp, size, flags): sigaltstack()
+        self._sigtramp = None     # guest address of the sigreturn trampoline page
+        self._sig_streak = {}     # (signal, rip, addr) -> deliveries, to catch fault loops
         self.devs = {}            # fd -> devices.Device (/dev/gc, /dev/dce, ...)
         # AF_UNIX endpoints served in-process (see unixsock.py): the system
         # processes that would own the listening end are not emulated.
@@ -534,7 +540,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     # Service event flags (cmd 0x490 waitEventFlag) satisfied immediately instead
     # of parking: the compositor fires a vblank/flip event every frame on a
     # console, so the UI render thread's wait must complete for frames to flow.
-    IPMI_EVF_SATISFY = frozenset({"SceVideoCoreServer"})
+    # SceAvSettingIpc: the AV-settings service answers requests (e.g. the shell's
+    # SetVideoOutputColorEffect at boot) by signalling its event flag; unsignalled,
+    # that boot task never finishes and BootManager's background-init join, and
+    # with it the scene start-up, waits forever.
+    IPMI_EVF_SATISFY = frozenset({"SceVideoCoreServer", "SceAvSettingIpc"})
 
     def _ipmi_service_name(self, uc, in_ptr, size):
         import struct
@@ -1801,11 +1811,17 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     # {onstack, rdi, rsi, rdx, rcx, r8, r9, rax, rbx, rbp, r10, r11, r12..r15,
     #  trapno/fs/gs, addr, flags/es/ds, err, rip, cs, rflags, rsp, ss, len, ...}
     UCTX_SIZE = 0x370
+    UCTX_MC = 0x40       # offset of mcontext_t in the Orbis ucontext_t (64-byte aligned;
+                         # recovered from Mono's mono_sigctx_to_monoctx: rip is at +0xE0)
     UCTX_REGS = (            # (mcontext offset, unicorn register)
         (0x08, "RDI"), (0x10, "RSI"), (0x18, "RDX"), (0x20, "RCX"), (0x28, "R8"),
         (0x30, "R9"), (0x38, "RAX"), (0x40, "RBX"), (0x48, "RBP"), (0x50, "R10"),
         (0x58, "R11"), (0x60, "R12"), (0x68, "R13"), (0x70, "R14"), (0x78, "R15"),
-        (0xA0, "RIP"), (0xB0, "RFLAGS"), (0xB8, "RSP"))
+        (0xA0, "RIP"), (0xB0, "RFLAGS"), (0xB8, "RSP"),
+        # mc_fsbase / mc_gsbase: Mono's stop-the-world reads the target thread's
+        # TLS (current domain, JIT thread data) through the fs base; with 0 there
+        # it concluded no thread was attached and retried the suspend forever.
+        (0x2E0, "FS_BASE"), (0x2E8, "GS_BASE"))
 
     def _ucontext_target(self, uc, tid):
         """The Thread for lwp id `tid`, or None if it does not exist / has exited."""
@@ -1838,7 +1854,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         # a thread that is not running has its registers in its saved context
         src = t.ctx if t.ctx is not None else uc
         buf = bytearray(self.UCTX_SIZE)
-        base = 0x10                                     # uc_mcontext
+        base = self.UCTX_MC                             # uc_mcontext
         for off, name in self.UCTX_REGS:
             try:
                 _struct.pack_into("<Q", buf, base + off,
@@ -1866,10 +1882,200 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         for off, name in self.UCTX_REGS:
             try:
                 dst.reg_write(getattr(xc, f"UC_X86_REG_{name}"),
-                              _struct.unpack_from("<Q", raw, 0x10 + off)[0])
+                              _struct.unpack_from("<Q", raw, self.UCTX_MC + off)[0])
             except Exception:
                 pass
         self._ret(uc, 0)
+
+    # ---- signals: sigaction / sigaltstack / delivery / sigreturn ---------
+    # Mono turns hardware faults into managed exceptions: it installs a SIGSEGV
+    # handler, and a null dereference in managed code reaches it as a signal
+    # whose ucontext it rewrites to jump into its throw routine, then sigreturn
+    # resumes there. Without delivery, the first NullReferenceException ended the
+    # whole emulation.
+    SIGSEGV, SIGBUS = 11, 10
+    SA_ONSTACK, SA_SIGINFO = 0x1, 0x40
+    SIG_DFL, SIG_IGN = 0, 1
+    SS_DISABLE = 4
+
+    def sys_sigaction(self, uc):
+        # sigaction(sig, const struct sigaction *act, struct sigaction *oact);
+        # FreeBSD struct sigaction = {handler:8, flags:4 (+4 pad), mask:16} (0x20)
+        sig, act, oact = self._args(uc)[:3]
+        sig &= 0xFFFFFFFF
+        old = self.sig_actions.get(sig, (self.SIG_DFL, 0, bytes(16)))
+        try:
+            if oact:
+                uc.mem_write(oact, _struct.pack("<QI4x", old[0], old[1]) + old[2])
+            if act:
+                raw = bytes(uc.mem_read(act, 0x20))
+                handler, flags = _struct.unpack_from("<QI", raw, 0)
+                self.sig_actions[sig] = (handler, flags, raw[0x10:0x20])
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        self._ret(uc, 0)
+
+    # ---- time zone conversion (Sony syscalls 638 / 639) --------------------
+    # sceKernelConvertUtcToLocaltime(time_t time, time_t *local, OrbisTimesec *st,
+    # u64 *dst_sec): the console's configured zone is UTC with no DST here. The
+    # outputs used to stay unwritten, so Mono built TimeZoneInfo.Local from stack
+    # garbage ("baseUtcOffset ... whole number of minutes") and the ShellUI's first
+    # type initialiser that touched time zones threw.
+    # OrbisTimesec = {time_t t; u32 west_sec; u32 dst_sec}
+    def sys_convert_utc_to_localtime(self, uc):
+        t, p_local, p_st, p_dst = self._args(uc)[:4]
+        try:
+            if p_local:
+                uc.mem_write(p_local, _struct.pack("<q", t))
+            if p_st:
+                uc.mem_write(p_st, _struct.pack("<qII", t, 0, 0))
+            if p_dst:
+                uc.mem_write(p_dst, _struct.pack("<Q", 0))
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        self._ret(uc, 0)
+
+    def sys_convert_localtime_to_utc(self, uc):
+        # sceKernelConvertLocaltimeToUtc(time_t time, int mode, time_t *utc,
+        # OrbisTimesec *st, u64 *dst_sec)
+        t, _mode, p_utc, p_st, p_dst = self._args(uc)[:5]
+        try:
+            if p_utc:
+                uc.mem_write(p_utc, _struct.pack("<q", t))
+            if p_st:
+                uc.mem_write(p_st, _struct.pack("<qII", t, 0, 0))
+            if p_dst:
+                uc.mem_write(p_dst, _struct.pack("<Q", 0))
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        self._ret(uc, 0)
+
+    def sys_sigaltstack(self, uc):
+        # sigaltstack(const stack_t *ss, stack_t *oss); stack_t = {sp:8, size:8, flags:4}
+        ss, oss = self._args(uc)[:2]
+        tid = self.emu.sched.current.tid if self.emu.sched and self.emu.sched.current else 0
+        old = self.sig_altstack.get(tid, (0, 0, self.SS_DISABLE))
+        try:
+            if oss:
+                uc.mem_write(oss, _struct.pack("<QQI4x", *old))
+            if ss:
+                sp, size, flags = _struct.unpack("<QQI", bytes(uc.mem_read(ss, 20)))
+                self.sig_altstack[tid] = (sp, size, flags)
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        self._ret(uc, 0)
+
+    def _sigtramp_addr(self):
+        """A page with the signal return code: after the handler returns, rsp
+        points at the ucontext it was given, so `mov rdi, rsp; mov eax, 417;
+        syscall` is sigreturn(ucontext)."""
+        if self._sigtramp is None:
+            from unicorn import UC_PROT_ALL
+            page = self.emu.map_anon(0x1000, prot=UC_PROT_ALL)
+            self.emu.uc.mem_write(page, bytes([0x48, 0x89, 0xE7,              # mov rdi, rsp
+                                               0xB8, 0xA1, 0x01, 0x00, 0x00,  # mov eax, 417
+                                               0x0F, 0x05, 0xCC]))            # syscall; int3
+            self._sigtramp = page
+        return self._sigtramp
+
+    def _pack_ucontext(self, src, fault_addr=0, trapno=0, err=0):
+        """A FreeBSD amd64 ucontext_t (mcontext at +0x10) from register source `src`."""
+        import unicorn.x86_const as xc
+        buf = bytearray(self.UCTX_SIZE)
+        base = self.UCTX_MC
+        for off, name in self.UCTX_REGS:
+            try:
+                _struct.pack_into("<Q", buf, base + off,
+                                  src.reg_read(getattr(xc, f"UC_X86_REG_{name}")))
+            except Exception:
+                pass
+        _struct.pack_into("<I", buf, base + 0x80, trapno)        # mc_trapno
+        _struct.pack_into("<Q", buf, base + 0x88, fault_addr)    # mc_addr
+        _struct.pack_into("<Q", buf, base + 0x98, err)           # mc_err
+        _struct.pack_into("<q", buf, base + 0xC8, 0x320)         # mc_len
+        return bytes(buf)
+
+    def can_deliver(self, sig):
+        act = self.sig_actions.get(sig)
+        return bool(act and act[0] not in (self.SIG_DFL, self.SIG_IGN))
+
+    def deliver_signal(self, uc, sig, fault_addr, write=False):
+        """Run the guest's handler for `sig` as the kernel would: build a signal
+        frame on the thread's (alternate) stack and return the handler's address
+        to resume at, or None when it cannot be delivered."""
+        handler, flags, _mask = self.sig_actions[sig]
+        from unicorn.x86_const import (UC_X86_REG_RSP, UC_X86_REG_RIP, UC_X86_REG_RDI,
+                                       UC_X86_REG_RSI, UC_X86_REG_RDX, UC_X86_REG_RCX)
+        rip = uc.reg_read(UC_X86_REG_RIP)
+        key = (sig, rip, fault_addr)
+        self._sig_streak[key] = self._sig_streak.get(key, 0) + 1
+        if self._sig_streak[key] > 200:       # the handler does not cure the fault
+            return None
+        rsp = uc.reg_read(UC_X86_REG_RSP)
+        tid = self.emu.sched.current.tid if self.emu.sched and self.emu.sched.current else 0
+        top = rsp - 128                                    # skip the red zone
+        alt = self.sig_altstack.get(tid)
+        if flags & self.SA_ONSTACK and alt and not alt[2] & self.SS_DISABLE and alt[1]:
+            if not (alt[0] <= rsp < alt[0] + alt[1]):      # not already on it
+                top = alt[0] + alt[1]
+        base = (top - 0x600) & ~0xF
+        ucp, sip = base + 0x80, base + 0x500
+        uctx = self._pack_ucontext(uc, fault_addr, trapno=12, err=(2 if write else 0))
+        info = bytearray(0x80)
+        _struct.pack_into("<iii", info, 0, sig, 0, 1)      # si_signo, si_errno, si_code=SEGV_MAPERR
+        _struct.pack_into("<Q", info, 0x18, fault_addr)    # si_addr
+        uc.mem_write(ucp, uctx)
+        uc.mem_write(sip, bytes(info))
+        uc.mem_write(base + 0x78, _struct.pack("<Q", self._sigtramp_addr()))   # return address
+        uc.reg_write(UC_X86_REG_RSP, base + 0x78)
+        uc.reg_write(UC_X86_REG_RDI, sig)
+        uc.reg_write(UC_X86_REG_RSI, sip)
+        uc.reg_write(UC_X86_REG_RDX, ucp)
+        uc.reg_write(UC_X86_REG_RCX, fault_addr)
+        self._sig_delivered = getattr(self, "_sig_delivered", 0) + 1
+        if self._sig_delivered in (2, 3):          # diagnostic: full state at the fault
+            import unicorn.x86_const as _x
+            rg = {n: uc.reg_read(getattr(_x, "UC_X86_REG_" + n))
+                  for n in ("RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9",
+                            "R10", "R11", "R12", "R13", "R14", "R15", "EFLAGS", "CS", "SS", "FS_BASE")}
+            self.emu.log("  [signal] fault state: " + " ".join(f"{k.lower()}={v:#x}" for k, v in rg.items()))
+            try:
+                self.emu.log("  [signal] code at rip: " + bytes(uc.mem_read(rip, 16)).hex(" "))
+            except Exception:
+                pass
+        if self._sig_delivered <= 6 or self._sig_delivered % 1000 == 0:
+            self.emu.log(f"  [signal] SIGSEGV #{self._sig_delivered} tid={tid:#x} addr={fault_addr:#x} "
+                         f"rip={rip:#x} rsp={rsp:#x} -> handler {handler:#x} (frame {base:#x}, ucontext {ucp:#x})")
+        return handler
+
+    def sys_sigreturn(self, uc):
+        # sigreturn(const ucontext_t *ucp): restore every register from the (possibly
+        # rewritten) context and resume there. The new rip needs the CPU restarted.
+        import unicorn.x86_const as xc
+        ucp = self._args(uc)[0]
+        try:
+            raw = bytes(uc.mem_read(ucp, self.UCTX_SIZE))
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        self._sigret_n = getattr(self, "_sigret_n", 0) + 1
+        if self._sigret_n <= 6:
+            vals = {n: _struct.unpack_from("<Q", raw, self.UCTX_MC + o)[0] for o, n in self.UCTX_REGS}
+            self.emu.log("  [signal] sigreturn #%d ucp=%#x: " % (self._sigret_n, ucp) +
+                         " ".join(f"{k.lower()}={v:#x}" for k, v in vals.items()
+                                  if k in ("RIP", "RSP", "RBP", "RDI", "RSI", "RAX", "FS_BASE")))
+        for off, name in self.UCTX_REGS:
+            try:
+                uc.reg_write(getattr(xc, f"UC_X86_REG_{name}"),
+                             _struct.unpack_from("<Q", raw, self.UCTX_MC + off)[0])
+            except Exception:
+                pass
+        # Unicorn advances rip past the 2-byte `syscall` AFTER this hook returns, so
+        # a rip written here lands 2 bytes late (mid-instruction: the REX prefix of
+        # `push rbp; mov rbp, rsp` was skipped, turning it into a 32-bit mov).
+        from unicorn.x86_const import UC_X86_REG_RIP
+        uc.reg_write(UC_X86_REG_RIP, (uc.reg_read(UC_X86_REG_RIP) - 2) & 0xFFFFFFFFFFFFFFFF)
+        self.emu._hle_pending = True        # resume at the restored rip
+        uc.emu_stop()
 
     # ---- virtual memory areas: what virtual_query reports -------------
     # [start, end, prot (incl. GPU bits 0x10/0x20), flags, phys offset, direct]

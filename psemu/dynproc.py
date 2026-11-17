@@ -482,13 +482,20 @@ class DynamicProcess:
             uc.mem_write(sp, b)
             strings.append(sp)
         argv_ptrs, execpath = strings[:-1], strings[-1]
+        # guest environment: PSEMU_GUEST_ENV="A=1;B=2" (experiments, e.g. Mono tuning)
+        env_ptrs = []
+        for kv in [x for x in os.environ.get("PSEMU_GUEST_ENV", "").split(";") if "=" in x]:
+            b = kv.encode() + b"\x00"
+            sp -= len(b)
+            uc.mem_write(sp, b)
+            env_ptrs.append(sp)
         sp &= ~0xF
         phoff = struct.unpack_from("<Q", e.data, 0x20)[0]      # e_phoff
         phdr = exe.base + phoff
         aux = [(AT_PHDR, phdr), (AT_PHENT, 56), (AT_PHNUM, len(e.segments)),
                (AT_PAGESZ, PAGE), (AT_BASE, self.libkernel.base), (AT_FLAGS, 0),
                (AT_ENTRY, exe.entry), (AT_EXECPATH, execpath), (AT_NULL, 0)]
-        words = [len(argv_ptrs)] + argv_ptrs + [0] + [0]          # argc argv NULL envp NULL
+        words = [len(argv_ptrs)] + argv_ptrs + [0] + env_ptrs + [0]   # argc argv NULL envp.. NULL
         for k, v in aux:
             words += [k, v]
         blob = struct.pack("<%dQ" % len(words), *words)

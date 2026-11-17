@@ -98,6 +98,7 @@ class Emulator:
 
         # --- per-image state (reset by _build_image) ---
         self._hle_pending = False
+        self._pending_fault = None  # (address, is_write) of a fault awaiting SIGSEGV delivery
         self._exec_next = None     # (path, argv) requested by execve()
         self._stop_reason = None
         self._last_rip = 0
@@ -562,6 +563,12 @@ class Emulator:
     def _hook_mem_unmapped(self, uc, access, address, size, value, user_data):
         rip = uc.reg_read(UC_X86_REG_RIP)
         kind = {16: "READ", 17: "WRITE", 18: "FETCH"}.get(access, str(access))
+        # The guest installed a SIGSEGV handler (Mono turns null dereferences into
+        # NullReferenceException this way): let _run_segment deliver the signal
+        # instead of ending the run.
+        if self.syscalls.can_deliver(self.syscalls.SIGSEGV):
+            self._pending_fault = (address, access == 17)
+            return False
         self.log(f"  [unmapped {kind}] addr=0x{address:x} size={size} "
                  f"at rip=0x{rip:x}")
         self.dump_state()
@@ -840,10 +847,21 @@ class Emulator:
         if os.path.isfile(cand):
             return cand
         base = os.path.basename(name)
-        for root, _dirs, files in os.walk(self.fw_root):
-            if base in files:
-                return os.path.join(root, base)
-        return None
+        # basename index of the firmware tree, built once (first hit in walk order
+        # wins, as before); falls back to a case-insensitive match because the
+        # console's /system/common/font etc. are looked up without regard to case
+        # (the dump has DFHEI5-SONY.ttf, PSM opens DFHEI5-SONY.TTF).
+        idx = getattr(self, "_basename_index", None)
+        if idx is None:
+            idx, low = {}, {}
+            for root, _dirs, files in os.walk(self.fw_root):
+                for f in files:
+                    p = os.path.join(root, f)
+                    idx.setdefault(f, p)
+                    low.setdefault(f.lower(), p)
+            self._basename_index = idx
+            self._basename_index_ci = low
+        return idx.get(base) or self._basename_index_ci.get(base.lower())
 
     def run(self, start=None):
         """Single-process driver: start, step to completion, summarise. A
@@ -908,6 +926,15 @@ class Emulator:
             self.uc.emu_start(cur, 0)
         except UcError as e:
             rip = self.uc.reg_read(UC_X86_REG_RIP)
+            fault, self._pending_fault = self._pending_fault, None
+            if fault is not None and self._stop_reason is None:
+                handler = self.syscalls.deliver_signal(self.uc, self.syscalls.SIGSEGV,
+                                                       fault[0], fault[1])
+                if handler is not None:
+                    return handler                  # run the guest's SIGSEGV handler
+                self._stop_reason = (f"unmapped access at 0x{fault[0]:x} (rip 0x{rip:x}); "
+                                     f"SIGSEGV handler could not run")
+                return None
             if self._stop_reason is None:
                 self._stop_reason = f"UcError: {e} at rip=0x{rip:x}"
             return None

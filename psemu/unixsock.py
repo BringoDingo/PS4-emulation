@@ -16,6 +16,7 @@ written, the server named by connect() answers it and the reply is queued for
 the client's reads. Servers are small Python objects registered by endpoint
 name in SyscallDispatcher.unix_servers.
 """
+import os
 import struct
 
 from .devices import Device
@@ -304,11 +305,18 @@ class CompositorRing:
         them) and at the start of the stream."""
         np = self._np
         out, i, n = [self._rt_words], 0, len(words)
+        noblend = bool(os.environ.get("PSEMU_DCB_NOBLEND"))
         while i < n:
             h = int(words[i])
             if (h >> 30) == 3:
                 cnt = ((h >> 16) & 0x3FFF) + 1
-                out.append(words[i:i + 1 + cnt])
+                pkt = words[i:i + 1 + cnt]
+                if noblend and (h >> 8) & 0xFF == 0x69 and cnt >= 2:
+                    reg = int(pkt[1])
+                    if reg <= 0x1E0 < reg + cnt - 1:          # CB_BLEND0_CONTROL off
+                        pkt = pkt.copy()
+                        pkt[2 + 0x1E0 - reg] = 0
+                out.append(pkt)
                 if (h >> 8) & 0xFF == self._pm4.IT_CLEAR_STATE:
                     out.append(self._rt_words)
                 i += 1 + cnt
@@ -338,6 +346,60 @@ class CompositorRing:
         base = last[0] << 8
         return f"{base:#x}/info={last[4]:#x}" if len(last) >= 5 else f"{base:#x}"
 
+    def _debug_dump_state(self, uc, words):
+        """PSEMU_DCB_DEBUG: log the shader user data and the memory it points at
+        (V# buffer descriptors, constant data) for each draw, to see what the
+        compositor client actually fed the GPU."""
+        sh, i, n, out = {}, 0, len(words), []
+        while i < n:
+            h = int(words[i])
+            if (h >> 30) != 3:
+                i += 1
+                continue
+            cnt = ((h >> 16) & 0x3FFF) + 1
+            op = (h >> 8) & 0xFF
+            if op == 0x12:
+                sh = {}
+            if op == 0x76 and cnt >= 2:
+                reg = int(words[i + 1])
+                for k, v in enumerate(words[i + 2:i + 1 + cnt]):
+                    sh[reg + k] = int(v)
+            if op in (0x2D, 0x27):
+                out.append(dict(sh))
+            i += 1 + cnt
+        log = self.server.sc.emu.log
+        for d, sh in enumerate(out):
+            for name, base in (("PS", 0x0C), ("VS", 0x4C)):
+                regs = [sh.get(base + k) for k in range(16)]
+                if regs[0] is None:
+                    continue
+                log(f"      draw{d} {name} user data: " + " ".join(
+                    "-" if r is None else f"{r:08x}" for r in regs))
+                # every consecutive (lo, hi) pair that looks like a 48-bit pointer
+                for k in range(0, 14, 2):
+                    if regs[k] is None or regs[k + 1] is None:
+                        continue
+                    addr = regs[k] | ((regs[k + 1] & 0xFFFF) << 32)
+                    if 0x3000000000 <= addr < 0x3100000000:
+                        try:
+                            raw = bytes(uc.mem_read(addr, 96))
+                            log(f"        {name}[{k}] -> {addr:#x}: " + raw.hex(" ", 4))
+                            # a table of V# buffer descriptors? follow each one
+                            for v in range(0, 48, 16):
+                                d0, d1, d2, d3 = struct.unpack_from("<4I", raw, v)
+                                base = d0 | ((d1 & 0xFFFF) << 32)
+                                stride, nrec = (d1 >> 16) & 0x3FFF, d2
+                                if (0x3000000000 <= base < 0x3100000000 and 0 < stride <= 64
+                                        and 0 < nrec <= 4096):
+                                    n = min(stride * nrec, 96)
+                                    data = bytes(uc.mem_read(base, n))
+                                    fl = struct.unpack_from("<%df" % (n // 4), data)
+                                    log(f"          V#{v // 16}: base={base:#x} stride={stride} "
+                                        f"num={nrec} dst_sel/fmt={d3:#x} -> " +
+                                        " ".join(f"{x:.4g}" for x in fl))
+                        except Exception as e:
+                            log(f"        {name}[{k}] -> {addr:#x}: unreadable ({e})")
+
     def _run_dcb(self, uc, dcb, size):
         """Execute one client command buffer; returns a log suffix."""
         emu = self.server.sc.emu
@@ -355,9 +417,11 @@ class CompositorRing:
         self.dcb_ok += 1
         # what render target does the buffer itself set (CB_COLOR0_*, ctx reg 0x318..)?
         rt = self._dcb_rt0(words)
+        if os.environ.get("PSEMU_DCB_DEBUG") and getattr(self, "_dbg_left", 12) > 0:
+            self._dbg_left = getattr(self, "_dbg_left", 12) - 1
+            self._debug_dump_state(uc, words)
         fdir = getattr(emu, "frame_dir", None)
         if fdir:
-            import os
             os.makedirs(fdir, exist_ok=True)
             with open(os.path.join(fdir, f"dcb_{self.dcb_ok:04d}_f{self.frames + 1}.bin"), "wb") as fh:
                 fh.write(words.tobytes())
@@ -374,7 +438,8 @@ class CompositorRing:
                             dtype=np.uint8).reshape(self.HEIGHT, self.WIDTH, 4)
         lit = int(img[..., :3].any(axis=2).sum())
         msg = f" [target: {lit} non-black px]"
-        if fdir:
+        every = getattr(self.server.sc.emu, "frame_every", 1)
+        if fdir and (self.frames == 1 or self.frames % every == 0):
             import os
             from PIL import Image
             os.makedirs(fdir, exist_ok=True)
