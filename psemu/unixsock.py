@@ -123,6 +123,7 @@ class GnmCompositorServer:
         self.ring = CompositorRing(self)
         # chunk counts the first client asked for, reused for MapAnotherProcess
         self.n_sys, self.n_vid = 7, 64
+        self.chunks = None          # (system offsets, video offsets), allocated once
 
     def _dmem(self, count):
         offs = []
@@ -142,9 +143,14 @@ class GnmCompositorServer:
         if with_control:
             name = self.CONTROL_SHM.encode() + b"\0"
             reply[0x34:0x34 + len(name)] = name
-        for i, off in enumerate(self._dmem(n_sys)):
+        # The chunks are one physical allocation made at Init; later clients
+        # (MapAnotherProcess) get their own virtual windows onto the SAME
+        # direct-memory offsets, so allocate only once per chunk count.
+        if self.chunks is None or (len(self.chunks[0]), len(self.chunks[1])) != (n_sys, n_vid):
+            self.chunks = (self._dmem(n_sys), self._dmem(n_vid))
+        for i, off in enumerate(self.chunks[0]):
             struct.pack_into("<Q", reply, 0xB8 + 8 * i, off)
-        for i, off in enumerate(self._dmem(n_vid)):
+        for i, off in enumerate(self.chunks[1]):
             struct.pack_into("<Q", reply, 0x8B8 + 8 * i, off)
         cmd = struct.unpack_from("<I", hdr, 0)[0]
         return struct.pack("<IIII", cmd, struct.unpack_from("<I", hdr, 4)[0],

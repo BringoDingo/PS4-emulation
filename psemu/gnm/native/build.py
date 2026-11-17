@@ -33,6 +33,21 @@ VCVARS_CANDIDATES = [
 ]
 
 
+def apply_patches():
+    """Apply patches/*.patch to the vendored shadPS4 tree (idempotent): the tree is
+    fetched separately, so psemu's changes to it live as patches."""
+    root = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
+    for patch in sorted(glob.glob(os.path.join(HERE, "patches", "*.patch"))):
+        base = [shutil.which("git") or "git", "apply", "--ignore-whitespace", "-p2"]
+        if subprocess.run(base + ["--reverse", "--check", patch], cwd=root,
+                          capture_output=True).returncode == 0:
+            continue                                   # already applied
+        r = subprocess.run(base + [patch], cwd=root, capture_output=True, text=True)
+        if r.returncode:
+            sys.exit("cannot apply %s: %s" % (os.path.basename(patch), r.stderr))
+        print("applied", os.path.basename(patch))
+
+
 def msvc_env():
     for bat in VCVARS_CANDIDATES:
         if os.path.exists(bat):
@@ -130,6 +145,7 @@ def main():
         if not os.path.isdir(os.path.join(deps, need)):
             sys.exit("missing dependency %s under %s" % (need, deps))
 
+    apply_patches()
     env = msvc_env()
     build = os.path.join(HERE, "build", "debug" if a.debug else "release")
     os.makedirs(build, exist_ok=True)
