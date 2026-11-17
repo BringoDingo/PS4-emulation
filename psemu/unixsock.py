@@ -487,9 +487,12 @@ class CompositorRing:
             return ""
         fdir = getattr(self.server.sc.emu, "frame_dir", None)
         np = self._np
-        img = np.frombuffer(bytes(self._rt[:self.WIDTH * self.HEIGHT * 4]),
-                            dtype=np.uint8).reshape(self.HEIGHT, self.WIDTH, 4)
-        lit = int(img[..., :3].any(axis=2).sum())
+        raw = bytes(self._rt[:self.WIDTH * self.HEIGHT * 4])
+        img = np.frombuffer(raw, dtype=np.uint8).reshape(self.HEIGHT, self.WIDTH, 4)
+        # pixels with any non-zero R, G or B byte (RGBA in memory: the low 24 bits of
+        # each little-endian dword). Same count as img[..., :3].any(axis=2).sum() but
+        # ~8x faster; this runs on every flip.
+        lit = int(np.count_nonzero(np.frombuffer(raw, dtype="<u4") & np.uint32(0x00FFFFFF)))
         msg = f" [target: {lit} non-black px]"
         every = getattr(self.server.sc.emu, "frame_every", 1)
         if fdir and (self.frames == 1 or self.frames % every == 0):
