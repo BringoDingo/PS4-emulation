@@ -1,0 +1,200 @@
+[ipmi] create client 'SceLncService' -> kid 0x100
+[ipmi] connect 'SceLncService' (kid 0x100) -> ok
+[ipmi] cmd=0x320 kid=0x100 (SceLncService) size=0x30
+[ipmi] invoke SceLncService.method0x30010 in=[] out=[12] -> empty success
+[ipmi] create client 'SceShellCoreUtil' -> kid 0x101
+[ipmi] connect 'SceShellCoreUtil' (kid 0x101) -> ok
+[ipmi] create client 'SceAppMessaging' -> kid 0x102
+[ipmi] connect 'SceAppMessaging' (kid 0x102) -> ok
+[ipmi] create client 'SceNpMgrIpc' -> kid 0x103
+[ipmi] connect 'SceNpMgrIpc' (kid 0x103) -> ok
+[ipmi] cmd=0x320 kid=0x103 (SceNpMgrIpc) size=0x30
+[ipmi] invoke SceNpMgrIpc.method0x0 in=[] out=[32, 4] -> empty success
+[ipmi] create client 'SceNpService' -> kid 0x104
+[ipmi] connect 'SceNpService' (kid 0x104) -> ok
+[ipmi] create client 'SceNetCtl' -> kid 0x105
+[ipmi] connect 'SceNetCtl' (kid 0x105) -> ok
+[ipmi] cmd=0x491 kid=0x105 (SceNetCtl) size=0x20
+[ipmi] cmd=0x320 kid=0x105 (SceNetCtl) size=0x30
+[ipmi] invoke SceNetCtl.method0x20000 in=[] out=[] -> empty success
+[ipmi] cmd=0x320 kid=0x104 (SceNpService) size=0x30
+[ipmi] invoke SceNpService.method0x0 in=[4] out=[0] -> empty success
+[ipmi] invoke SceNpService.method0xa0001 in=[] out=[1] -> empty success
+[ipmi] invoke SceNpService.method0xa0002 in=[4] out=[4, 4] -> empty success
+[ipmi] invoke SceNpService.method0x70000 in=[] out=[] -> empty success
+[ipmi] invoke SceNpMgrIpc.method0x36 in=[4] out=[4] -> empty success
+[ipmi] create client 'SceNpTrophyIpc' -> kid 0x106
+[ipmi] connect 'SceNpTrophyIpc' (kid 0x106) -> ok
+[ipmi] cmd=0x320 kid=0x106 (SceNpTrophyIpc) size=0x30
+[ipmi] invoke SceNpTrophyIpc.method0x0 in=[4] out=[0] -> empty success
+[ipmi] create client 'SceAvCaptureIpc' -> kid 0x107
+[ipmi] connect 'SceAvCaptureIpc' (kid 0x107) -> ok
+[ipmi] create client 'SceAppInst' -> kid 0x108
+[ipmi] connect 'SceAppInst' (kid 0x108) -> ok
+[ipmi] create client 'SceAppContent' -> kid 0x109
+[ipmi] connect 'SceAppContent' (kid 0x109) -> ok
+[ipmi] create client 'SceVideoCoreServer' -> kid 0x10a
+[ipmi] connect 'SceVideoCoreServer' (kid 0x10a) -> ok
+[ipmi] cmd=0x490 kid=0x10a (SceVideoCoreServer) size=0x28
+[ipmi] wait_evf SceVideoCoreServer: driving at 60Hz (compositor vblank fired on wake)
+[ipmi] create client 'SceShareFactoryUtil' -> kid 0x10b
+[ipmi] connect 'SceShareFactoryUtil' (kid 0x10b) -> ok
+[ipmi] create client 'SceNpUdsIpc' -> kid 0x10c
+[ipmi] connect 'SceNpUdsIpc' (kid 0x10c) -> ok
+[ipmi] cmd=0x320 kid=0x10c (SceNpUdsIpc) size=0x30
+[ipmi] invoke SceNpUdsIpc.method0x0 in=[4] out=[0] -> empty success
+[ipmi] create client 'SceSysCoreApp' -> kid 0x10d
+[ipmi] connect 'SceSysCoreApp' (kid 0x10d) -> ok
+[ipmi] cmd=0x252 kid=0x10a (SceVideoCoreServer) size=0x20
+[ipmi] create client 'SceMbusIpc' -> kid 0x10e
+[ipmi] connect 'SceMbusIpc' (kid 0x10e) -> ok
+[ipmi] cmd=0x320 kid=0x10e (SceMbusIpc) size=0x30
+[ipmi] invoke SceMbusIpc.method0xce11002a in=[4] out=[] -> empty success
+[ipmi] invoke SceMbusIpc.method0xce110029 in=[12] out=[48] -> empty success
+[ipmi] invoke SceMbusIpc.method0xce110028 in=[272] out=[4096, 4, 4] -> empty success
+[ipmi] create client 'SceSystemLoggerService' -> kid 0x10f
+[ipmi] connect 'SceSystemLoggerService': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceSystemLoggerService' (kid 0x10f) -> ok
+[ipmi] create client 'SceUserService' -> kid 0x110
+[ipmi] connect 'SceUserService' (kid 0x110) -> ok
+[ipmi] cmd=0x252 kid=0x110 (SceUserService) size=0x20
+[ipmi] create client 'SceDbPreparationServer' -> kid 0x111
+[ipmi] connect 'SceDbPreparationServer': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceDbPreparationServer' (kid 0x111) -> ok
+[ipmi] cmd=0x320 kid=0x111 (SceDbPreparationServer) size=0x30
+[ipmi] invoke SceDbPreparationServer.method0x160007 in=[] out=[1] -> empty success
+[ipmi] cmd=0x3 kid=0x111 (SceDbPreparationServer) size=0x0
+[ipmi] create client 'SceAppDbIpc' -> kid 0x112
+[ipmi] connect 'SceAppDbIpc': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceAppDbIpc' (kid 0x112) -> ok
+[ipmi] cmd=0x251 kid=0x112 (SceAppDbIpc) size=0x28
+[ipmi] cmd=0x320 kid=0x10f (SceSystemLoggerService) size=0x30
+[ipmi] invoke SceSystemLoggerService.method0x3298005 in=[152, 118] out=[] -> empty success
+[ipmi] invoke SceSystemLoggerService.method0x3298006 in=[8] out=[] -> empty success
+[ipmi] cmd=0x252 kid=0x10e (SceMbusIpc) size=0x20
+[ipmi] cmd=0x320 kid=0x110 (SceUserService) size=0x30
+[ipmi] invoke SceUserService.method0x3000f in=[] out=[80] -> modelled
+[ipmi] invoke SceLncService.method0x30016 in=[] out=[] -> empty success
+[ipmi] create client 'SceUpdateService' -> kid 0x113
+[ipmi] connect 'SceUpdateService' (kid 0x113) -> ok
+[ipmi] create client 'ScePatchChecker' -> kid 0x114
+[ipmi] connect 'ScePatchChecker' (kid 0x114) -> ok
+[ipmi] create client 'SceMorpheusUpdService' -> kid 0x115
+[ipmi] connect 'SceMorpheusUpdService': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceMorpheusUpdService' (kid 0x115) -> ok
+[ipmi] create server 'SceCompAppService' -> kid 0x116
+[ipmi] cmd=0x10 kid=0x1f00 (?) size=0x40
+[ipmi] cmd=0x201 kid=0x116 (SceCompAppService) size=0x20
+[ipmi] create client 'SceCompAppProxyUtil' -> kid 0x117
+[ipmi] connect 'SceCompAppProxyUtil': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceCompAppProxyUtil' (kid 0x117) -> ok
+[ipmi] create client 'SceCompAppProxy' -> kid 0x118
+[ipmi] connect 'SceCompAppProxy': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceCompAppProxy' (kid 0x118) -> ok
+[ipmi] create client 'SceShellAppProxy' -> kid 0x119
+[ipmi] connect 'SceShellAppProxy': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceShellAppProxy' (kid 0x119) -> ok
+[ipmi] cmd=0x320 kid=0x101 (SceShellCoreUtil) size=0x30
+[ipmi] invoke SceShellCoreUtil.method0x25 in=[4, 9] out=[2048, 4] -> empty success
+[ipmi] invoke SceShellCoreUtil.method0x24 in=[18, 103] out=[] -> empty success
+[ipmi] invoke SceMbusIpc.method0xce11003b in=[4] out=[] -> empty success
+[ipmi] invoke SceMbusIpc.method0xce11002f in=[8] out=[] -> empty success
+[ipmi] create client 'SceLoginMgrServer' -> kid 0x11a
+[ipmi] connect 'SceLoginMgrServer' (kid 0x11a) -> ok
+[ipmi] invoke SceMbusIpc.method0xce11000d in=[16] out=[] -> empty success
+[ipmi] cmd=0x320 kid=0x112 (SceAppDbIpc) size=0x30
+[ipmi] invoke SceAppDbIpc.method0x30009 in=[4, 132] out=[] -> empty success
+[ipmi] create client 'SceAutoMounterIpc' -> kid 0x11b
+[ipmi] connect 'SceAutoMounterIpc': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceAutoMounterIpc' (kid 0x11b) -> ok
+[ipmi] cmd=0x320 kid=0x11b (SceAutoMounterIpc) size=0x30
+[ipmi] invoke SceAutoMounterIpc.method0x30000 in=[16] out=[] -> empty success
+[ipmi] create server 'SceStickerDlgSrvServer' -> kid 0x11c
+[ipmi] cmd=0x201 kid=0x11c (SceStickerDlgSrvServer) size=0x20
+[ipmi] create client 'SceStickerCoreServer' -> kid 0x11d
+[ipmi] connect 'SceStickerCoreServer': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceStickerCoreServer' (kid 0x11d) -> ok
+[ipmi] cmd=0x490 kid=0x11d (SceStickerCoreServer) size=0x28
+[ipmi] cmd=0x252 kid=0x11d (SceStickerCoreServer) size=0x20
+[ipmi] invoke SceUserService.method0x3000c in=[] out=[4] -> modelled
+[ipmi] invoke SceLncService.method0x3002b in=[4] out=[17088, 4] -> empty success
+[ipmi] create client 'ScePsmSharedDmem' -> kid 0x11e
+[ipmi] connect 'ScePsmSharedDmem': server not created yet - session accepted, idle until it is
+[ipmi] connect 'ScePsmSharedDmem' (kid 0x11e) -> ok
+[ipmi] cmd=0x320 kid=0x11e (ScePsmSharedDmem) size=0x30
+[ipmi] invoke ScePsmSharedDmem.method0x34560000 in=[12] out=[32] -> empty success
+[ipmi] cmd=0x3 kid=0x11e (ScePsmSharedDmem) size=0x0
+[ipmi] create client 'SceBgft' -> kid 0x11f
+[ipmi] connect 'SceBgft' (kid 0x11f) -> ok
+[ipmi] cmd=0x490 kid=0x11f (SceBgft) size=0x28
+[ipmi] invoke SceNpMgrIpc.method0x1 in=[8] out=[] -> empty success
+[ipmi] create server 'SceImeService' -> kid 0x120
+[ipmi] cmd=0x201 kid=0x120 (SceImeService) size=0x20
+[ipmi] create client 'SceImeService' -> kid 0x121
+[ipmi] connect 'SceImeService' (kid 0x121) -> ok
+[ipmi] cmd=0x320 kid=0x121 (SceImeService) size=0x30
+[ipmi] invoke SceImeService.method0x0 in=[4] out=[] -> empty success
+[ipmi] cmd=0x490 kid=0x121 (SceImeService) size=0x28
+[ipmi] create client 'SceNpPartyIpc' -> kid 0x122
+[ipmi] connect 'SceNpPartyIpc': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceNpPartyIpc' (kid 0x122) -> ok
+[ipmi] cmd=0x320 kid=0x122 (SceNpPartyIpc) size=0x30
+[ipmi] invoke SceNpPartyIpc.method0x110000 in=[] out=[] -> empty success
+[ipmi] create server 'SceProfileCacheServer' -> kid 0x123
+[ipmi] cmd=0x201 kid=0x123 (SceProfileCacheServer) size=0x20
+[ipmi] cmd=0x320 kid=0x11a (SceLoginMgrServer) size=0x30
+[ipmi] invoke SceLoginMgrServer.method0x30003 in=[4] out=[] -> empty success
+[ipmi] create server 'SceShareUtil' -> kid 0x124
+[ipmi] create client 'SceEventService' -> kid 0x125
+[ipmi] connect 'SceEventService': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceEventService' (kid 0x125) -> ok
+[ipmi] cmd=0x201 kid=0x124 (SceShareUtil) size=0x20
+[ipmi] create client 'SceSaveData' -> kid 0x126
+[ipmi] connect 'SceSaveData' (kid 0x126) -> ok
+[ipmi] cmd=0x320 kid=0x126 (SceSaveData) size=0x30
+[ipmi] invoke SceSaveData.method0x12340002 in=[24, 4] out=[4, 8] -> empty success
+[ipmi] create client 'SceLibNpRifMgrIpc' -> kid 0x127
+[ipmi] connect 'SceLibNpRifMgrIpc': server not created yet - session accepted, idle until it is
+[ipmi] connect 'SceLibNpRifMgrIpc' (kid 0x127) -> ok
+[ipmi] create client 'SceAvSettingIpc' -> kid 0x128
+[ipmi] connect 'SceAvSettingIpc' (kid 0x128) -> ok
+[ipmi] cmd=0x241 kid=0x128 (SceAvSettingIpc) size=0x30
+[ipmi] cmd=0x490 kid=0x128 (SceAvSettingIpc) size=0x28
+[ipmi] wait_evf SceAvSettingIpc: driving at 60Hz (compositor vblank fired on wake)
+[ipmi] cmd=0x243 kid=0x128 (SceAvSettingIpc) size=0x28
+[ipmi] create client 'ScePsmSharedDmem' -> kid 0x129
+[ipmi] connect 'ScePsmSharedDmem': server not created yet - session accepted, idle until it is
+[ipmi] connect 'ScePsmSharedDmem' (kid 0x129) -> ok
+[ipmi] cmd=0x320 kid=0x129 (ScePsmSharedDmem) size=0x30
+[ipmi] invoke ScePsmSharedDmem.method0x34560003 in=[4] out=[] -> empty success
+[ipmi] cmd=0x3 kid=0x129 (ScePsmSharedDmem) size=0x0
+[ipmi] cmd=0x252 kid=0x122 (SceNpPartyIpc) size=0x20
+[ipmi] cmd=0x241 kid=0x100 (SceLncService) size=0x30
+[ipmi] cmd=0x490 kid=0x100 (SceLncService) size=0x28
+[ipmi] create client 'ScePsmSharedDmem' -> kid 0x12a
+[ipmi] connect 'ScePsmSharedDmem': server not created yet - session accepted, idle until it is
+[ipmi] connect 'ScePsmSharedDmem' (kid 0x12a) -> ok
+[ipmi] cmd=0x320 kid=0x12a (ScePsmSharedDmem) size=0x30
+[ipmi] invoke ScePsmSharedDmem.method0x34560004 in=[4] out=[] -> empty success
+[ipmi] cmd=0x3 kid=0x12a (ScePsmSharedDmem) size=0x0
+[ipmi] cmd=0x252 kid=0x102 (SceAppMessaging) size=0x20
+[ipmi] cmd=0x252 kid=0x100 (SceLncService) size=0x20
+[ipmi] cmd=0x320 kid=0x117 (SceCompAppProxyUtil) size=0x30
+[ipmi] invoke SceCompAppProxyUtil.method0xac0000 in=[8] out=[] -> empty success
+[ipmi] invoke SceNpMgrIpc.method0x4 in=[4] out=[] -> empty success
+[ipmi] invoke SceNetCtl.method0x20004 in=[] out=[4] -> empty success
+[ipmi] invoke SceNpMgrIpc.method0x33 in=[4] out=[4] -> empty success
+[ipmi] create server 'SceErrorDlgServ' -> kid 0x12b
+[ipmi] cmd=0x201 kid=0x12b (SceErrorDlgServ) size=0x20
+[ipmi] create server 'SceShellUIUtilSv' -> kid 0x12c
+[ipmi] cmd=0x201 kid=0x12c (SceShellUIUtilSv) size=0x20
+[ipmi] create server 'SceCdlgNpCommerc' -> kid 0x12d
+[ipmi] cmd=0x201 kid=0x12d (SceCdlgNpCommerc) size=0x20
+[ipmi] invoke SceUserService.method0x30008 in=[8] out=[4] -> empty success
+[ipmi] create server 'SceCdlgRichProf' -> kid 0x12e
+[ipmi] cmd=0x201 kid=0x12e (SceCdlgRichProf) size=0x20
+[ipmi] invoke SceUserService.method0x30006 in=[8] out=[8] -> empty success
+[ipmi] invoke SceUserService.method0x30004 in=[16] out=[17] -> empty success
+[ipmi] invoke SceUserService.method0x3001e in=[16] out=[17, 8] -> empty success
+[ipmi] invoke SceNpPartyIpc.method0x11004b in=[4] out=[1, 1] -> empty success
+[ipmi] invoke SceNpPartyIpc.method0x110003 in=[4] out=[] -> empty success

@@ -1,0 +1,125 @@
+
+== loading module #0: eboot.bin (dynamic, interp /libexec/ld-elf.so.1) ==
+  dynamic process: 96 modules
+  map eboot.bin                    0x0100000000-0x010102c000  tls#1
+  map libSceDipsw.prx              0x0101040000-0x010104c000  tls#2
+  map libkernel.prx                0x0101060000-0x01010e8000  tls#3
+  map libSceLibcInternal.prx       0x0101100000-0x010122c000  tls#4
+  map libSceGnmDriver.prx          0x0101240000-0x0101254000  tls#5
+  map libSceVideoOut.prx           0x0101270000-0x0101290000  tls#6
+  map libSceAvSetting.prx          0x01012a0000-0x01012b4000  tls#7
+  map libSceIpmi.prx               0x01012d0000-0x01012f4000  tls#8
+  map libSceMbus.prx               0x0101310000-0x0101324000  tls#9
+  map libSceRegMgr.prx             0x0101340000-0x010134c000  tls#10
+  map libSceSysmodule.prx          0x0101360000-0x010137c000  tls#11
+  map libSceM4aacEnc.prx           0x0101390000-0x010139c000  tls#12
+  map libSceAjm.prx                0x01013b0000-0x01013bc000  tls#13
+  map libSceScreenShot.prx         0x01013d0000-0x01013dc000  tls#14
+  map libSceSysUtil.prx            0x01013f0000-0x01013fc000  tls#15
+  map libSceJpegEnc.prx            0x0101410000-0x0101420000  tls#16
+  map libSceJpegDec.prx            0x0101430000-0x0101444000  tls#17
+  map libScePngEnc.prx             0x0101460000-0x0101474000  tls#18
+  map libScePngDec.prx             0x0101490000-0x01014a4000  tls#19
+  map libSceRtc.prx                0x01014c0000-0x01014d0000  tls#20
+  map libSceIme.prx                0x01014e0000-0x0101520000  tls#21
+  map libSceUserService.prx        0x0101530000-0x0101548000  tls#22
+  map libSceSystemService.prx      0x0101560000-0x01015ac000  tls#23
+  map libSceSysCore.prx            0x01015c0000-0x01015d0000  tls#24
+  map libSceHmd.prx                0x01015e0000-0x0101688000  tls#25
+  map libSceUsbd.prx               0x01016a0000-0x01016bc000  tls#26
+  map libSceVisionManager.prx      0x01016d0000-0x01018a4000  tls#27
+  map libSceCamera.prx             0x01018c0000-0x01018dc000  tls#28
+  map libScePad.prx                0x01018f0000-0x0101908000  tls#29
+  map libSceMove.prx               0x0101920000-0x0101934000  tls#30
+  map libSceComposite.prx          0x0101950000-0x01019e0000  tls#31
+  map libSceGnmDriver_sys.prx      0x01019f0000-0x0101a04000  tls#32
+  map libSceSsl.prx                0x0101a20000-0x0101a7c000  tls#33
+  map libSceNet.prx                0x0101a90000-0x0101bdc000  tls#34
+  map libSceHttp.prx               0x0101bf0000-0x0101c30000  tls#35
+  map libSceNetCtl.prx             0x0101c40000-0x0101c50000  tls#36
+  map libSceNpWebApi.prx           0x0101c60000-0x0101c80000  tls#37
+  map libSceNpCommon.prx           0x0101c90000-0x0101cd0000  tls#38
+  map libSceNpManager.prx          0x0101ce0000-0x0101d24000  tls#39
+  [np] shared NP heap+IPC server: size->VSH, re-init idempotent (heap flag @ 0x101d22b84)
+  map libSceNpUtility.prx          0x0101d40000-0x0101d70000  tls#40
+  map libSceNpSns.prx              0x0101d80000-0x0101d90000  tls#41
+  map libSceNpTrophy.prx           0x0101da0000-0x0101dd0000  tls#42
+  map libSceAudioIn.prx            0x0101de0000-0x0101df0000  tls#43
+  map libSceAudioOut.prx           0x0101e00000-0x0101e24000  tls#44
+  [audio] libSceAudioOut: no audio server -> stub IPMI client (calls fail with 0x80260001 instead of crashing)
+  map libSceBgft.prx               0x0101e40000-0x0101e54000  tls#45
+  map libSceFsInternalForVsh.prx   0x0101e70000-0x0101ec4000  tls#46
+  map libSceSaveData.prx           0x0101ee0000-0x0101f2c000  tls#47
+  map libSceJpegParser.prx         0x0101f40000-0x0101f68000  tls#48
+  map libSceAbstractStorage.prx    0x0101f80000-0x0101f94000  tls#49
+  map libSceGvMp4Parser.prx        0x0101fb0000-0x0102050000  tls#50
+  map libSceVideoCoreServerInterface.prx 0x0102060000-0x010207c000  tls#51
+  map libSceImageUtil.prx          0x0102090000-0x0102138000  tls#52
+  map libScePngParser.prx          0x0102150000-0x0102168000  tls#53
+  map libSceGifParser.prx          0x0102180000-0x0102198000  tls#54
+  map libSceMetadataReaderWriter.prx 0x01021b0000-0x01021c4000  tls#55
+  map libSceJson2.prx              0x01021e0000-0x01021f8000  tls#56
+  map libSceAbstractYoutube.prx    0x0102210000-0x0102234000  tls#57
+  map libSceAbstractTwitter.prx    0x0102250000-0x010228c000  tls#58
+  map libSceAbstractFacebook.prx   0x01022a0000-0x01022d0000  tls#59
+  map libSceAbstractDailymotion.prx 0x01022e0000-0x0102304000  tls#60
+  map libSceAbstractLocal.prx      0x0102320000-0x0102340000  tls#61
+  map libSceUpdateService.prx      0x0102350000-0x0102360000  tls#62
+  map libScePatchCheckerClient.prx 0x0102370000-0x010237c000  tls#63
+  map libSceVideoRecording.prx     0x0102390000-0x01023f0000  tls#64
+  map libSceAvcap.prx              0x0102400000-0x010241c000  tls#65
+  map libSceVideoOutSecondary.prx  0x0102430000-0x0102440000  tls#66
+  map libSceMusicCoreServerClient.prx 0x0102450000-0x0102460000  tls#67
+  map libSceAppInstUtil.prx        0x0102470000-0x0102488000  tls#68
+  map libSceCdlgUtilServer.prx     0x01024a0000-0x0102508000  tls#69
+  map libSceSharePlay.prx          0x0102520000-0x010252c000  tls#70
+  map libSceAppContent.prx         0x0102540000-0x0102554000  tls#71
+  map libSceMarlin.prx             0x0102570000-0x0102640000  tls#72
+  map libSceRemoteplay.prx         0x0102650000-0x0102660000  tls#73
+  map libSceWeb.prx                0x0102670000-0x0102784000  tls#74
+  map libSceWebKit2.prx            0x01027a0000-0x0106014000  tls#75
+  map libSceOrbisCompat.prx        0x0106030000-0x01061f8000  tls#76
+  map libSceLibreSsl.prx           0x0106210000-0x0106374000  tls#77
+  map libSceRandom.prx             0x0106390000-0x010639c000  tls#78
+  map libScePigletv2VSH.prx        0x01063b0000-0x0106468000  tls#79
+  map libScePrecompiledShaders.prx 0x0106480000-0x01064a0000  tls#80
+  map libScePsm.prx                0x01064b0000-0x0106828000  tls#81
+  map libmonosgen-2.0.prx          0x0106840000-0x0106d5c000  tls#82
+  map libSceAudiodec.prx           0x0106d70000-0x0106d80000  tls#83
+  map libSceKeyboard.prx           0x0106d90000-0x0106d9c000  tls#84
+  map libSceMouse.prx              0x0106db0000-0x0106dbc000  tls#85
+  map libSceRazorCpu.prx           0x0106dd0000-0x0106de0000  tls#86
+  map libSceNpGriefReport.prx      0x0106df0000-0x0106e0c000  tls#87
+  map libswreset.prx               0x0106e20000-0x0106e2c000  tls#88
+  map libSceTtsCoreEnUs.prx        0x0106e40000-0x01070e4000  tls#89
+  map libSceTtsCoreJp.prx          0x0107100000-0x01072a0000  tls#90
+  map libSceBackupRestoreUtil.prx  0x01072b0000-0x01072bc000  tls#91
+  map libSceDataTransfer.prx       0x01072d0000-0x01072e0000  tls#92
+  map libSceLoginMgrServer.prx     0x01072f0000-0x0107300000  tls#93
+  map libSceSocialScreen.prx       0x0107310000-0x010731c000  tls#94
+  map libSceShareFactoryUtil.prx   0x0107330000-0x0107340000  tls#95
+  map libSceNpUniversalDataSystem.prx 0x0107350000-0x0107360000  tls#96
+  relocations: 277897 relative, 15771 symbol, 21 TLS, 112 -> stubs (51 NIDs)
+  stack 0x7ffeffe00000-0x7fff00000000, rsp=0x7ffefffff000
+  tcb   0x000010008000 (fs_base), tdata 0x740
+  curthread 0x000010009000 (tid=0x10001)
+  libthr hooks: fatal=0x101066fd0, mutex-lock entries=['0x101072e30', '0x101072e50', '0x101072e70', '0x10108df40', '0x10108ee20', '0x10108f0a0']
+  entry: libkernel @ 0x101087454 (executable entry 0x10000abe0)
+
+=== instructions per thread per 250M window (top 5) ===
+ window 0M-250M  switches= 40197  0x10001=69%  0x10009=19%  0x1001a=10%  0x1000a=0%  0x1000c=0%
+ window 250M-500M  switches= 59924  0x1001a=48%  0x10001=46%  0x1002a=4%  0x1002c=0%  0x10027=0%
+ window 500M-750M  switches= 65150  0x10001=47%  0x1004f=20%  0x1001a=10%  0x10030=7%  0x10027=6%
+ window 750M-1000M  switches= 42971  0x1004f=52%  0x10001=47%  0x10051=0%  0x10036=0%  0x10002=0%
+ window 1000M-1250M  switches=  6587  0x10001=65%  0x1004f=34%  0x10052=0%  0x1002e=0%  0x10036=0%
+ window 1250M-1500M  switches=  1323  0x10001=97%  0x10052=0%  0x10026=0%  0x1002d=0%  0x10053=0%
+ window 1500M-1750M  switches=  2730  0x10001=97%  0x10026=0%  0x1005c=0%  0x10028=0%  0x1005b=0%
+ window 1750M-2000M  switches= 25566  0x10001=84%  0x10069=4%  0x10073=4%  0x10027=1%  0x10051=1%
+ window 2000M-2250M  switches= 58502  0x10001=65%  0x10027=17%  0x10029=5%  0x10073=5%  0x10028=5%
+ window 2250M-2500M  switches= 14312  0x10001=52%  0x10073=41%  0x10029=2%  0x10028=1%  0x10027=0%
+ window 2500M-2750M  switches= 13838  0x10075=40%  0x10001=34%  0x10073=23%  0x1005e=0%  0x10074=0%
+ window 2750M-3000M  switches=  3574  0x10075=49%  0x10001=41%  0x10073=8%  0x1005e=0%  0x10051=0%
+psemu: 3 assumption(s) about objects owned by processes that are not emulated:
+  evf  SceBootStatusFlags                       bits 0x4 AND           -> satisfy  x1 [default]
+  evf  SceBootStatusFlags                       bits 0x400 AND         -> satisfy  x1 [default]
+  evf  SceCompositorMultiEVF_0                  bits 0x1 AND           -> satisfy  x1121 [default]

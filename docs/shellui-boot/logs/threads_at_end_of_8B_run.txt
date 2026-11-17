@@ -1,0 +1,119 @@
+threads: 118 (117 created), 395647 switches
+0x10001 main: ready
+0x10002 libkernel.prx+0x6c50: blocked (kind=ipmi_wait_evf, kid=0x10a, name=SceVideoCoreServer)
+0x10003 libkernel.prx+0x6c50: exited
+0x10004 libkernel.prx+0x6c50: blocked (kind=umtx_wait, addr=0x2000394038)
+0x10005 libkernel.prx+0x6c50: blocked (kind=sem_wait, addr=0x106d283ac)
+0x10006 libkernel.prx+0x6c50: blocked (kind=kevent, kq=0x2a, evbuf=0x7ffeffae7ed0, nev=0x1)
+0x10007 libkernel.prx+0x6c50: blocked (kind=kevent, kq=0x28, evbuf=0x7ffeffac3f20, nev=0x1)
+0x10008 libkernel.prx+0x6c50: blocked (kind=umtx_wait, addr=0x2000394098)
+0x10009 libkernel.prx+0x6c50: exited
+0x1000a libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x2004684f44)
+0x1000b libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x2a7, name=SceSysLogPullEvt_000003E8, bits=0x1, mode=0x21, result=0x7ffeff98bda0, timeout_p=0x0)
+0x1000c libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x20046862e4)
+0x1000d libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x2b2, name=SceUserServiceGetEvent_000003e8, bits=0x1, mode=0x21, result=0x7ffeff973f88, timeout_p=0x0)
+0x1000e libkernel.prx+0x6c50: blocked (kind=sem_wait, addr=0x200468b588)
+0x1000f libkernel.prx+0x6c50: blocked (kind=sem_wait, addr=0x200468f968)
+0x10010 libkernel.prx+0x6c50: blocked (kind=sleep, ns=0x3b9aca00)
+0x10011 libkernel.prx+0x6c50: blocked (kind=sem_wait, addr=0x20086ddfa8)
+0x10012 libkernel.prx+0x6c50: blocked (kind=ipmi_receive, kid=0x116, name=SceCompAppService)
+0x10013 libkernel.prx+0x6c50: blocked (kind=sleep, ns=0xee6b280)
+0x10014 libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x455, name=SceVoiceMsgTaskEvf, bits=0x1, mode=0x11, result=0x0, timeout_p=0x0)
+0x10015 libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x467, name=SceAutoMounterEvent_000003e8, bits=0xffffffffffffffff, mode=0x12, result=0x7ffeff4fbd80, timeout_p=0x0)
+0x10016 libkernel.prx+0x6c50: blocked (kind=ipmi_receive, kid=0x11c, name=SceStickerDlgSrvServer)
+0x10017 libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x473, name=SceStickerTaskEvf, bits=0xff, mode=0x12, result=0x7ffeff3eff50, timeout_p=0x7ffeff3eff4c)
+0x10018 libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x475, name=SceStickerCbTaskEvf, bits=0xff, mode=0x12, result=0x7ffeff3dbc50, timeout_p=0x0)
+0x10019 libkernel.prx+0x6c50: blocked (kind=kevent, kq=0x2f, evbuf=0x7ffeff3c7f10, nev=0x1)
+0x1001a libkernel.prx+0x6c50: exited
+0x1001b libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cc2f1e4)
+0x1001c libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cc5b6a4)
+0x1001d libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cc5f6c4)
+0x1001e libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cc5f764)
+0x1001f libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200ccad324)
+0x10020 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200ccadfe4)
+0x10021 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200ccad4a4)
+0x10022 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200ccbaca4)
+0x10023 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200ccbc244)
+0x10024 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200ccbb964)
+0x10025 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cd51384)
+0x10026 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cd97904)
+0x10027 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cda9c84)
+0x10028 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cda9c84)
+0x10029 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cda9c84)
+0x1002a libkernel.prx+0x6c50: exited
+0x1002b libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200ce14084)
+0x1002c libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200ce85fc4)
+0x1002d libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cf039e4)
+0x1002e libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x2002b7b6a4)
+0x1002f libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200cf3ad24)
+0x10030 libkernel.prx+0x6c50: exited
+0x10031 libkernel.prx+0x6c50: exited
+0x10032 libkernel.prx+0x6c50: exited
+0x10033 libkernel.prx+0x6c50: blocked (kind=ipmi_wait_evf, kid=0x11f, name=SceBgft)
+0x10034 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200d03f6e4)
+0x10035 libkernel.prx+0x6c50: blocked (kind=sem_wait, addr=0x200d03e9c8)
+0x10036 libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x5ed, name=SceImeUpdateFlags, bits=0x1, mode=0x22, result=0x0, timeout_p=0x0)
+0x10037 libkernel.prx+0x6c50: blocked (kind=ipmi_receive, kid=0x120, name=SceImeService)
+0x10038 libkernel.prx+0x6c50: blocked (kind=ipmi_wait_evf, kid=0x121, name=SceImeService)
+0x10039 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x20003b4684)
+0x1003a libkernel.prx+0x6c50: blocked (kind=sem_wait, addr=0x200d039688)
+0x1003b libkernel.prx+0x6c50: blocked (kind=ipmi_receive, kid=0x123, name=SceProfileCacheServer)
+0x1003c libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200d1817c4)
+0x1003d libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x442, name=SceLoginMgrEventFlag, bits=0x8011fffe, mode=0x22, result=0x7ffefdc27f78, timeout_p=0x0)
+0x1003e libkernel.prx+0x6c50: blocked (kind=sem_wait, addr=0x200d185408)
+0x1003f libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x76d, name=SceShareUtilEventFlagWrapper, bits=0x1, mode=0x11, result=0x0, timeout_p=0x0)
+0x10040 libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x798, name=SceShareUtilEventFlagTimer, bits=0x1, mode=0x11, result=0x0, timeout_p=0x0)
+0x10041 libkernel.prx+0x6c50: blocked (kind=ipmi_receive, kid=0x124, name=SceShareUtil)
+0x10042 libkernel.prx+0x6c50: exited
+0x10043 libkernel.prx+0x6c50: exited
+0x10044 libkernel.prx+0x6c50: exited
+0x10045 libkernel.prx+0x6c50: exited
+0x10046 libkernel.prx+0x6c50: exited
+0x10047 libkernel.prx+0x6c50: exited
+0x10048 libkernel.prx+0x6c50: exited
+0x10049 libkernel.prx+0x6c50: exited
+0x1004a libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x22a, name=SceShellUIBootManager, bits=0x100000000000, mode=0x1, result=0x0, timeout_p=0x0)
+0x1004b libkernel.prx+0x6c50: exited
+0x1004c libkernel.prx+0x6c50: exited
+0x1004d libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x22a, name=SceShellUIBootManager, bits=0x400, mode=0x1, result=0x0, timeout_p=0x0)
+0x1004e libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x22a, name=SceShellUIBootManager, bits=0x8000000, mode=0x1, result=0x0, timeout_p=0x0)
+0x1004f libkernel.prx+0x6c50: exited
+0x10050 libkernel.prx+0x6c50: blocked (kind=kevent, kq=0x26, evbuf=0x7ffefd1a7758, nev=0x1)
+0x10051 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200d33fda4)
+0x10052 libkernel.prx+0x6c50: blocked (kind=kevent, kq=0x34, evbuf=0x101843020, nev=0x4)
+0x10053 libkernel.prx+0x6c50: blocked (kind=ipmi_wait_evf, kid=0x100, name=SceLncService)
+0x10054 libkernel.prx+0x6c50: blocked (kind=ipmi_wait_evf, kid=0x100, name=SceLncService)
+0x10055 libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x22a, name=SceShellUIBootManager, bits=0x8000000, mode=0x1, result=0x0, timeout_p=0x0)
+0x10056 libkernel.prx+0x6c50: exited
+0x10057 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200d5f0444)
+0x10058 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200d5f5be4)
+0x10059 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200d5fbb44)
+0x1005a libkernel.prx+0x6c50: blocked (kind=sleep, ns=0xfe8ff8)
+0x1005b libkernel.prx+0x6c50: blocked (kind=sem_wait, addr=0x200d6b6f48)
+0x1005c libkernel.prx+0x6c50: blocked (kind=evf_wait, evf=0x22a, name=SceShellUIBootManager, bits=0x40000000000, mode=0x1, result=0x0, timeout_p=0x0)
+0x1005d libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x2002b7b6a4)
+0x1005e libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x201597e924)
+0x1005f libkernel.prx+0x6c50: blocked (kind=ipmi_receive, kid=0x12b, name=SceErrorDlgServ)
+0x10060 libkernel.prx+0x6c50: blocked (kind=ipmi_receive, kid=0x12c, name=SceShellUIUtilSv)
+0x10061 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x2015c33844)
+0x10062 libkernel.prx+0x6c50: blocked (kind=sleep, ns=0xfe4d90)
+0x10063 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x2015c40da4)
+0x10064 libkernel.prx+0x6c50: blocked (kind=ipmi_receive, kid=0x12d, name=SceCdlgNpCommerc)
+0x10065 libkernel.prx+0x6c50: blocked (kind=sem_wait, addr=0x2016529c08)
+0x10066 libkernel.prx+0x6c50: blocked (kind=ipmi_receive, kid=0x12e, name=SceCdlgRichProf)
+0x10067 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x201656f824)
+0x10068 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x20165728a4)
+0x10069 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200d3722c4)
+0x1006a libkernel.prx+0x6c50: exited
+0x1006b libkernel.prx+0x6c50: exited
+0x1006c libkernel.prx+0x6c50: exited
+0x1006d libkernel.prx+0x6c50: exited
+0x1006e libkernel.prx+0x6c50: exited
+0x1006f libkernel.prx+0x6c50: exited
+0x10070 libkernel.prx+0x6c50: exited
+0x10071 libkernel.prx+0x6c50: exited
+0x10072 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x20167b6f84)
+0x10073 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x2002b7b6a4)
+0x10074 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x2002b7b6a4)
+0x10075 libkernel.prx+0x6c50: running
+0x10076 libkernel.prx+0x6c50: blocked (kind=cv_wait, addr=0x200c51a044)psemu: 3 assumption(s) about objects owned by processes that are not emulated:

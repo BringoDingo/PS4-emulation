@@ -1,0 +1,234 @@
+Boot steps in evaluation order:
+   1. EvalBGLayer
+   2. EvalBase
+   3. EvalMainOnStandby
+   4. EvalRegMgrInitOK
+   5. EvalSelectResolution
+   6. EvalInitialSetup
+   7. EvalCrashReport
+   8. EvalPowerOffWarning
+   9. EvalCreateKratosUser
+  10. EvalDBRecovery
+  11. EvalAutoStandbyAnnouncement
+  12. EvalSystemUpdate
+  13. EvalSystemPasscodeInput
+  14. EvalHealthWarning
+  15. EvalNotifyDbInitialized
+  16. EvalPlatformPrivacy
+  17. EvalFarsightUI
+  18. EvalMediaEventListener
+  19. EvalDaemons
+  20. EvalReadyGameBoot
+  21. EvalMediaEventListenerEnabled
+
+Flags per method (call, constant pushed just before it):
+
+Start:
+    SetFlag        ?
+    SetFlag        0x20
+
+BackgroundInitBeforeBGLayer:
+    SetEventFlag   0x800000
+
+BackgroundInitBeforeBasePlugin:
+    SetEventFlag   0x1000000
+
+BackgroundInitCrashReport:
+    SetEventFlag   0x4000
+    SetEventFlag   0x2000
+
+BackgroundInitDbRecovery:
+    SetEventFlag   0x200000
+    SetEventFlag   0x100000
+
+BackgroundInitSystemPasscode:
+    SetEventFlag   0x800000000000
+    SetEventFlag   0x400000000000
+
+BackgroundInitBeforeFarsightUI:
+    SetEventFlag   0x2000000
+
+BackgroundInitBackgroundAutoLogin:
+    WaitEventFlag  0x100000000000
+    SetEventFlag   0x2000000000
+
+BackgroundInitBeforeReadyGameBoot:
+    SetEventFlag   0x10000000
+
+BackgroundInitWebKit:
+    SetEventFlag   0x4000000
+
+BackgroundInitDaemons:
+    WaitEventFlag  0x400000
+    WaitEventFlag  0x400
+    GetEventFlag   0x200000
+    WaitEventFlag  0x80000
+    SetEventFlag   0x8000000
+
+BackgroundInitResetSurfaceRect:
+    WaitEventFlag  0x80000000000
+    WaitEventFlag  0x8000000
+
+EvalBGLayer:
+    GetEventFlag   0x800000
+    GetEventFlag   0x40
+    SetFlag        0x40
+
+EvalBase:
+    GetEventFlag   0x1000000
+    GetEventFlag   0x200
+    SetFlag        0x200
+
+EvalMainOnStandby:
+    GetEventFlag   0x1000000000
+    GetEventFlag   0x100000
+    GetEventFlag   0x4000000
+    SetFlag        0x1000000000
+
+EvalRegMgrInitOK:
+    GetEventFlag   0x4000000000000
+    GetEventFlag   0x8000000000000
+    SetFlag        0x8000000000000
+    SetFlag        0x4000000000000
+
+EvalSelectResolution:
+    GetEventFlag   0x1000000000000
+    GetEventFlag   0x2000000000000
+    SetFlag        0x2000000000000
+    SetFlag        0x1000000000000
+
+EvalInitialSetup:
+    GetEventFlag   0x100
+    GetEventFlag   0x80
+    GetEventFlag   0x100000
+    SetFlag        0x80
+    SetFlag        0x80
+    SetFlag        0x100
+
+OnCrashReportNeeded:
+    SetEventFlag   0x8000
+
+EvalCrashReport:
+    GetEventFlag   0x20000
+    GetEventFlag   0x10000
+    GetEventFlag   0x2000
+    GetEventFlag   0x4000
+    SetFlag        0x10000
+    SetFlag        0x20000
+
+EvalPowerOffWarning:
+    GetEventFlag   0x8000
+    GetEventFlag   0x1000
+    GetEventFlag   0x800
+    SetFlag        0x800
+    SetFlag        0x1000
+
+ExecDBRecovery:
+    GetEventFlag   0x200000
+    SetFlag        0x40000
+    SetFlag        0x80000
+
+EvalCreateKratosUser:
+    GetEventFlag   0x8000000000
+    SetFlag        0x8000000000
+
+EvalDBRecovery:
+    GetEventFlag   0x10000000000000
+    GetEventFlag   0x80000
+    SetFlag        0x10000000000000
+    GetEventFlag   0x40000
+    GetEventFlag   0x100000
+
+EvalAutoStandbyAnnouncement:
+    GetEventFlag   0x20000000000
+    GetEventFlag   0x10000000000
+    SetFlag        0x10000000000
+    SetFlag        0x20000000000
+
+EvalSystemUpdate:
+    GetEventFlag   0x200000000
+    GetEventFlag   0x100000000
+    SetFlag        0x100000000
+    SetFlag        0x200000000
+
+EvalSystemPasscodeInput:
+    GetEventFlag   0x100000000000
+    SetFlag        0x100000000000
+
+EvalHealthWarning:
+    GetEventFlag   ?
+    GetEventFlag   0x40000000
+    SetFlag        ?
+    SetFlag        0x40000000
+
+EvalNotifyDbInitialized:
+    GetEventFlag   0x20000000000000
+
+EvalPlatformPrivacy:
+    GetEventFlag   0x80000000000000
+    GetEventFlag   0x40000000000000
+    SetEventFlag   0x80000000000000
+    SetFlag        0x40000000000000
+
+EvalFarsightUI:
+    GetEventFlag   0x400000
+    GetEventFlag   0x2000000
+    GetEventFlag   0x2000000000
+    GetEventFlag   0x400
+    SetFlag        0x400000
+
+EvalMediaEventListener:
+    GetEventFlag   0x400000000
+    GetEventFlag   ?
+    SetFlag        0x400000000
+
+EvalDaemons:
+    GetEventFlag   0x8000000
+
+EvalReadyGameBoot:
+    GetEventFlag   0x10000000
+    GetEventFlag   0x20000000
+    SetFlag        0x20000000
+
+EvalMediaEventListenerEnabled:
+    GetEventFlag   0x400000000
+
+<EvalBase>b__e:
+    SetEventFlag   0x400
+
+<EvalSelectResolution>b__14:
+    GetEventFlag   0x400
+
+<EvalSelectResolution>b__15:
+    SetEventFlag   0x1000000000000
+
+<EvalInitialSetup>b__19:
+    SetEventFlag   0x100
+
+<EvalCrashReport>b__1e:
+    SetEventFlag   0x20000
+
+<EvalPowerOffWarning>b__20:
+    SetEventFlag   0x1000
+
+<ExecDBRecovery>b__22:
+    SetEventFlag   0x80000
+
+<NotifyDbInitialized>b__24:
+    SetEventFlag   0x20000000000000
+
+<EvalSystemUpdate>b__27:
+    SetEventFlag   0x200000000
+
+<EvalHealthWarning>b__2d:
+    SetEventFlag   ?
+
+<EvalPlatformPrivacy>b__2f:
+    SetEventFlag   0x80000000000000
+
+<EvalMediaEventListener>b__31:
+    WaitEventFlag  0x20000000
+
+<StartInitializeVisionEngine>b__33:
+    WaitEventFlag  0x20
+    SetEventFlag   0x40000000000
