@@ -55,6 +55,26 @@ Run from a psemu checkout with a firmware dump at `D:\Ps4Tools\ps4kernel\firmwar
 * `survey_dcbs.py DIR`, `pm4_dump.py FILE` - summarise / decode saved PM4 command buffers.
 * `aotsym.py` - resolve addresses in Mono AOT images to managed method names.
 
+## Speed: native AVX (2026-11)
+
+The 8B-instruction ShellUI boot spent much of its time in the Python AVX emulation:
+~47M executions of `vpermilps` (34.9M), `vpermilpd` (3.1M) and `vcvtps2ph` (9.3M), mostly in
+the native background-layer spline code. Those ops now run in C (`psemu/native/vex.c`;
+`vcvtps2ph` uses the host F16C instruction).
+
+| run (same 8B instructions, same code otherwise) | wall time | Python-emulated AVX |
+|---|---|---|
+| before | 74.9 min | ~47M executions |
+| after  | 20.6 min | 168 executions (`vcvtpd2ps`, `vcvtps2pd`) |
+
+The run is behaviourally identical: same instruction count, final rip, thread/switch counts and
+GPU totals (22,500 compositor buffers, 37,379 draws, 0 failed). The 1.6B-instruction window that
+contains the spline loop went 589 s -> 95 s (log byte-identical apart from the two AVX counter
+lines). Correctness: bit-for-bit against the host CPU, 13,612 firmware-harvested executions
+(`tools_vexhw`) plus 26,880 synthetic ones covering every vcvtps2ph form (`tools_vexhw_synth`),
+0 mismatches. The "before" time comes from the old log's file timestamps and overlapped
+other jobs for part of the run, so the true speedup may be slightly under 3.6x.
+
 ## Next
 
 Find out where the main thread is at 4-8B instructions (stack dumps at 4B/6B were running
