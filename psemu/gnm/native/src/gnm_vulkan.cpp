@@ -786,23 +786,26 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
             {.binding = bd.binding, .descriptorType = dtype, .descriptorCount = 1,
              .stageFlags = stage_bit});
         const auto view_type = sharp.GetViewType(ir.is_array);
-        if (view_type != AmdGpu::ImageType::Color2D) {
-            Fail(fmt::format("image type {} not supported yet", AmdGpu::NameOf(view_type)));
+        const bool is_1d = view_type == AmdGpu::ImageType::Color1D;
+        if (view_type != AmdGpu::ImageType::Color2D && !is_1d) {
+            const u32* d = reinterpret_cast<const u32*>(&sharp);
+            Fail(fmt::format("image type {} not supported yet [T# {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}]",
+                             AmdGpu::NameOf(view_type), d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]));
         }
         const auto fi = MapFormat(sharp.GetDataFmt(), sharp.GetNumberFmt());
         if (!fi) {
             Fail(fmt::format("texture format {}/{} not mapped yet", u32(sharp.GetDataFmt()),
                              u32(sharp.GetNumberFmt())));
         }
-        const u32 w = u32(sharp.width) + 1, h = u32(sharp.height) + 1;
+        const u32 w = u32(sharp.width) + 1, h = is_1d ? 1u : u32(sharp.height) + 1;
         const u32 pitch = u32(sharp.pitch) + 1;
         auto usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
         if (ir.is_written) {
             usage |= vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc;
         }
-        Image& im = fr.NewImage({.imageType = vk::ImageType::e2D,
+        Image& im = fr.NewImage({.imageType = is_1d ? vk::ImageType::e1D : vk::ImageType::e2D,
                                  .format = fi->fmt,
-                                 .extent = {w, h, 1},
+                                 .extent = {w, is_1d ? 1u : h, 1},
                                  .mipLevels = 1,
                                  .arrayLayers = 1,
                                  .samples = vk::SampleCountFlagBits::e1,
@@ -812,7 +815,7 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
         const auto sw = sharp.DstSelect();
         im.view = fr.dev.createImageView(
             {.image = im.img,
-             .viewType = vk::ImageViewType::e2D,
+             .viewType = is_1d ? vk::ImageViewType::e1D : vk::ImageViewType::e2D,
              .format = fi->fmt,
              .components = ir.is_written
                                ? vk::ComponentMapping{}
