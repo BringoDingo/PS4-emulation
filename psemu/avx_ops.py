@@ -563,6 +563,53 @@ class VexEngine:
         src = _np(self.pad(self.get(insn, ops[1], lanes * 4), lanes * 4), F32)[:lanes]
         self.put(insn, ops[0], src.astype(F64).tobytes())
 
+    def op_vcvtph2ps(self, insn, w):
+        # F16C: vcvtph2ps xmm1, xmm2/m64 (4 halves) | ymm1, xmm2/m128 (8 halves).
+        # half -> float32 is exact.
+        ops = insn.operands
+        lanes = ops[0].size // 4
+        src = _np(self.pad(self.get(insn, ops[1], lanes * 2), lanes * 2), np.float16)[:lanes]
+        self.put(insn, ops[0], src.astype(F32).tobytes())
+
+    @staticmethod
+    def _f32_to_f16(src, imm):
+        """float32 -> float16 with the x86 rounding control: imm[2]=1 uses
+        MXCSR.RC (nearest-even, the default); else imm[1:0] = 0 nearest-even,
+        1 toward -inf, 2 toward +inf, 3 toward zero."""
+        with np.errstate(all="ignore"):
+            near = src.astype(np.float16)                       # nearest-even
+            mode = 0 if imm & 4 else imm & 3
+            if mode == 0:
+                return near
+            back = near.astype(F32)
+            fin = np.isfinite(src)
+            if mode == 1:       # down: result must be <= src
+                fix = fin & (back > src)
+                step = np.float16(-np.inf)
+            elif mode == 2:     # up: result must be >= src
+                fix = fin & (back < src)
+                step = np.float16(np.inf)
+            else:               # toward zero: |result| must be <= |src|
+                fix = fin & (np.abs(back) > np.abs(src))
+                step = np.where(src > 0, np.float16(-np.inf), np.float16(np.inf)).astype(np.float16)
+            out = near.copy()
+            out[fix] = np.nextafter(near[fix], step[fix] if isinstance(step, np.ndarray) else step)
+            # a finite value that rounds up to +-inf in "toward zero"/"down"/"up" must
+            # saturate at the largest finite half instead
+            big = np.float16(65504.0)
+            sat = fin & np.isinf(out) & (
+                ((mode == 1) & (src > 0)) | ((mode == 2) & (src < 0)) | (mode == 3))
+            out[sat] = np.where(src[sat] > 0, big, -big).astype(np.float16)
+            return out
+
+    def op_vcvtps2ph(self, insn, w):
+        # F16C: vcvtps2ph xmm1/m64, xmm2, imm8 (4 floats) | xmm1/m128, ymm2, imm8 (8).
+        ops = insn.operands
+        lanes = 8 if ops[1].size == 32 else 4
+        imm = ops[2].imm
+        src = _np(self.pad(self.get(insn, ops[1], lanes * 4), lanes * 4), F32)[:lanes]
+        self.put(insn, ops[0], self._f32_to_f16(src, imm).tobytes())
+
     def op_vcvtsd2ss(self, insn, w):
         ops = insn.operands
         a = _np(self.pad(self.get(insn, ops[1], 16), 16), F32)

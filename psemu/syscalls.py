@@ -116,11 +116,27 @@ NAMED_SYSCTLS = {
     "hw.ncpu": _struct.pack("<i", 8),
     "machdep.tsc_freq": _struct.pack("<Q", 1_600_000_000),   # Jaguar @ 1.6 GHz
     "kern.sdk_version": _struct.pack("<I", 0x05050001),      # system software 5.05
+    # sceKernelGetCpumode() (libkernel +0x14520) ignores sysctlbyname's return
+    # value and returns its out variable, so an unknown name leaves stack garbage;
+    # libSceSystemService then reports is_cpu_mode_7_cpu_normal = (mode == 5).
+    # The console runs in the normal 7-CPU mode (5), and the shell polls this
+    # every frame.
+    "kern.cpumode": _struct.pack("<i", 5),
+    # The console's own OpenPSID (16 bytes). The ShellUI reads it at launch
+    # (LoginMgrProxy GetOpenPsIdForSystem) and hashes it into a GUID for system
+    # logging; a missing sysctl made PsmNativeException(-1) end AppMain.Main.
+    # A fixed dummy value (not any real console's id).
+    "machdep.openpsid_for_sys": bytes(range(0xA0, 0xB0)),
 }
 
 SYSCALLS.update(DYNLIB_SYSCALLS)
 SYSCALLS.update(SYNC_SYSCALLS)
 SYSCALLS[548] = "batch_map"          # sceKernelBatchMap (else labelled "(sceKernelBatchMap)")
+# libkernel's pthread_{suspend,resume,get,set}_user_context_np: stop another
+# thread and read/write its registers (Mono's stop-the-world uses them)
+SYSCALLS.update({632: "thr_suspend_ucontext", 633: "thr_resume_ucontext",
+                 634: "thr_get_ucontext", 635: "thr_set_ucontext"})
+ESRCH = 3
 
 # Names for every other syscall libkernel makes, from the table decoded out of
 # libkernel.sprx / libkernel_sys.sprx (D:\Ps4Tools\ps4kernel\analysis\syscalls.csv;
@@ -232,14 +248,27 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         return h
 
     def _read_cstr(self, uc, ptr, maxlen=64):
+        """NUL-terminated guest string, at most maxlen bytes. Reads page by page
+        up to the terminator: a fixed maxlen-byte read faults whenever a short
+        string sits within maxlen bytes of the end of its mapping (a 1024-byte
+        read of a path 0x160 bytes below a page boundary killed the whole run),
+        and returning "" on that fault would silently turn it into a wrong path."""
         if not ptr:
             return ""
-        try:
-            raw = bytes(uc.mem_read(ptr, maxlen))
-        except Exception:
-            return ""
-        end = raw.find(b"\x00")
-        return raw[:end if end >= 0 else maxlen].decode("latin1", "replace")
+        out = bytearray()
+        while len(out) < maxlen:
+            a = ptr + len(out)
+            n = min(maxlen - len(out), 0x1000 - (a & 0xFFF))
+            try:
+                chunk = bytes(uc.mem_read(a, n))
+            except Exception:
+                break
+            end = chunk.find(b"\x00")
+            if end >= 0:
+                out += chunk[:end]
+                break
+            out += chunk
+        return out.decode("latin1", "replace")
 
     def _args(self, uc):
         return (
@@ -293,6 +322,26 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         sched = self.emu.sched
         if sched is not None and any(t.state == "ready" for t in sched.threads.values()):
             sched.request_switch()
+
+    # ---- registry (regmgr_call, syscall 532) -----------------------------
+    # libSceRegMgr: sceRegMgrGetInt(key, int *out) = regmgr_call(2, key, &work, out, 4).
+    # The registry itself lives in the (not emulated) kernel; a factory-default
+    # value is returned for each known key and 0 for the rest.
+    REGMGR_INT_DEFAULTS = {
+        0x02020000: 1,      # SYSTEM_language = English (US)
+        0x020b0000: 1,      # SYSTEM_button_assign
+        0x05020000: 2,      # DATE_date_format = MM/DD/YYYY
+    }
+
+    def sys_regmgr_call(self, uc):
+        op, key, _work, out, size = self._args(uc)[:5]
+        if op == 2 and out:                       # get int
+            val = self.REGMGR_INT_DEFAULTS.get(key, 0)
+            try:
+                uc.mem_write(out, _struct.pack("<I", val)[:max(1, min(size or 4, 4))])
+            except Exception:
+                pass
+        self._ret(uc, 0)
 
     # ---- real-ish handlers ---------------------------------------------
     def sys_exit(self, uc):
@@ -526,9 +575,14 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         ("SceSysCoreApp", 0xAA110002): "_ipmi_syscore_app_info",
         ("SceSysCoreApp2", 0xAA120009): "_ipmi_syscore_my_app_id",
         ("SceUserService", 0x3000F): "_ipmi_user_id_list",
+        ("SceUserService", 0x3000C): "_ipmi_user_id_one",      # GetForegroundUser
+        ("SceUserService", 0x30011): "_ipmi_user_id_one",      # GetInitialUser
     }
 
-    USER_ID = 1                 # the one registered/logged-in user
+    # The one registered/logged-in user. Real console user ids are 0x1xxxxxxx
+    # values (the VSH's IsValidUserIdNative accepts only a high nibble of 1, 2
+    # or 3), not small indexes.
+    USER_ID = 0x10000001
     USER_ID_INVALID = 0xFFFFFFFF  # SCE_USER_SERVICE_USER_ID_INVALID (-1)
 
     def _ipmi_user_id_list(self, uc, call):
@@ -545,6 +599,16 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if call["out"]:
             ids = [self.USER_ID] + [self.USER_ID_INVALID] * 19
             self._ipmi_out(uc, call, 0, struct.pack("<20I", *ids))
+        return 0
+
+    def _ipmi_user_id_one(self, uc, call):
+        """SceUserService 0x3000c (GetForegroundUser) / 0x30011 (GetInitialUser):
+        out[0] = u32 user id. With the default empty reply the shell read 0 --
+        an invalid id -- and InputManager.SetDeviceIndexBehavior(SpecificUser, 0)
+        threw ArgumentException, ending AppMain.Main."""
+        import struct
+        if call["out"]:
+            self._ipmi_out(uc, call, 0, struct.pack("<I", self.USER_ID))
         return 0
 
     def _ipmi_syscore_my_app_id(self, uc, call):
@@ -684,6 +748,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
 
             def on_frame(th, result_ptr=result_ptr, p_to=p_to,
                          p_bits=p_bits, pattern=(pattern or 0xff)):
+                # each vblank the GnmCompositor stand-in drains whatever the
+                # client queued in the shared command ring
+                srv = self.unix_servers.get("GnmCompositor")
+                if srv is not None:
+                    srv.ring.service(self.emu.uc)
                 try:
                     if result_ptr:
                         self.emu.uc.mem_write(result_ptr, struct.pack("<I", 0))
@@ -855,6 +924,23 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             # queue is the correct steady state. Verified first for
             # SceUserService getEvent (@+0x1d65 branches on exactly this code).
             result = 0x80020023            # SCE_KERNEL_ERROR no-data / no event
+            # A console delivers a Login event for the user who is already
+            # logged in the first time a client asks (the shell's LoginMgr and
+            # the rest wait for it before they bring the UI up). Hand SceUserService
+            # clients that event once: argstruct in+0x08 = 8-byte event buffer
+            # {u32 type (0 = login, 1 = logout); u32 userId}, in+0x10 = size-out.
+            if nm == "SceUserService" and kid not in self.__dict__.setdefault(
+                    "_user_login_sent", set()):
+                try:
+                    p_buf, p_size = struct.unpack("<QQ", bytes(uc.mem_read(in_ptr + 8, 16)))
+                    if p_buf and p_size:
+                        uc.mem_write(p_buf, struct.pack("<II", 0, self.USER_ID))
+                        uc.mem_write(p_size, struct.pack("<Q", 8))
+                        self._user_login_sent.add(kid)
+                        self.emu.log(f"  [userservice] Login event delivered: user {self.USER_ID}")
+                        result = 0
+                except Exception:
+                    pass
             if result_ptr:
                 try:
                     uc.mem_write(result_ptr, struct.pack("<I", result))
@@ -1088,12 +1174,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             return self.sys_kevent_deliver(uc, kq, evbuf, nev)
         if not nev:
             return self._ret(uc, 0)
-        # Nothing pending but the queue waits for vblank: the display keeps
-        # refreshing, so the next vblank arrives (one per wait).
         dce = self.device_of_kind(DceDevice)
-        if dce is not None and dce.wants_vblank(kq) and not self.kq_pending.get(kq):
-            if dce.vblank():
-                return self.sys_kevent_deliver(uc, kq, evbuf, nev)
         if notes and kq not in self._kq_wait_logged:
             self._kq_wait_logged.add(kq)
             self.emu.log(f"  [kevent] kq {kq} waits; registered: " + ", ".join(
@@ -1108,6 +1189,23 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             except Exception:
                 wait_ns = 0
         sched = self.emu.sched
+        # A queue waiting for vblank: the display refreshes at 60 Hz of VIRTUAL
+        # time, so the wait ends at the next refresh (raising the vblank event
+        # for every queue that registered one) instead of returning at once -
+        # an instant return makes a vblank thread spin at CPU speed.
+        frame_ns = 16_666_667
+        if (sched is not None and dce is not None and dce.wants_vblank(kq)
+                and (wait_ns is None or wait_ns >= frame_ns)):
+            self._ret(uc, 0)
+
+            def on_vblank(th, kq=kq, evbuf=evbuf, nev=nev):
+                dce.vblank()                       # wakes every queue that registered one
+                th.timeout_ret = (self._copy_events(self.emu.uc, kq, evbuf, nev), False)
+
+            sched.block({"kind": "kevent", "kq": kq, "evbuf": evbuf, "nev": nev,
+                         "on_timeout": on_vblank},
+                        deadline_ns=sched.now_ns() + frame_ns, timeout_ret=(0, False))
+            return
         if sched is not None and wait_ns != 0:
             self._ret(uc, 0)          # value if it times out
             sched.block({"kind": "kevent", "kq": kq, "evbuf": evbuf, "nev": nev},
@@ -1459,6 +1557,36 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         f["pos"] = base + off                   # past EOF is allowed (sparse write)
         self._ret(uc, f["pos"])
 
+    # fcntl(fd, cmd, arg). Mono derives a handle's access rights from F_GETFL
+    # (O_ACCMODE); with no handler every fd read back as O_RDONLY and Mono then
+    # refused to write to the console (UnauthorizedAccessException from every
+    # Console.WriteLine / UILog call).
+    F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_SETFL = 0, 1, 2, 3, 4
+    F_DUPFD_CLOEXEC = 67
+    O_RDONLY, O_WRONLY, O_RDWR = 0, 1, 2
+
+    def sys_fcntl(self, uc):
+        fd, cmd, arg = self._args(uc)[:3]
+        fd &= 0xFFFFFFFF
+        cmd &= 0xFFFFFFFF
+        if fd not in self.fds and fd not in (0, 1, 2) and fd not in self.devs \
+                and fd not in self.files:
+            return self._ret(uc, 9, error=True)                      # EBADF
+        if cmd in (self.F_DUPFD, self.F_DUPFD_CLOEXEC):
+            new = self._alloc_fd(self.fds.get(fd, f"dup{fd}"), base=max(3, arg & 0xFFFFFFFF))
+            if fd in self.devs:
+                self.devs[new] = self.devs[fd]
+            if fd in self.files:
+                self.files[new] = self.files[fd]
+            return self._ret(uc, new)
+        if cmd == self.F_GETFL:
+            # stdin is read-only, the console/stdout/stderr write-only; anything
+            # else (files, devices, sockets) is opened read/write here.
+            if fd == 0:
+                return self._ret(uc, self.O_RDONLY)
+            return self._ret(uc, self.O_RDWR)
+        self._ret(uc, 0)               # F_GETFD/SETFD/SETFL/locks: no-ops
+
     def sys_dup(self, uc):
         oldfd = self._args(uc)[0]
         fd = self._alloc_fd(self.fds.get(oldfd, f"dup{oldfd}"))
@@ -1658,6 +1786,90 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 pass
         self.emu.log(f"  [batch_map] {done}/{count} entries")
         self._ret(uc, 0 if done == count else ENOMEM, error=done != count)
+
+    # ---- stopping another thread and reading its registers --------------
+    # thr_suspend_ucontext(tid) / thr_get_ucontext(tid, ucontext_t *) /
+    # thr_resume_ucontext(tid) / thr_set_ucontext(tid, ucontext_t *).
+    # Mono's stop-the-world (libmonosgen +0x218060) does suspend -> get -> check
+    # that the thread's rsp lies in its stack -> keep the context for a
+    # conservative stack scan, and resume + retry if it cannot use the thread.
+    # They used to be bare "success" stubs: nothing was stopped and the context
+    # buffer was never written, so Mono read stale stack, never settled, and the
+    # UI thread spun on suspend/get/resume of one event-loop thread forever.
+    #
+    # FreeBSD amd64 ucontext_t: uc_sigmask at 0, uc_mcontext at 0x10 =
+    # {onstack, rdi, rsi, rdx, rcx, r8, r9, rax, rbx, rbp, r10, r11, r12..r15,
+    #  trapno/fs/gs, addr, flags/es/ds, err, rip, cs, rflags, rsp, ss, len, ...}
+    UCTX_SIZE = 0x370
+    UCTX_REGS = (            # (mcontext offset, unicorn register)
+        (0x08, "RDI"), (0x10, "RSI"), (0x18, "RDX"), (0x20, "RCX"), (0x28, "R8"),
+        (0x30, "R9"), (0x38, "RAX"), (0x40, "RBX"), (0x48, "RBP"), (0x50, "R10"),
+        (0x58, "R11"), (0x60, "R12"), (0x68, "R13"), (0x70, "R14"), (0x78, "R15"),
+        (0xA0, "RIP"), (0xB0, "RFLAGS"), (0xB8, "RSP"))
+
+    def _ucontext_target(self, uc, tid):
+        """The Thread for lwp id `tid`, or None if it does not exist / has exited."""
+        sched = self.emu.sched
+        t = sched.threads.get(tid & 0xFFFFFFFF) if sched is not None else None
+        return t if t is not None and t.state != "exited" else None
+
+    def sys_thr_suspend_ucontext(self, uc):
+        t = self._ucontext_target(uc, self._args(uc)[0])
+        if t is None:
+            return self._ret(uc, ESRCH, error=True)
+        if t is self.emu.sched.current:
+            return self._ret(uc, EINVAL, error=True)   # cannot stop the caller
+        t.suspended = True
+        self._ret(uc, 0)
+
+    def sys_thr_resume_ucontext(self, uc):
+        t = self._ucontext_target(uc, self._args(uc)[0])
+        if t is None:
+            return self._ret(uc, ESRCH, error=True)
+        t.suspended = False
+        self._ret(uc, 0)
+
+    def sys_thr_get_ucontext(self, uc):
+        import unicorn.x86_const as xc
+        tid, out = self._args(uc)[:2]
+        t = self._ucontext_target(uc, tid)
+        if t is None:
+            return self._ret(uc, ESRCH, error=True)
+        # a thread that is not running has its registers in its saved context
+        src = t.ctx if t.ctx is not None else uc
+        buf = bytearray(self.UCTX_SIZE)
+        base = 0x10                                     # uc_mcontext
+        for off, name in self.UCTX_REGS:
+            try:
+                _struct.pack_into("<Q", buf, base + off,
+                                  src.reg_read(getattr(xc, f"UC_X86_REG_{name}")))
+            except Exception:
+                pass
+        _struct.pack_into("<q", buf, base + 0xC8, 0x320)   # mc_len
+        try:
+            uc.mem_write(out, bytes(buf))
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        self._ret(uc, 0)
+
+    def sys_thr_set_ucontext(self, uc):
+        import unicorn.x86_const as xc
+        tid, src_ptr = self._args(uc)[:2]
+        t = self._ucontext_target(uc, tid)
+        if t is None:
+            return self._ret(uc, ESRCH, error=True)
+        try:
+            raw = bytes(uc.mem_read(src_ptr, self.UCTX_SIZE))
+        except Exception:
+            return self._ret(uc, EFAULT, error=True)
+        dst = t.ctx if t.ctx is not None else uc
+        for off, name in self.UCTX_REGS:
+            try:
+                dst.reg_write(getattr(xc, f"UC_X86_REG_{name}"),
+                              _struct.unpack_from("<Q", raw, 0x10 + off)[0])
+            except Exception:
+                pass
+        self._ret(uc, 0)
 
     # ---- virtual memory areas: what virtual_query reports -------------
     # [start, end, prot (incl. GPU bits 0x10/0x20), flags, phys offset, direct]

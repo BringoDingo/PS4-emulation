@@ -75,7 +75,27 @@ def _imp_load_start_module(emu, uc):
     return lm.handle
 
 
+def _imp_getcwd(emu, uc):
+    # __getcwd(buf, size): the syscall form - 0 on success with the path in buf
+    # (the generic stub returned 0 without writing, leaving buf uninitialised).
+    buf, size = emu.hle.args(uc)[:2]
+    cwd = b"/app0\0"
+    if not buf or size < len(cwd):
+        return 0xFFFFFFFFFFFFFFFF
+    uc.mem_write(buf, cwd)
+    return 0
+
+
+def _imp_readlink(emu, uc):
+    # readlink(path, buf, size): nothing in the emulated tree is a symlink ->
+    # -1 (EINVAL), so callers treat the path as already canonical instead of
+    # reading a "0-byte" link target.
+    return 0xFFFFFFFFFFFFFFFF
+
+
 BUILTIN_IMPORTS = {
+    "Qsxbb+aty0U": ("__getcwd", _imp_getcwd),
+    "pd02UI9TbOA": ("readlink", _imp_readlink),
     "QyrxcdBrb0M": ("sceKernelGetEqueueId", _imp_eqid_from_handle),
     "Y1nEpkCieOY": ("sceKernelLoadStartModule", _imp_load_start_module),
 }
@@ -507,7 +527,9 @@ def _load_runtime(self, path):
     Runtime-loaded modules get a TLS index but no static TLS slot; libkernel
     allocates their TLS dynamically from the info get_info_ex reports."""
     emu = self.emu
-    f = self.ld._resolve_lib_file(os.path.basename(path.replace("\\", "/")))
+    f = emu.app0_file(path) if hasattr(emu, "app0_file") else None
+    if f is None:
+        f = self.ld._resolve_lib_file(os.path.basename(path.replace("\\", "/")))
     if f is None:
         cand = os.path.join(self.ld.fw_root, path.lstrip("/").replace("/", os.sep))
         f = cand if os.path.isfile(cand) else None

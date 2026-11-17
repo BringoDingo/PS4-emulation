@@ -66,6 +66,8 @@ class Emulator:
         self.verbose = verbose
         # Firmware root used to resolve execve() paths like "/SceSysAvControl.elf".
         self.fw_root = fw_root or os.path.dirname(os.path.abspath(path))
+        # /app0 = the directory of the launched application (its eboot.bin).
+        self.app_root = os.path.dirname(os.path.abspath(path))
 
         # placeholders the helpers read at construction (set by _build_image)
         self.uc = None
@@ -815,10 +817,25 @@ class Emulator:
         self.uc.emu_stop()
         return True
 
+    def app0_file(self, guest_path):
+        """'/app0/<rest>' -> the file inside the launched application's own
+        directory, if it exists there (else None). Without this a basename
+        search could pick another app's file of the same name (every PSM app
+        has a psm/Application/app.exe.sprx)."""
+        name = guest_path.replace("\\", "/").lstrip("/")
+        if not name.startswith("app0/"):
+            return None
+        cand = os.path.join(getattr(self, "app_root", self.fw_root),
+                            *name[len("app0/"):].split("/"))
+        return cand if os.path.isfile(cand) else None
+
     def resolve_path(self, guest_path):
         """Map a guest path like '/SceSysAvControl.elf' to a real file under
         the firmware root (searching the tree for the basename)."""
         name = guest_path.replace("\\", "/").lstrip("/")
+        cand = self.app0_file(name)
+        if cand:
+            return cand
         cand = os.path.join(self.fw_root, name)
         if os.path.isfile(cand):
             return cand

@@ -57,9 +57,10 @@ class DynlibSyscalls:
 
     # ---------------------------------------------------------------- helpers
     def _cstr(self, uc, addr, maxlen=1024):
-        raw = bytes(uc.mem_read(addr, maxlen))
-        end = raw.find(b"\x00")
-        return raw[:end if end >= 0 else maxlen].decode("latin1", "replace")
+        # page-bounded read (see SyscallDispatcher._read_cstr): a fixed-size
+        # read of a string near the end of its mapping raised UcError and
+        # aborted the run
+        return self._read_cstr(uc, addr, maxlen)
 
     def _module(self, uc, handle):
         dyn = self._dyn()

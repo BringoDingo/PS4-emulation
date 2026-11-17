@@ -382,10 +382,25 @@ class SyncSyscalls:
         ef = next((e for e in self.evfs.values() if e.name == name), None)
         if ef is None:
             h = self._new_handle("evf", name)
-            ef = self.evfs[h] = EventFlag(h, name, EVF_ATTR_MULTI, 0, external=True)
+            seed = self.EXTERNAL_EVF_BITS.get(name, 0)
+            ef = self.evfs[h] = EventFlag(h, name, EVF_ATTR_MULTI, seed, external=True)
             self.emu.log(f"  [evf] open '{name}': owned by another system process "
-                         f"-> stand-in {h:#x}")
+                         f"-> stand-in {h:#x}" + (f" (bits {seed:#x})" if seed else ""))
         self._ret(uc, ef.handle)
+
+    # Steady-state bits of event flags that SceShellCore owns on a console. The
+    # UI process only opens them (polling e.g. the system state until it reads
+    # non-zero), so the stand-in starts out the way the real owner leaves them
+    # after boot. Values measured from SceShellCore.elf run under psemu to its
+    # "State Change: WORKING" (events flags it creates/sets itself).
+    EXTERNAL_EVF_BITS = {
+        "SceSystemStateMgrInfo": 0x0000_0001_0000_03E8,
+        "SceSystemStateMgrStatus": 0x0000_0000_0400_0004,
+        "SceShellCoreUtilPowerControl": 0xFFFF,
+        "SceShellCoreUtilAppFocus": 0xFFFF_FFFF_FFFF_FFFF,
+        "SceShellCoreUtilCtrlFocus": 0xFFFF_FFFF_FFFF_FFFF,
+        "SceShellCoreUtilUIStatus": 0x2_0001,
+    }
 
     def sys_evf_close(self, uc):
         self._ret(uc, 0 if self._evf(self._args(uc)[0]) else ESRCH,

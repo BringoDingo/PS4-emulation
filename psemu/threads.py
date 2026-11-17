@@ -39,9 +39,14 @@ class Thread:
         self.insns = 0
         self.switches_in = 0
         self.spawn_child = False   # created by rfork() for a process spawn
+        # Stopped by another thread (thr_suspend_ucontext, used by Mono's
+        # stop-the-world): it keeps its state (a blocked thread stays blocked and
+        # may even become READY) but the scheduler will not run it until resumed.
+        self.suspended = False
 
     def __repr__(self):
-        return f"<thread {self.tid:#x} {self.name!r} {self.state}>"
+        return (f"<thread {self.tid:#x} {self.name!r} {self.state}"
+                + (" suspended" if self.suspended else "") + ">")
 
 
 class Scheduler:
@@ -186,7 +191,7 @@ class Scheduler:
         start = self.order.index(self.current.tid) if self.current else -1
         for k in range(1, n + 1):
             t = self.threads[self.order[(start + k) % n]]
-            if t.state == READY:
+            if t.state == READY and not t.suspended:
                 return t
         return None
 
@@ -237,26 +242,35 @@ class Scheduler:
         for t in self.threads.values():
             if t.state == BLOCKED and t.deadline is not None and t.deadline <= now:
                 on_timeout = t.wait.get("on_timeout") if isinstance(t.wait, dict) else None
-                ret = t.timeout_ret or (0, False)
                 if on_timeout:
-                    on_timeout(t)
+                    on_timeout(t)             # may set t.timeout_ret (e.g. events delivered)
+                ret = t.timeout_ret or (0, False)
                 self.wake(t, *ret)
 
     def _advance_clock(self):
-        timed = [t for t in self.threads.values() if t.state == BLOCKED and t.deadline is not None]
-        if not timed:
-            return None
-        t = min(timed, key=lambda x: x.deadline)
-        delta = t.deadline - self.now_ns()
-        if delta > 0:
-            self.clock_ns += delta
-        self.expire_timeouts()
-        return self._pick_any_ready()
+        # Skip idle time to the next deadline. A thread that wakes up but is
+        # suspended cannot run, so keep skipping until something runnable wakes
+        # (or nothing is left with a deadline -> real deadlock).
+        for _ in range(64):
+            timed = [t for t in self.threads.values()
+                     if t.state == BLOCKED and t.deadline is not None]
+            if not timed:
+                return None
+            t = min(timed, key=lambda x: x.deadline)
+            delta = t.deadline - self.now_ns()
+            if delta > 0:
+                self.clock_ns += delta
+            self.expire_timeouts()
+            nxt = self._pick_any_ready()
+            if nxt is not None:
+                return nxt
+        return None
 
     def _pick_any_ready(self):
         for tid in self.order:
-            if self.threads[tid].state == READY:
-                return self.threads[tid]
+            t = self.threads[tid]
+            if t.state == READY and not t.suspended:
+                return t
         return None
 
     # ---- reporting -------------------------------------------------------

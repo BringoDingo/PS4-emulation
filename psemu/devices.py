@@ -200,6 +200,9 @@ DCE_STATUS_OFFSET = 0x10000      # mmap token handed out by command 9
 EVFILT_DISPLAY = -13             # VideoOut's kevent filter
 DISPLAY_EV_FLIP = 6              # event type at ident bits 48..63
 DISPLAY_EV_VBLANK = 7
+# The 5.05 VSH libSceVideoOut registers vblank events as ident 0x0063_0101_0000_0000
+# (sceVideoOutGetEventId maps type 0x63 -> VBLANK); homebrew-era libs use type 7.
+DISPLAY_EV_VBLANK_IDS = (DISPLAY_EV_VBLANK, 0x63)
 
 
 class DceDevice(Device):
@@ -221,8 +224,9 @@ class DceDevice(Device):
         self.frame_hook = None       # callable(dce, buffer_index, address) on each flip
 
     def _raise(self, ev_type, data):
+        types = ev_type if isinstance(ev_type, tuple) else (ev_type,)
         idents = [i for kq in self.sc.knotes.values() for (i, f) in kq
-                  if f == EVFILT_DISPLAY and (i >> 48) & 0xFFFF == ev_type]
+                  if f == EVFILT_DISPLAY and (i >> 48) & 0xFFFF in types]
         for ident in set(idents):
             self.sc.trigger(EVFILT_DISPLAY, ident, data)
         return len(idents)
@@ -261,10 +265,10 @@ class DceDevice(Device):
 
     def vblank(self):
         self.vblanks += 1
-        return self._raise(DISPLAY_EV_VBLANK, (self.vblanks << 16) | (1 << 12))
+        return self._raise(DISPLAY_EV_VBLANK_IDS, (self.vblanks << 16) | (1 << 12))
 
     def wants_vblank(self, kq):
-        return any(f == EVFILT_DISPLAY and (i >> 48) & 0xFFFF == DISPLAY_EV_VBLANK
+        return any(f == EVFILT_DISPLAY and (i >> 48) & 0xFFFF in DISPLAY_EV_VBLANK_IDS
                    for (i, f) in self.sc.knotes.get(kq, {}))
 
     def ioctl(self, uc, req, argp):
@@ -508,7 +512,26 @@ class AvControlDevice(Device):
         return self.unknown(uc, req, argp)
 
 
+class RandomDevice(Device):
+    """/dev/urandom, /dev/random: an endless byte source. A read that returns 0
+    (EOF) makes Mono's read-all loops (e.g. the ThreadPool/SecureRandom seed
+    read) spin forever. Seeded, so runs stay deterministic."""
+
+    def __init__(self, sc, path):
+        super().__init__(sc, path)
+        import random
+        self._rng = random.Random(0x505334)
+
+    def read(self, uc, buf, n):
+        n = min(n & 0xFFFFFFFF, 1 << 20)
+        if n:
+            uc.mem_write(buf, self._rng.randbytes(n))
+        return n
+
+
 DEVICES = {
+    "/dev/urandom": RandomDevice,
+    "/dev/random": RandomDevice,
     "/dev/gc": GcDevice,
     "/dev/dce": DceDevice,
     "/dev/dmem0": DmemDevice,

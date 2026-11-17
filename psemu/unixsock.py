@@ -119,6 +119,7 @@ class GnmCompositorServer:
         self.sc = sc
         self.dmem_next = DMEM_BASE
         self.seen = set()
+        self.ring = CompositorRing(self)
         # chunk counts the first client asked for, reused for MapAnotherProcess
         self.n_sys, self.n_vid = 7, 64
 
@@ -182,6 +183,216 @@ class GnmCompositorServer:
         # not modelled: status 0, empty body; the client's fixed-size body read
         # gets zeros
         return struct.pack("<IIII", cmd, 0, 0, 0), True
+
+
+class CompositorRing:
+    """Consumer side of libSceComposite's shared command ring.
+
+    The client (libSceComposite, decoded from its disassembly) queues commands in
+    the "CompositorControl" shared block:
+        ctrl+0x00      u32  server marker: the producer waits while
+                            write_index == marker, so it equals the index of the
+                            LAST entry the server consumed (starts at 0)
+        ctrl+0x50      u64  ring[256]; entry = (operand << 8) | command, index
+                            wraps at 256, the producer starts at slot 1
+        ctrl+0x850     pool of 0x18-byte records the entries point at
+    Commands seen: 2 = run a Gnm command buffer (operand = record offset in the
+    pool; record = {u64 dcb, u64 ptr2, u32 size_bytes, u32 flags}), 0x14 = flip,
+    (event << 8) | 0x15 = post event.
+    The client's write index is not in shared memory; it lives in the client's own
+    globals (libSceComposite +0xc078 +0xec), which a same-address-space stand-in
+    server can read directly instead of needing a doorbell."""
+
+    RING, POOL = 0x50, 0x850
+    CLIENT_GLOBALS, CLIENT_WIDX = 0xC078, 0xEC     # libSceComposite (5.05)
+
+    def __init__(self, server):
+        self.server = server
+        self.read = 1                 # next slot to consume
+        self.count = {}               # command -> times seen
+        self.log_left = 40            # keep the log readable
+        self.failed = False
+        self.frames = 0
+
+    def _locate(self):
+        sc = self.server.sc
+        obj = sc.shm_objs.get("/SceCompositorControl")
+        dyn = sc.emu.dyn
+        lm = dyn.by_name("libSceComposite") if dyn else None
+        if not obj or not obj.get("addr") or lm is None:
+            return None
+        return obj["addr"], lm.base + self.CLIENT_GLOBALS + self.CLIENT_WIDX
+
+    def service(self, uc):
+        """Consume every command the client has queued. Called once per vblank."""
+        if self.failed:
+            return
+        try:
+            loc = self._locate()
+            if loc is None:
+                return
+            ctrl, widx_addr = loc
+            widx = struct.unpack("<I", bytes(uc.mem_read(widx_addr, 4)))[0] & 0xFF
+            while self.read != widx:
+                slot = self.read
+                entry = struct.unpack("<Q", bytes(uc.mem_read(ctrl + self.RING + 8 * slot, 8)))[0]
+                self._execute(uc, ctrl, slot, entry)
+                self.read = (slot + 1) & 0xFF
+                # marker = last consumed index; this is what unblocks the producer
+                uc.mem_write(ctrl, struct.pack("<I", slot))
+        except Exception as e:                       # never take the emulator down
+            self.failed = True
+            self.server.sc.emu.log(f"  [compositor] ring service failed: {e!r}")
+
+    def _execute(self, uc, ctrl, slot, entry):
+        cmd, operand = entry & 0xFF, entry >> 8
+        self.count[cmd] = self.count.get(cmd, 0) + 1
+        log = self.server.sc.emu.log
+        detail = ""
+        if cmd == 2:                                  # run a Gnm command buffer
+            rec = bytes(uc.mem_read(ctrl + self.POOL + operand, 0x18))
+            dcb, ptr2, size, flags = struct.unpack("<QQII", rec)
+            detail = f"GnmContext dcb={dcb:#x} ptr2={ptr2:#x} size={size:#x} flags={flags:#x}"
+            detail += self._run_dcb(uc, dcb, size)
+        elif cmd == 0x14:
+            self.frames += 1
+            detail = f"Flip (frame {self.frames})" + self._present()
+        elif cmd == 0x15:
+            detail = f"PostEvent({operand & 0xF})"
+            self._post_event(uc, operand & 0xF)
+        else:
+            detail = f"cmd {cmd:#x} operand {operand:#x} (not modelled)"
+        if self.log_left > 0:
+            self.log_left -= 1
+            log(f"  [compositor] ring[{slot}] {entry:#018x} -> {detail}")
+
+    # ---- running the client's command buffers on the host GPU -------------
+    WIDTH, HEIGHT = 1920, 1080
+
+    def _gpu_setup(self):
+        """Lazily bring up the GNM backend and a RGBA8 render target the
+        compositor draws into (the DCBs carry no render-target state: the real
+        compositor patches its own scanout buffer in, see the "PatchRenderTarget"
+        markers). Returns False if the GPU is unavailable."""
+        if getattr(self, "gpu_state", None) is not None:
+            return self.gpu_state
+        self.gpu_state = False
+        emu = self.server.sc.emu
+        if not getattr(emu, "gpu_enabled", True):
+            return False
+        try:
+            from .gnm import backend, pm4
+            import numpy as np
+            backend.init()
+            self._backend, self._pm4, self._np = backend, pm4, np
+            self._heap = backend.HostHeap()
+            self._rt = self._heap.alloc(self.WIDTH * self.HEIGHT * 4)
+            self._rt[:] = 0
+            self._rt_addr = backend.HostHeap.addr(self._rt)
+            cb = pm4.CommandBuffer()
+            cb.set_render_target(0, self._rt_addr, self.WIDTH, self.HEIGHT, fmt=10,
+                                 number_type=0, comp_swap=0)
+            self._rt_words = cb.words()
+            self.gpu_state = True
+            self.dcb_ok = self.dcb_bad = 0
+        except Exception as e:
+            emu.log(f"  [compositor] GPU unavailable: {e!r}")
+        return self.gpu_state
+
+    def _patch_dcb(self, words):
+        """Insert the render-target registers after every CLEAR_STATE (it resets
+        them) and at the start of the stream."""
+        np = self._np
+        out, i, n = [self._rt_words], 0, len(words)
+        while i < n:
+            h = int(words[i])
+            if (h >> 30) == 3:
+                cnt = ((h >> 16) & 0x3FFF) + 1
+                out.append(words[i:i + 1 + cnt])
+                if (h >> 8) & 0xFF == self._pm4.IT_CLEAR_STATE:
+                    out.append(self._rt_words)
+                i += 1 + cnt
+            else:
+                out.append(words[i:i + 1])
+                i += 1
+        return np.concatenate(out).astype(np.uint32)
+
+    def _dcb_rt0(self, words):
+        """Last CB_COLOR0 {base, pitch, slice, view, info, attrib} the stream sets."""
+        last = None
+        i, n = 0, len(words)
+        while i < n:
+            h = int(words[i])
+            if (h >> 30) != 3:
+                i += 1
+                continue
+            cnt = ((h >> 16) & 0x3FFF) + 1
+            if (h >> 8) & 0xFF == 0x69 and cnt >= 2:                # SET_CONTEXT_REG
+                reg = int(words[i + 1])
+                vals = words[i + 2:i + 1 + cnt]
+                if reg <= 0x318 < reg + len(vals):
+                    last = [int(x) for x in vals[0x318 - reg:0x318 - reg + 6]]
+            i += 1 + cnt
+        if last is None:
+            return "none"
+        base = last[0] << 8
+        return f"{base:#x}/info={last[4]:#x}" if len(last) >= 5 else f"{base:#x}"
+
+    def _run_dcb(self, uc, dcb, size):
+        """Execute one client command buffer; returns a log suffix."""
+        emu = self.server.sc.emu
+        if not size or not self._gpu_setup():
+            return ""
+        try:
+            if not emu.vm.host_backed(dcb, size):
+                self.dcb_bad += 1
+                return " [GPU: dcb not host-backed]"
+            words = self._np.frombuffer(bytes(uc.mem_read(dcb, size)), dtype=self._np.uint32)
+            stats, err = self._backend.submit(self._patch_dcb(words))
+        except Exception as e:
+            self.dcb_bad += 1
+            return f" [GPU: {e}]"
+        self.dcb_ok += 1
+        # what render target does the buffer itself set (CB_COLOR0_*, ctx reg 0x318..)?
+        rt = self._dcb_rt0(words)
+        fdir = getattr(emu, "frame_dir", None)
+        if fdir:
+            import os
+            os.makedirs(fdir, exist_ok=True)
+            with open(os.path.join(fdir, f"dcb_{self.dcb_ok:04d}_f{self.frames + 1}.bin"), "wb") as fh:
+                fh.write(words.tobytes())
+        s = f" rt0={rt} [GPU: {stats.get('draws', 0)} draw(s), {stats.get('failed', 0)} failed"
+        return s + (f", {err.splitlines()[0][:100]}" if err else "") + "]"
+
+    def _present(self):
+        """Flip: save what the compositor drew (when --frames is given)."""
+        if not getattr(self, "gpu_state", False):
+            return ""
+        fdir = getattr(self.server.sc.emu, "frame_dir", None)
+        np = self._np
+        img = np.frombuffer(bytes(self._rt[:self.WIDTH * self.HEIGHT * 4]),
+                            dtype=np.uint8).reshape(self.HEIGHT, self.WIDTH, 4)
+        lit = int(img[..., :3].any(axis=2).sum())
+        msg = f" [target: {lit} non-black px]"
+        if fdir:
+            import os
+            from PIL import Image
+            os.makedirs(fdir, exist_ok=True)
+            path = os.path.join(fdir, f"compositor_{self.frames:04d}.png")
+            Image.fromarray(img[..., :3].copy()).save(path)
+            msg += f" saved {os.path.basename(path)}"
+        return msg
+
+    def _post_event(self, uc, event):
+        """The server sets the post-event bit when the preceding commands are
+        done; sceCompositorWaitPostEvent waits on SceCompositorEventflag."""
+        sc = self.server.sc
+        if not hasattr(sc, "evfs"):
+            return
+        ef = next((e for e in sc.evfs.values() if e.name == "SceCompositorEventflag"), None)
+        if ef is not None:
+            ef.bits |= 1 << event
+            sc._evf_release(uc, ef)
 
 
 def install_default_servers(sc):
