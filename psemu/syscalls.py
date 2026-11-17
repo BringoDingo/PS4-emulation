@@ -335,12 +335,21 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     # value is returned for each known key and 0 for the rest.
     REGMGR_INT_DEFAULTS = {
         0x02020000: 1,      # SYSTEM_language = English (US)
+        # SYSTEM_initialize: BootManager.IsInitialSetupRequired() is true when this
+        # is 0, i.e. a never-set-up console takes the first-boot flow. A configured
+        # console has it set.
+        0x02040000: 1,
         0x020b0000: 1,      # SYSTEM_button_assign
         0x05020000: 2,      # DATE_date_format = MM/DD/YYYY
     }
 
     def sys_regmgr_call(self, uc):
         op, key, _work, out, size = self._args(uc)[:5]
+        seen = self.__dict__.setdefault("_regmgr_seen", set())
+        if (op, key) not in seen and len(seen) < 400:
+            seen.add((op, key))
+            self.emu.log(f"  [regmgr] op={op} key={key:#010x}"
+                         + (f" -> {self.REGMGR_INT_DEFAULTS.get(key, 0)}" if op == 2 else ""))
         if op == 2 and out:                       # get int
             val = self.REGMGR_INT_DEFAULTS.get(key, 0)
             try:

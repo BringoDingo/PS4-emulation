@@ -224,6 +224,33 @@ class CompositorRing:
             return None
         return obj["addr"], lm.base + self.CLIENT_GLOBALS + self.CLIENT_WIDX
 
+    # Fields the real compositor server publishes in the shared control block for
+    # its clients. libSceComposite+0x2d20 is `int get(u64 *out)` returning the u64
+    # at control+0x10; the ShellUI's frame-timing code reads it once and later
+    # divides by it (an unpublished 0 faults with #DE in `div`). It is the GPU
+    # timestamp frequency; the exact units are not confirmed, a nonzero tick rate
+    # is what the divisions need.
+    CTRL_TIMESTAMP_FREQ = 0x10
+    GPU_TIMESTAMP_FREQ = 100_000_000
+
+    def _publish_server_fields(self, uc, ctrl, widx_addr):
+        if getattr(self, "_published", False):
+            return
+        self._published = True
+        lib = widx_addr - self.CLIENT_WIDX                 # = libSceComposite + 0xC078
+        try:
+            ptr = struct.unpack("<Q", bytes(uc.mem_read(lib, 8)))[0]
+        except Exception:
+            ptr = None
+        emu = self.server.sc.emu
+        emu.log(f"  [compositor] client state ptr={ptr:#x} control block={ctrl:#x}"
+                if ptr is not None else "  [compositor] client state ptr unreadable")
+        if ptr == ctrl:
+            uc.mem_write(ctrl + self.CTRL_TIMESTAMP_FREQ,
+                         struct.pack("<Q", self.GPU_TIMESTAMP_FREQ))
+            emu.log(f"  [compositor] published timestamp frequency "
+                    f"{self.GPU_TIMESTAMP_FREQ} at control+{self.CTRL_TIMESTAMP_FREQ:#x}")
+
     def service(self, uc):
         """Consume every command the client has queued. Called once per vblank."""
         if self.failed:
@@ -233,6 +260,7 @@ class CompositorRing:
             if loc is None:
                 return
             ctrl, widx_addr = loc
+            self._publish_server_fields(uc, ctrl, widx_addr)
             widx = struct.unpack("<I", bytes(uc.mem_read(widx_addr, 4)))[0] & 0xFF
             while self.read != widx:
                 slot = self.read
@@ -425,6 +453,25 @@ class CompositorRing:
             os.makedirs(fdir, exist_ok=True)
             with open(os.path.join(fdir, f"dcb_{self.dcb_ok:04d}_f{self.frames + 1}.bin"), "wb") as fh:
                 fh.write(words.tobytes())
+        # running totals + each distinct backend message once, so a long run reports
+        # what the GPU path could not do (the per-command log below is capped)
+        tot = self.__dict__.setdefault("gpu_totals", {"dcbs": 0, "draws": 0, "failed": 0, "skipped": 0})
+        tot["dcbs"] += 1
+        tot["draws"] += stats.get("draws", 0)
+        tot["failed"] += stats.get("failed", 0)
+        tot["skipped"] += stats.get("skipped_packets", 0)
+        if err:
+            seen = self.__dict__.setdefault("gpu_errs", set())
+            key = err.splitlines()[0][:160]
+            if key not in seen and len(seen) < 25:
+                seen.add(key)
+                emu.log(f"  [compositor] GPU message (dcb {size}B, first seen at dcb #{tot['dcbs']}): {err[:400]!r}")
+        if stats.get("skipped_packets") and not self.__dict__.get("_skip_logged"):
+            self._skip_logged = True
+            emu.log(f"  [compositor] GPU skipped packets: opcode {stats.get('first_skipped_opcode', 0):#x} "
+                    f"(dcb {size}B) stats={stats}")
+        if tot["dcbs"] % 500 == 0:
+            emu.log(f"  [compositor] GPU totals after {tot['dcbs']} command buffers: {tot}")
         s = f" rt0={rt} [GPU: {stats.get('draws', 0)} draw(s), {stats.get('failed', 0)} failed"
         return s + (f", {err.splitlines()[0][:100]}" if err else "") + "]"
 
