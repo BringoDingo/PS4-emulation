@@ -394,3 +394,45 @@ Both live as patches under `psemu/gnm/native/patches/` (applied idempotently by 
 Result: the same `--frames` scenario that aborted in ~5 of 6 runs now completes 4/4
 (exit 0, 49-52 frames), and frames through 1200 render the same home screen. Regression suites
 (synctest 40/0, policytest 34/0, whp_uc_test) unchanged.
+
+## Update 2026-11-18 (late night): compositor speed - 1.6x more frames per second
+
+`tools/ring_split.py` splits the compositor's `ring.service` time (Python side) and prints the native
+per-phase profile (`gnm_profile`, now with sub-phases: `b_*` bind pieces, `flush4shader`,
+`wb_surface/wb_wait/wb_tile`, `fingerprint`, and counters `wb`, `wb_shader`, `wb_MB`, `direct`).
+Findings at the start (55 s run, ~17.5 ms per command buffer, 95 % of `ring.service` inside the native submit):
+
+* The home screen is ~10 draws per command buffer, all into one 1920x1088 (8 MB) guest surface at
+  `0x3020c00000`, which is then sampled by a draw that renders back into the same address.
+* That surface was written back (CPU retile) **twice per frame** (once because a draw samples it,
+  once at end of submit), dropped, and re-detiled + re-uploaded for the next draw: ~15 GB of tiling
+  traffic in 55 s, and the retile ran at ~1 GB/s on one thread.
+
+Changes (all in `psemu/gnm/native/src`):
+
+1. **Tiler** (`gnm_tiling.cpp`): `Tile`/`Detile` run in row bands on up to 8 threads (bands touch
+   disjoint pixels) with a 4-byte fast path. 8 MB: ~7 ms -> ~2 ms. `tests_tiling_rt.py` checks that
+   tile -> detile is the identity for several modes/bpp/sizes.
+2. **Direct sampling of resident render targets** (`gnm_vulkan.cpp`, `TryDirectSample`): when a draw reads
+   a plain 2D texture that is exactly a colour surface an earlier draw of this submit rendered
+   (same address, pitch, format, tile mode, T# no larger than the surface) the shader samples the GPU
+   image instead of the surface being written back and reloaded. If the T# is smaller than the
+   surface (here 1920x1080 vs 1920x1088) or the draw also renders into that surface (feedback pass),
+   the region is first copied on the GPU into an image of the declared size (a snapshot, as the old
+   write-back/upload path gave; normalised UVs depend on the image extent). The draw is rejected from
+   this path (old behaviour) if any target/depth range overlaps the surface without being exactly
+   that surface, since acquiring such a target would free the image being sampled.
+   `PSEMU_GNM_NO_DIRECT=1` turns it off for A/B runs; `PSEMU_GNM_WBLOG=1` logs write-backs and
+   rejected/missed direct matches.
+
+Result (same 55 s WHP run of the home screen): mean native submit 17.5 -> 6.1 ms, command buffers
+completed 2091 -> 4914, render-target cache misses 970 -> 2, forced shader write-backs 968 -> 0,
+flips in 70 s 1224 -> 1908. Frame content: two runs in the same mode differ from each other about as
+much as direct vs non-direct (animation phase depends on timing), and the second non-direct run was
+within noise of the direct one; synctest/policytest/whp_uc_test/tiling round trip pass; 3 `--frames`
+runs and a SceSysCore -> ShellUI chain run (4500 command buffers, 0 failed draws) are clean.
+
+What is left in the GPU path (per 55 s): end-of-submit write-back of that surface ~9 s
+(GPU copy wait + retile + fingerprint), GPU execution ~7 s, shader translation ~4.5 s (10k misses: the
+exact cache keys on descriptor contents that change per draw), render-target setup ~3 s. Deferring the
+write-back needs a way to see CPU reads of the surface (WHP page protection); not done.

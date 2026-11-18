@@ -9,6 +9,8 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <algorithm>
+#include <thread>
 #include <tuple>
 
 #include <fmt/format.h>
@@ -299,34 +301,72 @@ std::shared_ptr<const Tiler> Tiler::Get(AmdGpu::TileMode mode, u32 bytes_per_pix
     return t;
 }
 
+namespace {
+// Runs fn(y0, y1) over [0, h) split into bands on several threads when the surface is big
+// enough to pay for it (tiling is per-pixel table lookups; bands touch disjoint pixels).
+template <class F>
+void ParallelRows(u32 w, u32 h, F&& fn) {
+    const size_t pixels = size_t(w) * h;
+    static const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned n = (pixels < (1u << 18) || hw < 2) ? 1u : std::min({hw, 8u, h});
+    if (n == 1) {
+        fn(0u, h);
+        return;
+    }
+    std::vector<std::thread> pool;
+    pool.reserve(n - 1);
+    for (unsigned i = 1; i < n; ++i) {
+        pool.emplace_back([&fn, i, n, h] { fn(u32(u64(h) * i / n), u32(u64(h) * (i + 1) / n)); });
+    }
+    fn(0u, u32(u64(h) / n));
+    for (auto& t : pool) {
+        t.join();
+    }
+}
+} // namespace
+
 void Tiler::Detile(const u8* tiled, u8* linear, u32 w, u32 h, u32 row_pixels) const {
     w = std::min(w, pitch);
     h = std::min(h, height);
-    for (u32 y = 0; y < h; ++y) {
-        const u32* off = &offsets[size_t(y) * pitch];
-        u8* dst = linear + size_t(y) * row_pixels * bpp;
-        if (bpp == 4) {
-            for (u32 x = 0; x < w; ++x) {
-                std::memcpy(dst + x * 4, tiled + off[x], 4);
-            }
-        } else {
-            for (u32 x = 0; x < w; ++x) {
-                std::memcpy(dst + size_t(x) * bpp, tiled + off[x], bpp);
+    ParallelRows(w, h, [&](u32 y0, u32 y1) {
+        for (u32 y = y0; y < y1; ++y) {
+            const u32* off = &offsets[size_t(y) * pitch];
+            u8* dst = linear + size_t(y) * row_pixels * bpp;
+            if (bpp == 4) {
+                for (u32 x = 0; x < w; ++x) {
+                    u32 v;
+                    std::memcpy(&v, tiled + off[x], 4);
+                    std::memcpy(dst + size_t(x) * 4, &v, 4);
+                }
+            } else {
+                for (u32 x = 0; x < w; ++x) {
+                    std::memcpy(dst + size_t(x) * bpp, tiled + off[x], bpp);
+                }
             }
         }
-    }
+    });
 }
 
 void Tiler::Tile(const u8* linear, u8* tiled, u32 w, u32 h, u32 row_pixels) const {
     w = std::min(w, pitch);
     h = std::min(h, height);
-    for (u32 y = 0; y < h; ++y) {
-        const u32* off = &offsets[size_t(y) * pitch];
-        const u8* src = linear + size_t(y) * row_pixels * bpp;
-        for (u32 x = 0; x < w; ++x) {
-            std::memcpy(tiled + off[x], src + size_t(x) * bpp, bpp);
+    ParallelRows(w, h, [&](u32 y0, u32 y1) {
+        for (u32 y = y0; y < y1; ++y) {
+            const u32* off = &offsets[size_t(y) * pitch];
+            const u8* src = linear + size_t(y) * row_pixels * bpp;
+            if (bpp == 4) {
+                for (u32 x = 0; x < w; ++x) {
+                    u32 v;
+                    std::memcpy(&v, src + size_t(x) * 4, 4);
+                    std::memcpy(tiled + off[x], &v, 4);
+                }
+            } else {
+                for (u32 x = 0; x < w; ++x) {
+                    std::memcpy(tiled + off[x], src + size_t(x) * bpp, bpp);
+                }
+            }
         }
-    }
+    });
 }
 
 } // namespace psemu

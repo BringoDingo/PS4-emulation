@@ -697,6 +697,13 @@ struct BufferWriteBack {
     size_t size;
 };
 
+// GPU-side crop of a resident render target into an image the size the shader's T# declares
+// (normalised sampling coordinates depend on the image extent).
+struct DirectCopy {
+    vk::Image src, dst;
+    u32 w, h;
+};
+
 struct Bound {
     std::vector<vk::DescriptorSetLayoutBinding> layout;
     std::vector<vk::WriteDescriptorSet> writes;
@@ -705,6 +712,8 @@ struct Bound {
     std::vector<PendingUpload> uploads;
     std::vector<ImageWriteBack> image_writebacks;
     std::vector<BufferWriteBack> buffer_writebacks;
+    std::vector<vk::Image> direct;   // resident render targets sampled directly (no write-back)
+    std::vector<DirectCopy> dcopies; // ...or cropped on the GPU first when the T# is smaller
     u32 binding = 0;
 };
 
@@ -755,6 +764,34 @@ std::vector<std::unique_ptr<TexEntry>> g_tex_retired;   // freed when the GPU is
 constexpr size_t kTexCacheMax = 96;
 u64 g_tex_clock = 0, g_tex_hits = 0, g_tex_misses = 0;
 
+// Direct sampling of resident render targets (defined after Surface). A draw that reads, as a
+// plain 2D texture, exactly the colour surface an earlier draw of this submit rendered to samples
+// that GPU image in place instead of writing it back (retile), dropping it and re-uploading the
+// guest copy. The job being recorded (null for compute) tells which surfaces it renders to.
+const GraphicsJob* g_cur_job = nullptr;
+bool DirectSampleSurfaceExists(u64 addr, u32 w, u32 h, u32 pitch, vk::Format fmt, u32 mode);
+bool TryDirectSample(Frame& fr, Bound& bd, u64 addr, u32 w, u32 h, u32 pitch, vk::Format fmt,
+                     u32 mode, const std::array<vk::ComponentSwizzle, 4>& swz,
+                     vk::ImageView& out_view);
+u64 g_direct_samples = 0;
+
+// Sub-phase wall time inside BindStage (ms), reported by gnm_profile() as b_*.
+enum SubPhase { kSubBuf, kSubHash, kSubTexImg, kSubDetile, kSubSampler, kSubFlushShader,
+                kSubWriteBack, kSubFinger, kSubVtx, kSubWbWait, kSubWbTile, kNumSub };
+constexpr const char* kSubNames[kNumSub] = {"b_buf", "b_hash", "b_teximg", "b_detile", "b_sampler",
+                                      "flush4shader", "wb_surface", "fingerprint", "vtxfetch",
+                                      "wb_wait", "wb_tile"};
+double g_sub_ms[kNumSub]{};
+struct SubTimer {
+    SubPhase p;
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    explicit SubTimer(SubPhase ph) : p(ph) {}
+    ~SubTimer() {
+        g_sub_ms[p] += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t).count();
+    }
+};
+
 void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
     const auto& info = *ts.info;
     const auto stage_bit = StageBit(info.stage);
@@ -773,6 +810,7 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
             break;
         }
         case Shader::BufferType::Guest: {
+            SubTimer st_buf{kSubBuf};
             const auto sharp = br.GetSharp(info);
             const size_t n = sharp.GetSize();
             b = &fr.NewBuffer(n, vk::BufferUsageFlagBits::eStorageBuffer);
@@ -847,8 +885,26 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
             const auto tsw = sharp.DstSelect();
             const std::array<vk::ComponentSwizzle, 4> swz{MapSwizzle(tsw.r), MapSwizzle(tsw.g),
                                                           MapSwizzle(tsw.b), MapSwizzle(tsw.a)};
+            vk::ImageView direct_view{};
+            if (taddr && !is_1d &&
+                TryDirectSample(fr, bd, taddr, w, h, pitch, fi->fmt, u32(tmode), swz, direct_view)) {
+                auto ii = std::make_unique<vk::DescriptorImageInfo>(vk::DescriptorImageInfo{
+                    .imageView = direct_view,
+                    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal});
+                bd.writes.push_back({.dstBinding = bd.binding,
+                                     .descriptorCount = 1,
+                                     .descriptorType = dtype,
+                                     .pImageInfo = ii.get()});
+                bd.iinfos.push_back(std::move(ii));
+                ++bd.binding;
+                continue;
+            }
             if (taddr) {
-                const u64 th = Xxh64(reinterpret_cast<const u8*>(uintptr_t(taddr)), foot);
+                u64 th;
+                {
+                    SubTimer st_h{kSubHash};
+                    th = Xxh64(reinterpret_cast<const u8*>(uintptr_t(taddr)), foot);
+                }
                 for (size_t ci = 0; ci < g_tex_cache.size(); ++ci) {
                     auto& e = *g_tex_cache[ci];
                     if (e.addr == taddr && e.fmt == fi->fmt && e.w == w && e.h == h &&
@@ -885,6 +941,7 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
                         .tiling = vk::ImageTiling::eOptimal,
                         .usage = usage,
                         .initialLayout = vk::ImageLayout::eUndefined};
+                    SubTimer st_ti{kSubTexImg};
                     ne->img.img = fr.dev.createImage(tci);
                     const auto req = fr.dev.getImageMemoryRequirements(ne->img.img);
                     ne->img.mem = fr.dev.allocateMemory(
@@ -964,6 +1021,7 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
         // formats tile whole 4x4 blocks, so they use block units here).
         const auto mode = AmdGpu::TileMode(u32(sharp.tiling_index));
         std::shared_ptr<const Tiler> tiler;
+        SubTimer st_dt{kSubDetile};
         if (!IsLinear(mode)) {
             std::string why;
             tiler = Tiler::Get(mode, fi->bytes, row_elems, rows, &why);
@@ -1026,6 +1084,7 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
         if (unnorm) {
             ci.minFilter = ci.magFilter;
         }
+        SubTimer st_sm{kSubSampler};
         const auto smp = fr.dev.createSampler(ci);
         fr.samplers.push_back(smp);
         auto ii =
@@ -1322,6 +1381,9 @@ struct Surface {
 
 std::vector<std::unique_ptr<Surface>> g_surfaces;
 u32 g_surface_writebacks = 0;
+u64 g_wb_bytes = 0;
+u32 g_wb_shader = 0;          // write-backs forced because a draw reads the surface through memory
+bool g_in_flush_shader = false;
 // Written-back colour surfaces kept between submits (most recent first). Each is reused only when
 // its guest bytes still hash to `fingerprint`; otherwise it is refilled from guest memory.
 std::vector<std::unique_ptr<Surface>> g_surface_cache;
@@ -1342,10 +1404,126 @@ u64 GuestFingerprint(const Surface& s) {
     return Xxh64(reinterpret_cast<const u8*>(uintptr_t(s.address)), s.footprint);
 }
 
+Surface* FindDirectSurface(u64 addr, u32 w, u32 h, u32 pitch, vk::Format fmt, u32 mode,
+                           bool* feedback = nullptr) {
+    static const bool off = std::getenv("PSEMU_GNM_NO_DIRECT") != nullptr;
+    if (off || !g_cur_job || !addr) {
+        return nullptr;
+    }
+    Surface* found = nullptr;
+    for (auto& g : g_surfaces) {
+        if (g->address == addr && g->width >= w && g->height >= h && g->row == pitch &&
+            g->fi.fmt == fmt && u32(g->mode) == mode && g->img.img) {
+            found = g.get();
+        }
+    }
+    if (!found) {
+        static const bool dbg = std::getenv("PSEMU_GNM_WBLOG") != nullptr;
+        if (dbg) {
+            for (auto& g : g_surfaces) {
+                if (g->address == addr) {
+                    std::fprintf(stderr, "DIRECT miss: tex %ux%u pitch=%u fmt=%d mode=%u | surf %ux%u row=%u fmt=%d mode=%u\n",
+                                 w, h, pitch, int(fmt), mode, g->width, g->height, g->row,
+                                 int(g->fi.fmt), unsigned(g->mode));
+                }
+            }
+        }
+        return nullptr;
+    }
+    // The job must not also write this memory: acquiring its targets writes back and drops any
+    // resident surface aliasing them, which would free the image this draw samples.
+    const u64 lo = found->address, hi = found->address + found->footprint;
+    if (feedback) *feedback = false;
+    for (const auto& t : g_cur_job->targets) {
+        if (!t.address) continue;
+        if (t.address == lo) {
+            // The draw renders into this very surface while sampling it (read-modify-write pass).
+            // An exact match reuses the resident image, so nothing is dropped; the shader then
+            // needs a snapshot of the pre-draw contents, not the image it is writing.
+            const auto tfi = MapFormat(t.dfmt, t.nfmt);
+            if (tfi && !tfi->block && tfi->fmt == found->fi.fmt && t.width == found->width &&
+                t.height == found->height && std::max(t.pitch, t.width) == found->row &&
+                t.tile_mode == found->mode) {
+                if (feedback) *feedback = true;
+                continue;
+            }
+        }
+        const u64 tb = u64((std::max(t.pitch, t.width) + 255u) & ~255u) *
+                       ((t.height + 127u) & ~127u) * 16;   // generous upper bound of the footprint
+        if (t.address < hi && lo < t.address + tb) {
+            if (std::getenv("PSEMU_GNM_WBLOG")) {
+                std::fprintf(stderr, "DIRECT reject: target %llx %ux%u pitch=%u overlaps surface %llx\n",
+                             (unsigned long long)t.address, t.width, t.height, t.pitch,
+                             (unsigned long long)lo);
+            }
+            return nullptr;
+        }
+    }
+    if (g_cur_job->depth) {
+        const auto& d = *g_cur_job->depth;
+        const u64 db = u64((d.width + 255u) & ~255u) * ((d.height + 127u) & ~127u) * 4;
+        if ((d.z_address && d.z_address < hi && lo < d.z_address + db) ||
+            (d.stencil_address && d.stencil_address < hi && lo < d.stencil_address + db)) {
+            return nullptr;
+        }
+    }
+    return found;
+}
+
+bool DirectSampleSurfaceExists(u64 addr, u32 w, u32 h, u32 pitch, vk::Format fmt, u32 mode) {
+    return FindDirectSurface(addr, w, h, pitch, fmt, mode) != nullptr;
+}
+
+bool TryDirectSample(Frame& fr, Bound& bd, u64 addr, u32 w, u32 h, u32 pitch, vk::Format fmt,
+                     u32 mode, const std::array<vk::ComponentSwizzle, 4>& swz,
+                     vk::ImageView& out_view) {
+    bool feedback = false;
+    Surface* s = FindDirectSurface(addr, w, h, pitch, fmt, mode, &feedback);
+    if (!s) {
+        return false;
+    }
+    if (s->width == w && s->height == h && !feedback) {
+        fr.images.emplace_back();   // view-only entry: ~Frame destroys the view (image/mem null)
+        Image& v = fr.images.back();
+        v.view = fr.dev.createImageView(
+            {.image = s->img.img,
+             .viewType = vk::ImageViewType::e2D,
+             .format = fmt,
+             .components = vk::ComponentMapping{swz[0], swz[1], swz[2], swz[3]},
+             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}});
+        out_view = v.view;
+        if (std::find(bd.direct.begin(), bd.direct.end(), s->img.img) == bd.direct.end()) {
+            bd.direct.push_back(s->img.img);
+        }
+    } else {
+        Image& im = fr.NewImage({.imageType = vk::ImageType::e2D,
+                                 .format = fmt,
+                                 .extent = {w, h, 1},
+                                 .mipLevels = 1,
+                                 .arrayLayers = 1,
+                                 .samples = vk::SampleCountFlagBits::e1,
+                                 .tiling = vk::ImageTiling::eOptimal,
+                                 .usage = vk::ImageUsageFlagBits::eSampled |
+                                          vk::ImageUsageFlagBits::eTransferDst,
+                                 .initialLayout = vk::ImageLayout::eUndefined});
+        im.view = fr.dev.createImageView(
+            {.image = im.img,
+             .viewType = vk::ImageViewType::e2D,
+             .format = fmt,
+             .components = vk::ComponentMapping{swz[0], swz[1], swz[2], swz[3]},
+             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}});
+        out_view = im.view;
+        bd.dcopies.push_back({s->img.img, im.img, w, h});
+    }
+    ++g_direct_samples;
+    return true;
+}
+
 void WriteBack(Surface& s) {
     if (!s.dirty) {
         return;
     }
+    SubTimer st_wb{kSubWriteBack};
     // Pending batched draws may have rendered into this surface's image; make
     // sure they have executed before we read it back.
     FlushBatch();
@@ -1363,7 +1541,11 @@ void WriteBack(Surface& s) {
             A2::eColorAttachmentRead | A2::eColorAttachmentWrite);
     RecordHostBarrier(c);
     c.end();
-    SubmitAndWait(fr);
+    {
+        SubTimer st_w{kSubWbWait};
+        SubmitAndWait(fr);
+    }
+    SubTimer st_t{kSubWbTile};
     auto* dst = reinterpret_cast<u8*>(uintptr_t(s.address));
     if (s.tiler) {
         s.tiler->Tile(static_cast<const u8*>(st.map), dst, s.width, s.height, s.row);
@@ -1372,6 +1554,14 @@ void WriteBack(Surface& s) {
     }
     s.dirty = false;
     ++g_surface_writebacks;
+    g_wb_bytes += bytes;
+    if (g_in_flush_shader) ++g_wb_shader;
+    static const bool wb_log = std::getenv("PSEMU_GNM_WBLOG") != nullptr;
+    if (wb_log) {
+        std::fprintf(stderr, "WB addr=%llx %ux%u row=%u bpe=%u mode=%u via=%s host_only=%d\n",
+                     (unsigned long long)s.address, s.width, s.height, s.row, s.fi.bytes,
+                     unsigned(s.mode), g_in_flush_shader ? "shader" : "other", int(HostOnly(s)));
+    }
 }
 
 // A resident depth/stencil target: one Vulkan image with the guest's Z and
@@ -1599,6 +1789,11 @@ void FlushForShader(const TranslatedShader& ts) {
         // fall back to a generous 16 bytes per texel
         const auto fi = MapFormat(sharp.GetDataFmt(), sharp.GetNumberFmt());
         const u32 pitch = u32(sharp.pitch) + 1, height = u32(sharp.height) + 1;
+        if (fi && !ir.is_written && sharp.GetViewType(ir.is_array) == AmdGpu::ImageType::Color2D &&
+            DirectSampleSurfaceExists(a, u32(sharp.width) + 1, height, pitch, fi->fmt,
+                                      u32(sharp.tiling_index))) {
+            continue;   // sampled in place from the resident GPU image: nothing to write back
+        }
         const u32 rows = fi && fi->block ? (height + 3) / 4 : height;
         const u32 elems = fi && fi->block ? (pitch + 3) / 4 : pitch;
         const u32 bpe = fi ? fi->bytes : 16;
@@ -1636,10 +1831,19 @@ void ExecuteGraphics(const GraphicsJob& job) {
     const auto ps = has_ps ? TranslateCached(job.ps, D.profile, bnd, &job.ps_extras) : nullptr;
     const auto vs = TranslateCached(job.vs, D.profile, bnd, &job.vs_extras);
     pt.Lap(kTranslate);
-    if (ps) {
-        FlushForShader(*ps); // resident targets the shaders read as textures/buffers
+    struct JobScope {
+        explicit JobScope(const GraphicsJob* j) { g_cur_job = j; }
+        ~JobScope() { g_cur_job = nullptr; g_in_flush_shader = false; }
+    } job_scope{&job};
+    {
+        SubTimer st_f{kSubFlushShader};
+        g_in_flush_shader = true;
+        if (ps) {
+            FlushForShader(*ps); // resident targets the shaders read as textures/buffers
+        }
+        FlushForShader(*vs);
+        g_in_flush_shader = false;
     }
-    FlushForShader(*vs);
     // This draw's resources live in their own heap Frame, retained in the batch
     // until its fence signals (BeginBatch/FlushBatch), so they outlive recording.
     auto frp = std::make_unique<Frame>(Frame{.dev = D.dev});
@@ -1792,6 +1996,7 @@ void ExecuteGraphics(const GraphicsJob& job) {
                     .samples = vk::SampleCountFlagBits::e1,
                     .tiling = vk::ImageTiling::eOptimal,
                     .usage = vk::ImageUsageFlagBits::eColorAttachment |
+                             vk::ImageUsageFlagBits::eSampled |
                              vk::ImageUsageFlagBits::eTransferSrc |
                              vk::ImageUsageFlagBits::eTransferDst,
                     .initialLayout = vk::ImageLayout::eUndefined};
@@ -2138,6 +2343,32 @@ void ExecuteGraphics(const GraphicsJob& job) {
     // ---- record (into the shared per-submit batch command buffer)
     auto c = BeginBatch();
     RecordUploads(c, bd);
+    for (const auto& dc : bd.dcopies) {
+        Barrier(c, dc.src, L::eColorAttachmentOptimal, L::eTransferSrcOptimal,
+                S2::eColorAttachmentOutput, A2::eColorAttachmentWrite, S2::eCopy,
+                A2::eTransferRead);
+        Barrier(c, dc.dst, L::eUndefined, L::eTransferDstOptimal, S2::eTopOfPipe, {}, S2::eCopy,
+                A2::eTransferWrite);
+        const vk::ImageCopy region{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .srcOffset = {0, 0, 0},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstOffset = {0, 0, 0},
+            .extent = {dc.w, dc.h, 1}};
+        c.copyImage(dc.src, L::eTransferSrcOptimal, dc.dst, L::eTransferDstOptimal, region);
+        Barrier(c, dc.dst, L::eTransferDstOptimal, L::eShaderReadOnlyOptimal, S2::eCopy,
+                A2::eTransferWrite, S2::eVertexShader | S2::eFragmentShader,
+                A2::eShaderSampledRead);
+        Barrier(c, dc.src, L::eTransferSrcOptimal, L::eColorAttachmentOptimal, S2::eCopy,
+                A2::eTransferRead, S2::eColorAttachmentOutput,
+                A2::eColorAttachmentRead | A2::eColorAttachmentWrite);
+    }
+    for (const auto img : bd.direct) {
+        // resident render targets this draw samples: attachment -> shader-read for the draw
+        Barrier(c, img, L::eColorAttachmentOptimal, L::eShaderReadOnlyOptimal,
+                S2::eColorAttachmentOutput, A2::eColorAttachmentWrite,
+                S2::eVertexShader | S2::eFragmentShader, A2::eShaderSampledRead);
+    }
     std::vector<vk::RenderingAttachmentInfo> atts(num_slots);
     for (const auto& r : res) {
         const auto& t = *r.t;
@@ -2239,6 +2470,12 @@ void ExecuteGraphics(const GraphicsJob& job) {
         c.draw(job.vertex_count, instances, first_vertex, first_instance);
     }
     c.endRendering();
+    for (const auto img : bd.direct) {
+        // ...and back: resident surfaces rest in the attachment layout between draws
+        Barrier(c, img, L::eShaderReadOnlyOptimal, L::eColorAttachmentOptimal,
+                S2::eVertexShader | S2::eFragmentShader, {}, S2::eColorAttachmentOutput,
+                A2::eColorAttachmentRead | A2::eColorAttachmentWrite);
+    }
     for (const auto& r : res) {
         if (r.surf) {
             continue; // stays resident; written back by WriteBack()
@@ -2318,6 +2555,7 @@ void ReleaseSurfaces() {
     // keep the colour surfaces for later submits (written-back ones are identical to memory)
     for (auto& s : g_surfaces) {
         if (!s->gpu_newer) {
+            SubTimer st_fp{kSubFinger};
             s->fingerprint = GuestFingerprint(*s);
         }
         g_surface_cache.insert(g_surface_cache.begin(), std::move(s));
@@ -2459,15 +2697,20 @@ extern "C" GNM_API int gnm_profile(char* out, int outlen, int reset) {
     std::string s = fmt::format("draws={} flushes={} rt_cache hit={} refill={} miss={} "
                                 "tex_uploads={} tex_MB={:.0f} release={:.0f}ms "
                                 "lazy_skipped={} lazy_flushed={} xlat_hit={} xlat_miss={} "
-                                "tex_hit={} tex_miss={}",
+                                "tex_hit={} tex_miss={} wb={} wb_shader={} wb_MB={:.0f} direct={}",
                                 psemu::g_prof_draws, psemu::g_flush_count,
                                 psemu::g_surface_cache_hits, psemu::g_surface_cache_refills,
                                 psemu::g_surface_cache_misses, psemu::g_tex_uploads,
                                 psemu::g_tex_bytes / 1048576.0, psemu::g_release_ms,
                                 psemu::g_lazy_skipped, psemu::g_lazy_flushed, xh, xm,
-                                psemu::g_tex_hits, psemu::g_tex_misses);
+                                psemu::g_tex_hits, psemu::g_tex_misses, psemu::g_surface_writebacks,
+                                psemu::g_wb_shader, psemu::g_wb_bytes / 1048576.0,
+                                psemu::g_direct_samples);
     for (int i = 0; i < psemu::kNumPhases; ++i) {
         s += fmt::format(" {}={:.0f}ms", psemu::kPhaseNames[i], psemu::g_prof_ms[i]);
+    }
+    for (int i = 0; i < psemu::kNumSub; ++i) {
+        s += fmt::format(" {}={:.0f}ms", psemu::kSubNames[i], psemu::g_sub_ms[i]);
     }
     if (out && outlen > 0) {
         std::snprintf(out, size_t(outlen), "%s", s.c_str());
