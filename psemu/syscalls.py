@@ -788,7 +788,10 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 # client queued in the shared command ring
                 srv = self.unix_servers.get("GnmCompositor")
                 if srv is not None:
+                    _t = self.emu._time() if self.emu.whp else 0.0
                     srv.ring.service(self.emu.uc)
+                    if self.emu.whp:
+                        self.emu._excl += self.emu._time() - _t     # GPU time is not guest time
                 try:
                     if result_ptr:
                         self.emu.uc.mem_write(result_ptr, struct.pack("<I", 0))

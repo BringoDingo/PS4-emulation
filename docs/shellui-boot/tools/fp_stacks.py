@@ -52,7 +52,15 @@ for t in emu.sched.threads.values():
         continue
     regs = (list(uc.context_save().r) if t is emu.sched.current else t.ctx.r)
     rip, rbp, rsp = regs[16], regs[5], regs[4]
-    print(f"== tid {t.tid:#x} {t.state} {t.wait if not callable(t.wait) else ''}")
+    w = t.wait if isinstance(t.wait, dict) else {}
+    desc = {k: (hex(v) if isinstance(v, int) else v) for k, v in w.items() if not callable(v)}
+    owner = ""
+    if str(w.get("kind", "")).startswith("mutex") and w.get("addr"):
+        try:   # umtx mutex word: owner tid | 0x80000000 (contested)
+            owner = f"  owner tid {struct.unpack('<I', bytes(uc.mem_read(w['addr'], 4)))[0] & 0x7fffffff:#x}"
+        except Exception:
+            pass
+    print(f"== tid {t.tid:#x} {t.state}{' SUSPENDED' if t.suspended else ''} {desc}{owner}")
     print(f"   rip  {name(rip)}")
     seen = 0
     while rbp and seen < 40:

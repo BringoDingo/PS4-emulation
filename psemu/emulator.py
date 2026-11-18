@@ -66,6 +66,9 @@ class Emulator:
         # virtual time, see whp_uc.py). PSEMU_BACKEND=whp selects it from the environment.
         self.whp = (backend or os.environ.get("PSEMU_BACKEND") or "unicorn").lower() == "whp"
         self._t0 = time.perf_counter()
+        # whp: wall seconds spent on the (parallel, on real hardware) GPU / compositor; excluded
+        # from virtual time so the guest's 60 Hz world is not starved by our software renderer
+        self._excl = 0.0
         self._time = time.perf_counter
         self.max_seconds = None        # whp: wall-clock budget (an instruction budget is meaningless)
         # --then: once the first process (SceSysCore) has brought its services up, chain-load this
@@ -212,7 +215,7 @@ class Emulator:
         """The module uses AVX (vxorps/vmovups ymm...). Unicorn's default CPU
         model rejects those, so select an AVX2-capable model and turn on the
         SSE/AVX enable bits so instructions don't #UD at runtime."""
-        if self.whp:
+        if getattr(self, "whp", False):
             return          # the vCPU is built with SSE/AVX on (whp_uc.CR4_VAL / XCR0_VAL)
         try:
             self.uc.ctl_set_cpu_model(UC_CPU_X86_HASWELL)
@@ -463,7 +466,7 @@ class Emulator:
         if self.whp:
             # no instruction counter on hardware: virtual time follows the wall clock, expressed
             # in "instructions" at the scheduler's NS_PER_INSN so now_ns() stays one formula
-            return int((self._time() - self._t0) * 1e9)
+            return int((self._time() - self._t0 - self._excl) * 1e9)
         n = self.native
         return n.s.count if n is not None else self._insn_py
 
@@ -985,7 +988,8 @@ class Emulator:
             self.log(self.native.vex_summary())
         self.log(self.hle.summary())
         if self.whp:
-            self.log(f"WHP: {self._time() - self._t0:.1f} s wall, {self.uc.n_syscalls} syscalls, "
+            self.log(f"WHP: {self._time() - self._t0:.1f} s wall ({self.uc.t_run:.1f} s in the guest), "
+                     f"{self.uc.n_syscalls} syscalls, "
                      f"VM exits {self.uc.exits}")
         self.log(self.sched.summary())
         return self._stop_reason

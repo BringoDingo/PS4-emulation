@@ -112,3 +112,30 @@ New tools (WHP backend, frame-pointer based, run in 20-60 s): `fp_stacks.py` (li
 `fp_timeline.py` (sample one thread's stack over time), `trace_methods.py` (int3-trace named managed
 methods with args / call chains, any assembly via `MODULE=`), `bootmgr_evf.py` (BootManager event
 flag sets with time). `shellui_stacks.py` also accepts `20s` for WHP.
+
+
+### Why Base never reports Loaded (2026-11-18, later the same day)
+
+Chain established with the WHP tools:
+
+1. `SceneManager.UpdateSceneAction` processes ONE queued scene action per call and retries the head of
+   the queue until its `UpdateLoadAction` finishes. The head is `QuickMenuPlugin` (159 retries in 22 s,
+   `stuck_scene.py`); the Base plugin's Loaded dispatch (and the ninth plugin) sit behind it.
+2. QuickMenu waits in `ResourceManager.IsResourceLoaded` (`CxmlLoader.GetResource` -> KeyNotFound each
+   frame) for `CxmlLoader.RegisterResourceFileAsync`. That only *enqueues* a `CxmlLoadRequestJob`;
+   `JobQueue.Check()` (called from the main thread's frame loop) hands queued jobs to worker threads. 23
+   Cxml requests were enqueued but only 10 ever ran (`trace_methods.py`).
+3. The main frame loop crawls (17 `UpdateSceneLifeCycle` in 25 s). Time accounting (`WhpUc.t_run`, cProfile):
+   of 40 s wall only ~3 s is guest execution and ~5 s syscall handlers; ~11 s per 27 s is the software
+   compositor (`on_frame` -> `_run_dcb`, ~14 ms per 60 Hz frame). WHP virtual time follows wall time, so
+   the guest was starved by our own renderer. Now GPU time is excluded from the WHP virtual clock
+   (`Emulator._excl`); this did not by itself unblock the boot.
+4. When the main thread stalls it is blocked in `_umtx_op(MUTEX_LOCK)` on a libkernel-resident umutex
+   (0x1010e4630, word = owner tid | contested) whose owner is a worker running Mono managed code
+   (`GlsConvertUtil..cctor` / `ThemeColorManager..cctor`): READY, not suspended, scheduled only a handful
+   of times in 8 s (`stuck_lock.py`), while 1-5 other threads wait on the same lock. Not an EDEADLK, and
+   every thread's curthread->tid matches its scheduler tid (TLS is consistent). Open: why the owner is so
+   rarely run (it has not been reproduced on demand; roughly one run in two shows it).
+
+Tools added: `stuck_scene.py`, `stuck_lock.py`, `rip_hist.py` (unbiased guest rip profile from the
+preemption exits), `syscall_time.py`.

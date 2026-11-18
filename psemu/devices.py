@@ -148,6 +148,8 @@ class GcDevice(Device):
             self.log(f"submit #{self.submits}: {e}")
             return 0
         ms = (time.perf_counter() - t0) * 1000
+        if self.emu.whp:
+            self.emu._excl += ms / 1000.0            # GPU time is not guest time (see Emulator._excl)
         self.gpu_ms = getattr(self, "gpu_ms", 0.0) + ms
         summary = " ".join(f"{k}={v}" for k, v in stats.items() if v)
         self.log(f"submit #{self.submits} ring={ring} ibs={count} {ms:.0f} ms: {summary}"

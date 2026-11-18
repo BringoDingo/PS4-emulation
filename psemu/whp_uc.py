@@ -29,6 +29,7 @@ import ctypes
 import struct
 import threading
 import time
+from time import perf_counter as _pc
 
 import numpy as np
 import unicorn.x86_const as X
@@ -193,6 +194,7 @@ class WhpUc:
         self._step_addr = None
         self.exits = {}                        # exit statistics
         self.n_syscalls = 0
+        self.t_run = 0.0                       # seconds inside WHvRunVirtualProcessor (guest + exits)
         self._xs_len = 0
         self._xs_buf = (ctypes.c_ubyte * 16384)()
         self._timer = None
@@ -577,7 +579,9 @@ class WhpUc:
         while True:
             self._flush()
             self._in_guest = True
+            t0 = _pc()
             hr = run(self._h, 0, ctx, 256)
+            self.t_run += _pc() - t0
             self._in_guest = False
             if hr & 0xFFFFFFFF:
                 raise whp.WhpError("WHvRunVirtualProcessor failed (hr=%#010x)" % (hr & 0xFFFFFFFF))

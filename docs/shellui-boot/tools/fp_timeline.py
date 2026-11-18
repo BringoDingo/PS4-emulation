@@ -27,10 +27,10 @@ emu.log = lambda *a, **k: None
 res = {}
 
 
-def managed_stack(limit=60):
+def managed_stack(limit=60, which=None):
     uc = emu.uc
     r = res.setdefault("r", AotResolver(emu))
-    t = emu.sched.threads.get(tid)
+    t = emu.sched.threads.get(which or tid)
     if t is None:
         return None
     regs = uc.context_save().r if t is emu.sched.current else (t.ctx.r if t.ctx else None)
@@ -68,6 +68,19 @@ def tick():
         t = emu.sched.threads.get(tid)
         w = t.wait.get("kind") if t is not None and isinstance(t.wait, dict) else None
         print(f"[{now:6.1f}s] {t.state if t else '?'}/{w}: " + " <- ".join((st or [])[:7]), flush=True)
+        if t is not None and w in ("mutex_lock", "mutex_wait") and os.environ.get("OWNER"):
+            addr = t.wait.get("addr")
+            try:
+                owner = struct.unpack("<I", bytes(emu.uc.mem_read(addr, 4)))[0] & 0x7fffffff
+            except Exception:
+                owner = None
+            ot = emu.sched.threads.get(owner)
+            print(f"           mutex {addr:#x} owner {owner and hex(owner)} "
+                  f"{ot.state if ot else '?'} {ot.wait.get('kind') if ot is not None and isinstance(ot.wait, dict) else ''}",
+                  flush=True)
+            if ot is not None:
+                ost = managed_stack(which=owner)
+                print("           owner stack: " + " <- ".join((ost or [])[:9]), flush=True)
 
 
 emu.uc.tick_cb = tick

@@ -32,6 +32,13 @@ orig_tick = emu._whp_tick
 
 def make_handler(name):
     def h(e, uc):
+        focus_key = os.environ.get("FOCUS")        # e.g. BasePlugin::OnLoading: then only trace that `this`
+        if focus_key:
+            this = uc.reg_read(X.UC_X86_REG_RDI)
+            if focus_key in name and "this" not in state:
+                state["this"] = this
+            if state.get("this") is None or (this != state["this"] and focus_key not in name):
+                return None
         rsp = uc.reg_read(X.UC_X86_REG_RSP)
         ret = struct.unpack("<Q", bytes(uc.mem_read(rsp, 8)))[0]
         tid = e.sched.current.tid if e.sched and e.sched.current else 0
@@ -55,26 +62,36 @@ def make_handler(name):
                 rbp = nx
             extra += "".join("\n        " + f for f in frames)
         print(f"[{e._time() - e._t0:7.2f}s] tid {tid:#x} {name}   <- {res.name(ret)}{extra}", flush=True)
+        if os.environ.get("RET") and ret not in e.hle.table:
+            def on_ret(e2, uc2, ra=ret, nm=name):
+                print(f"[{e2._time() - e2._t0:7.2f}s]   {nm} returned rax={uc2.reg_read(X.UC_X86_REG_RAX):#x}", flush=True)
+                uc2.hle_remove(ra)
+                e2.hle.table.pop(ra, None)
+                return None
+            e.hle.register(ret, on_ret, name="ret", mode="fixup")
         return None
     return h
 
 
 def install():
-    app = emu.dyn.by_name(os.environ.get("MODULE", "app.exe.sprx")) if emu.dyn else None
-    if app is None:
-        return
-    img = res._image(app)
-    if img is None:
-        return
-    n = 0
-    for start, rid in zip(img.starts, img.rids):
-        nm = img.method_name(rid)
-        if any(s in nm for s in subs):
-            emu.hle.register(start, make_handler(nm), name=nm, mode="fixup")
-            n += 1
-            if os.environ.get("LIST"):
-                print(f"[trace]   {start:#x} {nm}", flush=True)
-    print(f"[trace] hooked {n} methods in {os.environ.get("MODULE", "app.exe.sprx")}", flush=True)
+    mods = os.environ.get("MODULE", "app.exe.sprx").split(",")
+    total = 0
+    for mod in mods:
+        lm = emu.dyn.by_name(mod) if emu.dyn else None
+        img = res._image(lm) if lm is not None else None
+        if img is None:
+            return                     # not loaded yet: retry on the next tick
+    for mod in mods:
+        img = res._image(emu.dyn.by_name(mod))
+        n = 0
+        for start, rid in zip(img.starts, img.rids):
+            nm = img.method_name(rid)
+            if any(s in nm for s in subs):
+                emu.hle.register(start, make_handler(nm), name=nm, mode="fixup")
+                n += 1
+                if os.environ.get("LIST"):
+                    print(f"[trace]   {start:#x} {nm}", flush=True)
+        print(f"[trace] hooked {n} methods in {mod}", flush=True)
     state["done"] = True
 
 
