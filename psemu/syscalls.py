@@ -1221,6 +1221,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             if flags & self.EV_ADD:
                 kn.update(flags=flags, udata=udata)
             if filt == self.EVFILT_USER and fflags & self.NOTE_TRIGGER:
+                # sceKernelTriggerUserEvent(eq, id, udata): the kernel copies the change's udata
+                # onto the existing knote on every registration (kn_kevent.udata = kev->udata),
+                # so the waiter receives the TRIGGER's udata, not the one given at EV_ADD (the
+                # vision manager passes a request-message pointer this way)
+                kn["udata"] = udata
                 self.trigger(self.EVFILT_USER, ident)
         if nev and self.kq_pending.get(kq):
             return self.sys_kevent_deliver(uc, kq, evbuf, nev)

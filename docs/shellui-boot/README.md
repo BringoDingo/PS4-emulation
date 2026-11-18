@@ -139,3 +139,36 @@ Chain established with the WHP tools:
 
 Tools added: `stuck_scene.py`, `stuck_lock.py`, `rip_hist.py` (unbiased guest rip profile from the
 preemption exits), `syscall_time.py`.
+
+## Update 2026-11-18 (later): the EvalBase stall is fixed - it was a kevent bug
+
+The Base plugin never reported Loaded because QuickMenu's load task waited on boot flag
+`0x40000000000`, which only `BootManager.<StartInitializeVisionEngine>b__33` sets, after
+`VisionRecognitionUtil.InitializeVisionEngine()` returns. That call never returned.
+
+Chain (found with `vision_sys.py`, `native_trace.py`, `disasm_mem.py`):
+
+1. `libSceVisionManager` creates two equeues (0x33, 0x34) and a worker thread
+   (`libSceVisionManager+0x287c0`). It sends the worker a request with
+   `sceKernelAddUserEvent(eq33, 0)` + `sceKernelTriggerUserEvent(eq33, 0, &msg)` and then waits on
+   eq34 for the reply. `msg` is a request block (type 0, path `/app0/recognition/vision/dict/`).
+2. On the kernel side a registration change updates the existing knote's `udata`
+   (`kn->kn_kevent.udata = kev->udata`). `Syscalls.sys_kevent` stored `udata` only at `EV_ADD`, so
+   the worker received `udata = NULL`, took its "no message" exit path, deleted the event and
+   `thr_exit`ed without replying. The init thread then waited forever on an empty queue.
+3. Fix (`syscalls.py`, `sys_kevent`): an `EVFILT_USER` change with `NOTE_TRIGGER` copies the
+   change's `udata` onto the knote before the event is raised.
+
+Result on WHP: `0x40000000000` is set at ~11.8 s and `0x400` (Base loaded) at ~13-15 s; the shell
+draws a real screen ("Rebuilding database..." with a progress bar, the system software's
+database-recovery UI) through the compositor. The remaining BootManager waiters are the later boot
+steps (`0x80000`, `0x8000000`, `0x100000000000`).
+
+Two measurement notes worth keeping:
+* never patch an `int3` over a `call` instruction of Mono AOT code: the PLT resolver re-reads the
+  call bytes (`aot-runtime.c: condition 'plt_entry' not met`); hook method entries only;
+* the compositor service (`ring.service`) was 25 of 45 s of wall time (mean 37 ms/frame, 100 ms+
+  once the scene is large). It is excluded from the guest clock but is the main cost of a run.
+
+New tools: `ready_wait.py`, `frame_cost.py`, `disasm_method.py`, `disasm_mem.py`, `find_imm.py`,
+`catch_hit.py`, `vision_sys.py`, `native_trace.py`, `kq_dump.py`, `main_syscalls.py`.

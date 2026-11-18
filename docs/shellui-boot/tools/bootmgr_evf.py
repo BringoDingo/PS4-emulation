@@ -30,11 +30,14 @@ def wrap(name):
         ef = sc._evf(h)
         nm = getattr(ef, "name", "") if ef is not None else ""
         if "BootManager" in str(nm):
-            print(f"[{emu._time() - emu._t0:7.2f}s] {name} {bits:#x}  (before: {ef.bits:#x})", flush=True)
+            tid = emu.sched.current.tid if emu.sched and emu.sched.current else 0
+            print(f"[{emu._time() - emu._t0:7.2f}s] tid {tid:#x} {name} {bits:#x}  (before: {ef.bits:#x})", flush=True)
         return orig(uc, *a, **k)
     setattr(sc, name, f)
 
 
 wrap("sys_evf_set")
 wrap("sys_evf_clear")
+if os.environ.get("WAITS"):                      # also the waits (bits, mode in rdx), first-time per thread+bits
+    wrap("sys_evf_wait")
 emu.run()
