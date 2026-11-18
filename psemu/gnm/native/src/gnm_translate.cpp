@@ -5,6 +5,8 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
@@ -87,6 +89,41 @@ static Shader::LogicalStage ToLogical(Shader::Stage s) {
                                  "not supported by the standalone translator yet");
     }
 }
+
+namespace {
+struct CachedTranslation {
+    std::shared_ptr<TranslatedShader> ts;
+    std::vector<u32> flat;   // flattened user-data buffer the translation was made from
+};
+std::unordered_map<std::string, std::vector<CachedTranslation>> g_tcache;
+u64 g_tcache_hits = 0, g_tcache_misses = 0;
+
+template <class T>
+void AppendBytes(std::string& k, const T& v) {
+    k.append(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+
+std::string TranslationKey(const GnmShaderDesc& d, const Shader::Profile& profile,
+                           const Shader::Backend::Bindings& binding, const StageExtras* extras) {
+    std::string k;
+    k.reserve(256 + size_t(d.code_dwords) * 4);
+    AppendBytes(k, d);
+    k.append(reinterpret_cast<const char*>(d.code), size_t(d.code_dwords) * 4);
+    AppendBytes(k, binding);
+    AppendBytes(k, &profile);
+    const bool has_extras = extras != nullptr;
+    AppendBytes(k, has_extras);
+    if (has_extras) {
+        AppendBytes(k, extras->ps_inputs.has_value());
+        if (extras->ps_inputs) AppendBytes(k, *extras->ps_inputs);
+        AppendBytes(k, extras->color_buffers.has_value());
+        if (extras->color_buffers) AppendBytes(k, *extras->color_buffers);
+        AppendBytes(k, extras->cs_threads);
+        AppendBytes(k, extras->vs_depth_minus_one_to_one);
+    }
+    return k;
+}
+} // namespace
 
 std::unique_ptr<TranslatedShader> Translate(const GnmShaderDesc& d, const Shader::Profile& profile,
                                             Shader::Backend::Bindings& binding,
@@ -182,6 +219,39 @@ std::unique_ptr<TranslatedShader> Translate(const GnmShaderDesc& d, const Shader
     ts->spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
     ts->next_binding = binding;
     return ts;
+}
+
+std::shared_ptr<const TranslatedShader> TranslateCached(const GnmShaderDesc& d,
+                                                        const Shader::Profile& profile,
+                                                        Shader::Backend::Bindings& binding,
+                                                        const StageExtras* extras) {
+    if (!d.code || d.code_dwords == 0) {
+        return Translate(d, profile, binding, extras);   // let Translate report the error
+    }
+    auto& entries = g_tcache[TranslationKey(d, profile, binding, extras)];
+    for (auto& e : entries) {
+        auto& info = *e.ts->info;
+        std::vector<u32> saved = info.flattened_ud_buf;
+        info.RefreshFlatBuf();                           // descriptors as guest memory holds them now
+        if (info.flattened_ud_buf == e.flat) {
+            binding = e.ts->next_binding;
+            ++g_tcache_hits;
+            return e.ts;
+        }
+        info.flattened_ud_buf = std::move(saved);       // different descriptors: not this one
+    }
+    ++g_tcache_misses;
+    std::shared_ptr<TranslatedShader> ts = Translate(d, profile, binding, extras);
+    entries.push_back({ts, ts->info->flattened_ud_buf});
+    if (entries.size() > 16) {
+        entries.erase(entries.begin());
+    }
+    return ts;
+}
+
+void TranslateCacheStats(u64& hits, u64& misses) {
+    hits = g_tcache_hits;
+    misses = g_tcache_misses;
 }
 
 std::string Summarize(const TranslatedShader& ts) {

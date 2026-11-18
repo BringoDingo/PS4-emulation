@@ -76,6 +76,9 @@ def dll():
                                     C.c_char_p, C.c_int]
         _dll.gnm_read_reg.argtypes = [C.c_uint32, C.POINTER(C.c_uint32)]
         _dll.gnm_profile.argtypes = [C.c_char_p, C.c_int, C.c_int]
+        _dll.gnm_set_host_only_range.argtypes = [C.c_uint64, C.c_uint64]
+        _dll.gnm_set_host_only_range.restype = None
+        _dll.gnm_flush_range.argtypes = [C.c_uint64, C.c_uint64, C.c_char_p, C.c_int]
         _dll.gnm_tiling.argtypes = [C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32, C.c_int,
                                     C.c_void_p, C.c_void_p, C.POINTER(C.c_uint64),
                                     C.POINTER(C.c_uint32), C.POINTER(C.c_uint32),
@@ -85,9 +88,22 @@ def dll():
 
 def profile(reset=True):
     """Per-phase time of graphics jobs since the last reset, as a string."""
-    buf = C.create_string_buffer(512)
+    buf = C.create_string_buffer(1024)
     dll().gnm_profile(buf, len(buf), 1 if reset else 0)
     return buf.value.decode(errors="replace")
+
+
+def set_host_only_range(addr, nbytes):
+    """Declare [addr, addr+nbytes) memory that only the host reads (never the guest program).
+    Render targets inside it are written back lazily: call flush_range() before reading it."""
+    dll().gnm_set_host_only_range(addr, addr + nbytes)
+
+
+def flush_range(addr, nbytes):
+    """Bring [addr, addr+nbytes) up to date with any render target still held on the GPU."""
+    err = C.create_string_buffer(512)
+    if dll().gnm_flush_range(addr, addr + nbytes, err, len(err)):
+        raise GnmError("flush_range: " + err.value.decode(errors="replace"))
 
 
 def tiling_info(mode, bpp, pitch, height):

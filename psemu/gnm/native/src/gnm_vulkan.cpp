@@ -727,6 +727,34 @@ vk::BufferImageCopy CopyRegion(u32 w, u32 h, u32 row_texels, bool block) {
 
 // Create descriptors for everything one translated stage references, in the
 // order shadPS4's descriptor-set layout uses: buffers, images, samplers.
+u64 g_tex_uploads = 0, g_tex_bytes = 0;     // sampled-texture uploads (BindStage)
+double g_release_ms = 0;                    // end-of-submit surface write-backs
+
+u64 Xxh64(const u8* p, size_t len);         // defined with the surface cache below
+
+// Read-only textures kept between draws/submits (see BindStage).
+struct TexEntry {
+    u64 addr{};
+    vk::Format fmt{};
+    u32 w{}, h{}, pitch{}, mode{};
+    bool is_1d{};
+    size_t footprint{};
+    std::array<vk::ComponentSwizzle, 4> sw{};
+    u64 hash{};
+    u64 last_used{};
+    Image img{};
+    ~TexEntry() {
+        auto dev = Dev().dev;
+        if (img.view) dev.destroyImageView(img.view);
+        if (img.img) dev.destroyImage(img.img);
+        if (img.mem) dev.freeMemory(img.mem);
+    }
+};
+std::vector<std::unique_ptr<TexEntry>> g_tex_cache;
+std::vector<std::unique_ptr<TexEntry>> g_tex_retired;   // freed when the GPU is idle
+constexpr size_t kTexCacheMax = 96;
+u64 g_tex_clock = 0, g_tex_hits = 0, g_tex_misses = 0;
+
 void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
     const auto& info = *ts.info;
     const auto stage_bit = StageBit(info.stage);
@@ -787,6 +815,7 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
              .stageFlags = stage_bit});
         const auto view_type = sharp.GetViewType(ir.is_array);
         const bool is_1d = view_type == AmdGpu::ImageType::Color1D;
+        TexEntry* cached = nullptr;          // set when a read-only texture is served from cache
         if (view_type != AmdGpu::ImageType::Color2D && !is_1d) {
             const u32* d = reinterpret_cast<const u32*>(&sharp);
             Fail(fmt::format("image type {} not supported yet [T# {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}]",
@@ -803,7 +832,103 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
         if (ir.is_written) {
             usage |= vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc;
         }
-        Image& im = fr.NewImage({.imageType = is_1d ? vk::ImageType::e1D : vk::ImageType::e2D,
+        if (!ir.is_written) {
+            // ---- read-only texture: serve from the cache when the guest bytes are unchanged
+            const u32 trows = fi->block ? (h + 3) / 4 : h;
+            const u32 telems = fi->block ? (pitch + 3) / 4 : pitch;
+            size_t foot = size_t(trows) * telems * fi->bytes;
+            const auto tmode = AmdGpu::TileMode(u32(sharp.tiling_index));
+            if (!IsLinear(tmode)) {
+                if (const auto t = Tiler::Get(tmode, fi->bytes, telems, trows, nullptr)) {
+                    foot = t->TiledBytes();
+                }
+            }
+            const u64 taddr = u64(sharp.base_address) << 8;
+            const auto tsw = sharp.DstSelect();
+            const std::array<vk::ComponentSwizzle, 4> swz{MapSwizzle(tsw.r), MapSwizzle(tsw.g),
+                                                          MapSwizzle(tsw.b), MapSwizzle(tsw.a)};
+            if (taddr) {
+                const u64 th = Xxh64(reinterpret_cast<const u8*>(uintptr_t(taddr)), foot);
+                for (size_t ci = 0; ci < g_tex_cache.size(); ++ci) {
+                    auto& e = *g_tex_cache[ci];
+                    if (e.addr == taddr && e.fmt == fi->fmt && e.w == w && e.h == h &&
+                        e.pitch == pitch && e.mode == u32(tmode) && e.is_1d == is_1d &&
+                        e.footprint == foot && e.sw == swz) {
+                        if (e.hash == th) {
+                            cached = &e;
+                        } else {
+                            // contents changed: retire the old image (an earlier draw in this
+                            // batch may still sample it); a fresh one is created below
+                            g_tex_retired.push_back(std::move(g_tex_cache[ci]));
+                            g_tex_cache.erase(g_tex_cache.begin() + ci);
+                        }
+                        break;
+                    }
+                }
+                if (cached) {
+                    cached->last_used = ++g_tex_clock;
+                    ++g_tex_hits;
+                } else {
+                    ++g_tex_misses;
+                    auto ne = std::make_unique<TexEntry>();
+                    ne->addr = taddr; ne->fmt = fi->fmt; ne->w = w; ne->h = h;
+                    ne->pitch = pitch; ne->mode = u32(tmode); ne->is_1d = is_1d;
+                    ne->footprint = foot; ne->sw = swz; ne->hash = th;
+                    ne->last_used = ++g_tex_clock;
+                    const vk::ImageCreateInfo tci{
+                        .imageType = is_1d ? vk::ImageType::e1D : vk::ImageType::e2D,
+                        .format = fi->fmt,
+                        .extent = {w, is_1d ? 1u : h, 1},
+                        .mipLevels = 1,
+                        .arrayLayers = 1,
+                        .samples = vk::SampleCountFlagBits::e1,
+                        .tiling = vk::ImageTiling::eOptimal,
+                        .usage = usage,
+                        .initialLayout = vk::ImageLayout::eUndefined};
+                    ne->img.img = fr.dev.createImage(tci);
+                    const auto req = fr.dev.getImageMemoryRequirements(ne->img.img);
+                    ne->img.mem = fr.dev.allocateMemory(
+                        {.allocationSize = req.size,
+                         .memoryTypeIndex = FindMemory(req.memoryTypeBits,
+                                                       vk::MemoryPropertyFlagBits::eDeviceLocal)});
+                    fr.dev.bindImageMemory(ne->img.img, ne->img.mem, 0);
+                    ne->img.view = fr.dev.createImageView(
+                        {.image = ne->img.img,
+                         .viewType = is_1d ? vk::ImageViewType::e1D : vk::ImageViewType::e2D,
+                         .format = fi->fmt,
+                         .components = vk::ComponentMapping{swz[0], swz[1], swz[2], swz[3]},
+                         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}});
+                    g_tex_cache.push_back(std::move(ne));
+                    if (g_tex_cache.size() > kTexCacheMax) {
+                        // evict the least recently used (retired: may be in the open batch)
+                        size_t lru = 0;
+                        for (size_t i = 1; i + 1 < g_tex_cache.size(); ++i) {
+                            if (g_tex_cache[i]->last_used < g_tex_cache[lru]->last_used) lru = i;
+                        }
+                        g_tex_retired.push_back(std::move(g_tex_cache[lru]));
+                        g_tex_cache.erase(g_tex_cache.begin() + lru);
+                    }
+                }
+            }
+        }
+        if (cached) {
+            auto ii = std::make_unique<vk::DescriptorImageInfo>(vk::DescriptorImageInfo{
+                .imageView = cached->img.view,
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal});
+            bd.writes.push_back({.dstBinding = bd.binding,
+                                 .descriptorCount = 1,
+                                 .descriptorType = dtype,
+                                 .pImageInfo = ii.get()});
+            bd.iinfos.push_back(std::move(ii));
+            ++bd.binding;
+            continue;
+        }
+        // a texture just entered into the cache is uploaded below into its own image
+        TexEntry* fresh = (!ir.is_written && !g_tex_cache.empty() &&
+                           g_tex_cache.back()->last_used == g_tex_clock &&
+                           g_tex_cache.back()->addr == (u64(sharp.base_address) << 8))
+                              ? g_tex_cache.back().get() : nullptr;
+        Image& im = fresh ? fresh->img : fr.NewImage({.imageType = is_1d ? vk::ImageType::e1D : vk::ImageType::e2D,
                                  .format = fi->fmt,
                                  .extent = {w, is_1d ? 1u : h, 1},
                                  .mipLevels = 1,
@@ -813,6 +938,7 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
                                  .usage = usage,
                                  .initialLayout = vk::ImageLayout::eUndefined});
         const auto sw = sharp.DstSelect();
+        if (!fresh)
         im.view = fr.dev.createImageView(
             {.image = im.img,
              .viewType = is_1d ? vk::ImageViewType::e1D : vk::ImageViewType::e2D,
@@ -828,6 +954,8 @@ void BindStage(Frame& fr, const TranslatedShader& ts, Bound& bd) {
         const size_t bytes = size_t(rows) * row_elems * fi->bytes;
         Buffer& st = fr.NewBuffer(bytes, vk::BufferUsageFlagBits::eTransferSrc |
                                              vk::BufferUsageFlagBits::eTransferDst);
+        ++g_tex_uploads;
+        g_tex_bytes += bytes;
         void* src = reinterpret_cast<void*>(uintptr_t(sharp.base_address) << 8);
         if (!src) {
             Fail("texture base address is null");
@@ -1135,8 +1263,44 @@ void FlushBatch() {
 // WRITE_DATA) touches it. Nothing else can change guest memory during a
 // submit, so this is exact; between submits the CPU runs, so surfaces are
 // always written back and dropped at the end of each submit.
+// XXH64 (Yann Collet's public algorithm, seed 0): fingerprints guest memory so a cached
+// render target can be reused only when its guest bytes are provably unchanged.
+inline u64 XxRotl(u64 x, int r) { return (x << r) | (x >> (64 - r)); }
+constexpr u64 kXxP1 = 0x9E3779B185EBCA87ull, kXxP2 = 0xC2B2AE3D27D4EB4Full,
+              kXxP3 = 0x165667B19E3779F9ull, kXxP4 = 0x85EBCA77C2B2AE63ull,
+              kXxP5 = 0x27D4EB2F165667C5ull;
+inline u64 XxRound(u64 acc, u64 in) { return XxRotl(acc + in * kXxP2, 31) * kXxP1; }
+inline u64 XxMerge(u64 acc, u64 v) { return (acc ^ XxRound(0, v)) * kXxP1 + kXxP4; }
+u64 Xxh64(const u8* p, size_t len) {
+    const u8* end = p + len;
+    u64 h;
+    auto rd64 = [](const u8* q) { u64 v; std::memcpy(&v, q, 8); return v; };
+    auto rd32 = [](const u8* q) { u32 v; std::memcpy(&v, q, 4); return v; };
+    if (len >= 32) {
+        u64 v1 = kXxP1 + kXxP2, v2 = kXxP2, v3 = 0, v4 = 0 - kXxP1;
+        const u8* lim = end - 32;
+        do {
+            v1 = XxRound(v1, rd64(p)); v2 = XxRound(v2, rd64(p + 8));
+            v3 = XxRound(v3, rd64(p + 16)); v4 = XxRound(v4, rd64(p + 24));
+            p += 32;
+        } while (p <= lim);
+        h = XxRotl(v1, 1) + XxRotl(v2, 7) + XxRotl(v3, 12) + XxRotl(v4, 18);
+        h = XxMerge(h, v1); h = XxMerge(h, v2); h = XxMerge(h, v3); h = XxMerge(h, v4);
+    } else {
+        h = kXxP5;
+    }
+    h += u64(len);
+    while (p + 8 <= end) { h ^= XxRound(0, rd64(p)); h = XxRotl(h, 27) * kXxP1 + kXxP4; p += 8; }
+    if (p + 4 <= end) { h ^= u64(rd32(p)) * kXxP1; h = XxRotl(h, 23) * kXxP2 + kXxP3; p += 4; }
+    while (p < end) { h ^= u64(*p) * kXxP5; h = XxRotl(h, 11) * kXxP1; ++p; }
+    h ^= h >> 33; h *= kXxP2; h ^= h >> 29; h *= kXxP3; h ^= h >> 32;
+    return h;
+}
+
 struct Surface {
     u64 address{};
+    u64 fingerprint{};           // XXH64 of the guest footprint right after the last write-back
+    bool gpu_newer{};            // host-only surface: image newer than memory (write-back deferred)
     size_t footprint{};          // guest bytes [address, address + footprint)
     u32 width{}, height{}, row{};
     FormatInfo fi{};
@@ -1158,6 +1322,25 @@ struct Surface {
 
 std::vector<std::unique_ptr<Surface>> g_surfaces;
 u32 g_surface_writebacks = 0;
+// Written-back colour surfaces kept between submits (most recent first). Each is reused only when
+// its guest bytes still hash to `fingerprint`; otherwise it is refilled from guest memory.
+std::vector<std::unique_ptr<Surface>> g_surface_cache;
+constexpr size_t kSurfaceCacheMax = 8;
+u64 g_surface_cache_hits = 0, g_surface_cache_refills = 0, g_surface_cache_misses = 0;
+
+// Memory only the host reads (registered by psemu): surfaces fully inside are written back lazily.
+std::vector<std::pair<u64, u64>> g_host_only;
+bool HostOnly(const Surface& s) {
+    for (const auto& [lo, hi] : g_host_only) {
+        if (s.address >= lo && s.address + s.footprint <= hi) return true;
+    }
+    return false;
+}
+u64 g_lazy_skipped = 0, g_lazy_flushed = 0;
+
+u64 GuestFingerprint(const Surface& s) {
+    return Xxh64(reinterpret_cast<const u8*>(uintptr_t(s.address)), s.footprint);
+}
 
 void WriteBack(Surface& s) {
     if (!s.dirty) {
@@ -1356,8 +1539,20 @@ struct TargetRes {
 // Write back (and drop) every resident surface overlapping a guest range the
 // current job is about to read or write through some other path.
 void FlushRange(u64 lo, u64 hi) {
+    for (auto& c : g_surface_cache) {
+        if (c->gpu_newer && c->Overlaps(lo, hi)) {
+            c->dirty = true;
+            WriteBack(*c);
+            c->gpu_newer = false;
+            c->fingerprint = GuestFingerprint(*c);
+            ++g_lazy_flushed;
+        }
+    }
     for (size_t i = 0; i < g_surfaces.size();) {
         if (g_surfaces[i]->Overlaps(lo, hi)) {
+            if (g_surfaces[i]->gpu_newer) {
+                g_surfaces[i]->dirty = true;
+            }
             WriteBack(*g_surfaces[i]);
             g_surfaces.erase(g_surfaces.begin() + i);
         } else {
@@ -1438,8 +1633,8 @@ void ExecuteGraphics(const GraphicsJob& job) {
 
     // Translate in shadPS4's order: fragment first, then vertex (shared numbering).
     Shader::Backend::Bindings bnd{};
-    const auto ps = has_ps ? Translate(job.ps, D.profile, bnd, &job.ps_extras) : nullptr;
-    const auto vs = Translate(job.vs, D.profile, bnd, &job.vs_extras);
+    const auto ps = has_ps ? TranslateCached(job.ps, D.profile, bnd, &job.ps_extras) : nullptr;
+    const auto vs = TranslateCached(job.vs, D.profile, bnd, &job.vs_extras);
     pt.Lap(kTranslate);
     if (ps) {
         FlushForShader(*ps); // resident targets the shaders read as textures/buffers
@@ -1552,7 +1747,33 @@ void ExecuteGraphics(const GraphicsJob& job) {
             }
             bool upload = false;
             if (!s) {
-                FlushRange(t.address, t.address + footprint); // aliases of this memory
+                // a surface kept from an earlier submit: take it out of the cache first, so the
+                // alias flush below does not write back the very image we are about to reuse
+                std::unique_ptr<Surface> cs;
+                for (size_t ci = 0; ci < g_surface_cache.size(); ++ci) {
+                    auto& g = g_surface_cache[ci];
+                    if (g->address == t.address && g->width == t.width &&
+                        g->height == t.height && g->row == row && g->fi.fmt == fi->fmt &&
+                        g->mode == t.tile_mode && g->footprint == footprint) {
+                        cs = std::move(g);
+                        g_surface_cache.erase(g_surface_cache.begin() + ci);
+                        break;
+                    }
+                }
+                FlushRange(t.address, t.address + footprint); // other surfaces aliasing this memory
+                if (cs) {
+                    // reuse the image; skip the upload when it is newer than memory (host-only,
+                    // deferred) or memory is unchanged since it was written back (hash checked
+                    // after the alias flush, which may itself have written this memory)
+                    upload = !cs->gpu_newer && GuestFingerprint(*cs) != cs->fingerprint;
+                    ++(upload ? g_surface_cache_refills : g_surface_cache_hits);
+                    cs->dirty = false;
+                    s = cs.get();
+                    new_surfaces.push_back(std::move(cs));
+                }
+            }
+            if (!s) {
+                ++g_surface_cache_misses;
                 auto ns = std::make_unique<Surface>();
                 ns->address = t.address;
                 ns->footprint = footprint;
@@ -2070,20 +2291,50 @@ void FlushSurfaces(u64 lo, u64 hi) {
 }
 
 void ReleaseSurfaces() {
+    const auto rel_t0 = std::chrono::steady_clock::now();
+    struct RelTimer {
+        std::chrono::steady_clock::time_point t;
+        ~RelTimer() {
+            g_release_ms += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t).count();
+        }
+    } rel_timer{rel_t0};
     // Finish any draws still batched (also covers a submit whose targets were
     // all non-resident, so the WriteBack loop below would not flush).
     FlushBatch();
     // write everything back first (WriteBack may throw: keep the rest intact)
     for (auto& s : g_surfaces) {
-        WriteBack(*s);
+        if (HostOnly(*s)) {
+            s->gpu_newer = s->gpu_newer || s->dirty;   // defer: nobody but the host reads it
+            s->dirty = false;
+            ++g_lazy_skipped;
+        } else {
+            WriteBack(*s);
+        }
     }
     for (auto& s : g_depth_surfaces) {
         WriteBack(*s);
+    }
+    // keep the colour surfaces for later submits (written-back ones are identical to memory)
+    for (auto& s : g_surfaces) {
+        if (!s->gpu_newer) {
+            s->fingerprint = GuestFingerprint(*s);
+        }
+        g_surface_cache.insert(g_surface_cache.begin(), std::move(s));
+    }
+    while (g_surface_cache.size() > kSurfaceCacheMax) {
+        auto& last = g_surface_cache.back();
+        if (last->gpu_newer) {
+            last->dirty = true;
+            WriteBack(*last);
+        }
+        g_surface_cache.pop_back();                // ~Surface frees the evicted image
     }
     g_surfaces.clear();
     g_depth_surfaces.clear();
     // Submit boundary: the GPU is idle and every surface is written back, so the
     // whole submit's pooled scratch can now be reused by the next submit.
+    g_tex_retired.clear();
     PoolResetAll();
 }
 
@@ -2102,7 +2353,7 @@ void ExecuteCompute(const ComputeJob& job) {
     StageExtras extras{};
     extras.cs_threads = job.threads;
     Shader::Backend::Bindings bnd{};
-    const auto cs = Translate(job.cs, D.profile, bnd, &extras);
+    const auto cs = TranslateCached(job.cs, D.profile, bnd, &extras);
     FlushForShader(*cs);
 
     Frame fr{.dev = D.dev};
@@ -2163,6 +2414,9 @@ extern "C" GNM_API void gnm_shutdown(void) {
     std::lock_guard lk{g_mutex};
     if (g_dev) {
         g_dev->dev.waitIdle();
+        g_surface_cache.clear();
+        g_tex_retired.clear();
+        g_tex_cache.clear();
         PoolDestroyAll();
         g_dev->dev.destroyCommandPool(g_dev->cmd_pool);
         g_dev->dev.destroy();
@@ -2182,8 +2436,36 @@ extern "C" GNM_API int gnm_device_name(char* out, int cap) {
     }
 }
 
+extern "C" GNM_API void gnm_set_host_only_range(uint64_t lo, uint64_t hi) {
+    std::lock_guard lk{g_mutex};
+    psemu::g_host_only.emplace_back(lo, hi);
+}
+
+// Bring memory in [lo, hi) up to date with any deferred render target before the host reads it.
+extern "C" GNM_API int gnm_flush_range(uint64_t lo, uint64_t hi, char* err, int errlen) {
+    std::lock_guard lk{g_mutex};
+    try {
+        psemu::FlushSurfaces(lo, hi);
+    } catch (const std::exception& e) {
+        if (err && errlen > 0) std::snprintf(err, size_t(errlen), "%s", e.what());
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" GNM_API int gnm_profile(char* out, int outlen, int reset) {
-    std::string s = fmt::format("draws={} flushes={}", psemu::g_prof_draws, psemu::g_flush_count);
+    u64 xh = 0, xm = 0;
+    psemu::TranslateCacheStats(xh, xm);
+    std::string s = fmt::format("draws={} flushes={} rt_cache hit={} refill={} miss={} "
+                                "tex_uploads={} tex_MB={:.0f} release={:.0f}ms "
+                                "lazy_skipped={} lazy_flushed={} xlat_hit={} xlat_miss={} "
+                                "tex_hit={} tex_miss={}",
+                                psemu::g_prof_draws, psemu::g_flush_count,
+                                psemu::g_surface_cache_hits, psemu::g_surface_cache_refills,
+                                psemu::g_surface_cache_misses, psemu::g_tex_uploads,
+                                psemu::g_tex_bytes / 1048576.0, psemu::g_release_ms,
+                                psemu::g_lazy_skipped, psemu::g_lazy_flushed, xh, xm,
+                                psemu::g_tex_hits, psemu::g_tex_misses);
     for (int i = 0; i < psemu::kNumPhases; ++i) {
         s += fmt::format(" {}={:.0f}ms", psemu::kPhaseNames[i], psemu::g_prof_ms[i]);
     }

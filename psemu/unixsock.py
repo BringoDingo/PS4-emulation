@@ -291,7 +291,11 @@ class CompositorRing:
             detail += self._run_dcb(uc, dcb, size)
         elif cmd == 0x14:
             self.frames += 1
-            detail = f"Flip (frame {self.frames})" + self._present()
+            detail = f"Flip (frame {self.frames})"
+            # the pixel stats only feed this log line (capped) and the frame dumps: read the
+            # 8 MB target only when one of them will actually use it
+            if self.log_left > 0 or self._frame_due():
+                detail += self._present()
         elif cmd == 0x15:
             detail = f"PostEvent({operand & 0xF})"
             self._post_event(uc, operand & 0xF)
@@ -324,6 +328,9 @@ class CompositorRing:
             self._rt = self._heap.alloc(self.WIDTH * self.HEIGHT * 4)
             self._rt[:] = 0
             self._rt_addr = backend.HostHeap.addr(self._rt)
+            # psemu's own scanout buffer: the guest program never sees this address, so the
+            # backend may keep it on the GPU and write it back only when we read it (_present)
+            backend.set_host_only_range(self._rt_addr, self.WIDTH * self.HEIGHT * 4)
             cb = pm4.CommandBuffer()
             cb.set_render_target(0, self._rt_addr, self.WIDTH, self.HEIGHT, fmt=10,
                                  number_type=0, comp_swap=0)
@@ -481,12 +488,20 @@ class CompositorRing:
         s = f" rt0={rt} [GPU: {stats.get('draws', 0)} draw(s), {stats.get('failed', 0)} failed"
         return s + (f", {err.splitlines()[0][:100]}" if err else "") + "]"
 
+    def _frame_due(self):
+        """True if this flip's frame gets saved (--frames)."""
+        fdir = getattr(self.server.sc.emu, "frame_dir", None)
+        every = getattr(self.server.sc.emu, "frame_every", 1)
+        return bool(fdir) and (self.frames == 1 or self.frames % every == 0)
+
     def _present(self):
         """Flip: save what the compositor drew (when --frames is given)."""
         if not getattr(self, "gpu_state", False):
             return ""
         fdir = getattr(self.server.sc.emu, "frame_dir", None)
         np = self._np
+        # the target may still be on the GPU (lazy write-back): bring memory up to date first
+        self._backend.flush_range(self._rt_addr, self.WIDTH * self.HEIGHT * 4)
         raw = bytes(self._rt[:self.WIDTH * self.HEIGHT * 4])
         img = np.frombuffer(raw, dtype=np.uint8).reshape(self.HEIGHT, self.WIDTH, 4)
         # pixels with any non-zero R, G or B byte (RGBA in memory: the low 24 bits of

@@ -48,6 +48,15 @@ std::unique_ptr<TranslatedShader> Translate(const GnmShaderDesc& desc,
                                             Shader::Backend::Bindings& binding,
                                             const StageExtras* extras = nullptr);
 
+// Translate() with an exact cache: reuses an earlier translation when every input is identical
+// (descriptor, code, extras, incoming bindings) and the shader's flattened descriptor data read
+// from guest memory is unchanged. Updates `binding` exactly as Translate() would.
+std::shared_ptr<const TranslatedShader> TranslateCached(const GnmShaderDesc& desc,
+                                                        const Shader::Profile& profile,
+                                                        Shader::Backend::Bindings& binding,
+                                                        const StageExtras* extras = nullptr);
+void TranslateCacheStats(u64& hits, u64& misses);
+
 std::string Summarize(const TranslatedShader& ts);
 
 // Profile used when no Vulkan device is open (translation-only runs):
