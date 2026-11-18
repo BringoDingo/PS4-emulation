@@ -1,0 +1,17 @@
+diff --git a/a/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/frontend/translate/vector_interpolation.cpp b/b/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/frontend/translate/vector_interpolation.cpp
+--- a/a/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/frontend/translate/vector_interpolation.cpp
++++ b/b/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/frontend/translate/vector_interpolation.cpp
+@@ -98,6 +98,13 @@
+     const IR::Attribute attrib = IR::Attribute::Param0 + attr_index;
+     const auto& attr = runtime_info.fs_info.inputs[attr_index];
+     auto& interp = info.fs_interpolation[attr_index];
++    if (attr.IsDefault()) {
++        // An input the vertex stage never exports has no SPIR-V variable (EmitContext skips
++        // default inputs), so reading it must yield the hardware default constant, exactly as
++        // V_INTERP_P2_F32 does. Without this the emitter loads a null id and aborts.
++        SetDst(inst.dst[0], ir.Imm32(DefaultValTable[attr.default_value][inst.control.vintrp.chan]));
++        return;
++    }
+     ASSERT(attr.is_flat || inst.src[0].code == 2);
+     if (profile.supports_amd_shader_explicit_vertex_parameter ||
+         (profile.supports_fragment_shader_barycentric &&

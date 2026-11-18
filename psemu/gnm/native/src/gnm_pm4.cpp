@@ -524,6 +524,7 @@ extern "C" GNM_API void gnm_pm4_reset(void) {
 extern "C" GNM_API int gnm_submit(const uint32_t* dcb, uint32_t dwords, GnmSubmitStats* stats,
                                   char* err, int errlen) {
     std::lock_guard lk{DeviceMutex()};
+    InstallCrashHandlers();
     SehGuard seh;
     auto& cp = Cp();
     cp.stats = {};

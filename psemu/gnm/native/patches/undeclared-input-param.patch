@@ -1,0 +1,17 @@
+diff --git a/a/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp b/b/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+--- a/a/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
++++ b/b/psemu/gnm/native/third_party/shadps4/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+@@ -84,6 +84,13 @@
+     if (IR::IsParam(attr)) {
+         const u32 param_index{u32(attr) - u32(IR::Attribute::Param0)};
+         const auto& param{ctx.input_params.at(param_index)};
++        if (param.num_components == 0) {
++            // The shader reads an input parameter that was never declared: the previous stage
++            // exports fewer parameters than this one reads (EmitContext only defines inputs it was
++            // told about), so there is no SPIR-V variable to load. Loading the null id aborts the
++            // whole process (Sirit asserts), so read the unexported parameter as zero instead.
++            return ctx.ConstF32(0.0f);
++        }
+         const Id value = [&] {
+             if (param.is_array) {
+                 ASSERT(param.num_components > 1);

@@ -371,3 +371,26 @@ Open issue (separate): in `--frames` runs the process aborts inside the native G
 (`gnm_submit` -> "Fatal Python error: Aborted") after ~1000 command buffers once these richer
 frames render; a plain run without `--frames` completed cleanly (exit 0, 70 s). Not yet
 diagnosed - likely a path exercised by the scanout write-back used for frame dumps.
+
+## Update 2026-11-18 (late night): the native GPU abort is fixed
+
+The `--frames` abort noted above was **not** the scanout write-back. A crash handler
+(`gnm_crash.cpp`, installed per thread from `gnm_submit`: `std::set_terminate` + `SIGABRT`, prints the
+pending exception and a symbolized stack via dbghelp) showed the stack:
+
+    gnm_submit -> ... -> Shader::Backend::SPIRV::EmitGetAttribute -> Sirit::Module::OpLoad(null Id)
+
+i.e. a Sirit assertion, not a Vulkan fault. The cause: the **fragment shader reads an interpolant the
+vertex stage never exports**. shadPS4's `EmitContext` skips declaring SPIR-V variables for such
+"default" inputs (and for params beyond what the previous stage wrote), but two paths still emitted a
+load of the missing variable:
+
+1. `V_INTERP_MOV_F32` did not handle `attr.IsDefault()` (its sibling `V_INTERP_P2_F32` does). It now
+   returns the hardware default constant (`DefaultValTable`). Patch `interp-mov-default-input.patch`.
+2. `EmitGetAttribute` for a param whose `num_components == 0` loaded a null id. It now yields `0.0f`.
+   Patch `undeclared-input-param.patch`.
+
+Both live as patches under `psemu/gnm/native/patches/` (applied idempotently by `build.py`).
+Result: the same `--frames` scenario that aborted in ~5 of 6 runs now completes 4/4
+(exit 0, 49-52 frames), and frames through 1200 render the same home screen. Regression suites
+(synctest 40/0, policytest 34/0, whp_uc_test) unchanged.

@@ -67,6 +67,10 @@ const Shader::Profile& CurrentProfile();
 
 void SetError(char* err, int errlen, const std::string& msg);
 
+// Installs (once per thread) a std::terminate / SIGABRT handler that prints the pending exception
+// and a symbolized stack to stderr before the process dies (gnm_crash.cpp).
+void InstallCrashHandlers();
+
 // While alive, hardware faults (e.g. the recompiler dereferencing a bad guest
 // pointer from user data) are turned into C++ exceptions on this thread, so
 // they are reported instead of killing the host process. Needs /EHa.
