@@ -54,6 +54,9 @@ if ts:
     print("first/last call at", f"{ts[0][0]:.1f}s", f"{ts[-1][0]:.1f}s")
     big = sorted(ts, key=lambda x: -x[1])[:6]
     print("slowest calls (t, ms):", [(round(a, 1), round(b * 1000)) for a, b in big])
+    from collections import Counter
+    per = Counter(int(t) for t, _ in ts)
+    print("ring.service calls per wall second:", " ".join(f"{k}:{per[k]}" for k in sorted(per)))
     third = len(ts) // 3
     for i in range(3):
         seg = ts[i * third:(i + 1) * third] or ts

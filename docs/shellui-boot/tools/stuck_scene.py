@@ -98,4 +98,11 @@ for action, n in calls.most_common(3):
     for fld in (0x10, 0x18, 0x20):
         v = q(uc, action + fld)
         names = klass_names(uc, v) if v > 0x10000 else {}
-        print(f"  +{fld:#x} = {v:#x}  class strings: {names}")
+        sv = None
+        if names.get(64) == "String":
+            try:
+                n = struct.unpack("<i", bytes(uc.mem_read(v + 0x10, 4)))[0]
+                sv = bytes(uc.mem_read(v + 0x14, min(n, 120) * 2)).decode("utf-16le", "replace")
+            except Exception:
+                pass
+        print(f"  +{fld:#x} = {v:#x}  class strings: {names}" + (f"  value={sv!r}" if sv else ""))

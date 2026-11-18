@@ -1410,9 +1410,14 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                     self.emu.log(f"  [open] '{path}' -> ENOENT (no embedded CIL in .sprx)")
                     return self._ret(uc, ENOENT, error=True)
             else:
-                # Not in the dump and not being created. Kept permissive (an
-                # empty file) like before; reads see EOF.
-                kind = " (missing)"
+                # Not in the dump and not being created: ENOENT, as on the real system. (This
+                # used to hand back a working fd on an empty file whose writes were dropped, so a
+                # database opened without O_CREAT - SQLite's open of app.db - lost its own
+                # writes, read them back as zeros and was declared corrupt: the shell then
+                # asked for a database rebuild.)
+                self.fds.pop(fd, None)
+                self.emu.log(f"  [open] '{path}' -> ENOENT")
+                return self._ret(uc, ENOENT, error=True)
             if data is not None:
                 self.files[fd] = {"data": data, "pos": 0, "path": p,
                                   "append": bool(flags & self.O_APPEND)}

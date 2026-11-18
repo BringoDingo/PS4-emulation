@@ -172,3 +172,32 @@ Two measurement notes worth keeping:
 
 New tools: `ready_wait.py`, `frame_cost.py`, `disasm_method.py`, `disasm_mem.py`, `find_imm.py`,
 `catch_hit.py`, `vision_sys.py`, `native_trace.py`, `kq_dump.py`, `main_syscalls.py`.
+
+## Update 2026-11-18 (later): past EvalBase, the shell runs its DB-recovery path
+
+With the kevent fix the boot now reaches `0x400` (Base loaded) and the shell loads `DbRecoveryPlugin`,
+which draws the system "Rebuilding database..." screen. It never leaves that screen. Diagnosis chain
+(`dbstatus.py`, `vision_sys.py HOOK=`, `disasm_mem.py`, `vfs_dump.py`, `path_watch.py`,
+`missing_opens.py`):
+
+1. Early in boot (~6 s) the app-DB layer opens `/priv/mms/app.db`, finds nothing valid, writes the
+   markers `app.db-corrupt` and `/system_data/priv/mms/dbr.db-err`, and requests recovery.
+2. `BootManager.EvalDBRecovery` -> `ExecDBRecovery` loads `DbRecoveryPlugin`. Its `OnLoaded` calls
+   `DbPreparationWrapper.CexDbRecoveryStart` (returns 0 = ok); `OnUpdateFrame` then polls
+   `CexDbRecoveryGetStatus(out finished, out error, out progress, out stage)` every frame.
+3. `CexDbRecoveryGetStatus` is a P/Invoke into native code statically linked in `eboot.bin`
+   (`+0x5c5390`) that reads a status structure. That structure is only advanced by the
+   `SceDbPreparationServer` daemon - which psemu answers as an **empty-success IPMI stub**. So the
+   status never changes: `finished=0, error=0, progress=0.0, stage=-1` for the whole run (confirmed
+   stable over 110 s with `dbstatus.py`).
+
+So the shell is not stuck on a lock or a scheduler problem here - it is correctly waiting for a
+database service that does no real work. This is the concrete case of "the IPMI stubs cannot
+reproduce complete service interactions": `SceDbPreparationServer` + `SceAppDbIpc` need either a real
+app-database implementation (the no-tricks fix) or a modelled recovery that signals completion.
+
+Also fixed this session (working copy, uncommitted): `sys_open` now returns ENOENT for a file that
+is absent and not being created, instead of a permissive empty fd whose writes were silently
+dropped. Verified it does not regress the boot (flags still reach `0x400`) nor the SceSysCore->ShellUI
+`--then` chain (runs clean to budget, exit 0). It does not by itself prevent the corruption verdict,
+because the fresh-DB creation path also goes through the stub app-DB service.

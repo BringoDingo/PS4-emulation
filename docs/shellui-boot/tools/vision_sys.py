@@ -3,6 +3,7 @@ call into VisionRecognitionUtil.InitializeVisionEngine on (WHP).
 
     python vision_sys.py 24
 """
+import os
 import sys
 
 sys.path.insert(0, r"D:\CLAUDEGODOT2")
@@ -21,7 +22,7 @@ sc = emu.syscalls
 st = {"tid": None, "armed": False, "last": 0.0, "log": []}
 orig_dispatch = sc.dispatch
 orig_tick = emu._whp_tick
-HOOK = 0x108210320      # method entry of b__33 (never patch a call site: Mono re-reads the call bytes)
+HOOK = int(os.environ.get('HOOK', '0x108210320'), 0)      # method entry of b__33 (never patch a call site: Mono re-reads the call bytes)
 
 
 def hit(e, uc):
@@ -71,6 +72,13 @@ def dispatch(uc):
                 extra += f" [chg ident={ident:#x} filt={filt} flags={fl:#x} fflags={ff:#x} data={dat:#x} udata={ud:#x}]"
             except Exception:
                 pass
+    for ri, rr in enumerate((X.UC_X86_REG_RDI, X.UC_X86_REG_RSI)):
+        try:
+            raw = bytes(uc.mem_read(uc.reg_read(rr), 96)).split(bytes([0]))[0]
+            if len(raw) >= 3 and all(32 <= c < 127 for c in raw):
+                extra += f" arg{ri}={raw.decode()!r}"
+        except Exception:
+            pass
     r = orig_dispatch(uc)
     for k in range(before, emu.sched.next_tid):          # threads this thread just created
         st["kids"].add(k)
@@ -100,5 +108,5 @@ emu.run()
 print(f"\nvision thread {st['tid'] and hex(st['tid'])} entered InitializeVisionEngine at {st.get('t')}")
 log = st["log"]
 print(len(log), "syscalls; first 70:")
-for t, n, a, r in (lambda L: L[next((i for i, e in enumerate(L) if e[1].endswith(' kqueue')), 0):])(log)[:int(sys.argv[2]) if len(sys.argv) > 2 else 70]:
+for t, n, a, r in log[:int(sys.argv[2]) if len(sys.argv) > 2 else 70]:
     print(f"  {t:7.2f}s {n}  {a[0]:#x} {a[1]:#x} {a[2]:#x} {a[3]:#x} -> {r:#x}")
