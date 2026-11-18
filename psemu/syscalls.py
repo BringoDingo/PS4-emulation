@@ -615,6 +615,16 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         ("SceUserService", 0x30011): "_ipmi_user_id_one",      # GetInitialUser
     }
 
+    # An empty reply zeroes each small out buffer the caller declares, because the declared size
+    # is a CAPACITY: some clients declare more than their real buffer holds (a real server only
+    # writes what it returns). For those, cap how many bytes the empty reply may touch per out
+    # buffer. SceAutoMounterIpc 0x30023 declares out=[64, 4] but the 64-byte one is smaller on
+    # the caller's stack; zeroing all 64 bytes smashed the canary (guest abort in the stack-check
+    # tail) once boot got far enough to make the call.
+    IPMI_EMPTY_ZERO_CAP = {
+        ("SceAutoMounterIpc", 0x30023): 4,
+    }
+
     # The one registered/logged-in user. Real console user ids are 0x1xxxxxxx
     # values (the VSH's IsValidUserIdNative accepts only a high nibble of 1, 2
     # or 3), not small indexes.
@@ -718,10 +728,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             # 0x500-byte stack array as 2048, so filling it all overwrote the
             # stack canary (__stack_chk_fail after SceNpMgrIpc method 0x22).
             res = 0
+            cap = self.IPMI_EMPTY_ZERO_CAP.get((name, method), 0x40)
             for d, sz, info in call["out"]:
                 try:
                     if d and 0 < sz <= 0x40:
-                        uc.mem_write(d, bytes(sz))
+                        uc.mem_write(d, bytes(min(sz, cap)))
                     uc.mem_write(info + 16, struct.pack("<Q", 0))   # bytes returned
                 except Exception:
                     pass
@@ -1359,6 +1370,12 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         "CREATE TABLE IF NOT EXISTS tbl_cmdfunc (idx INT NOT NULL,cmdMsg BLOB NOT NULL,titleIdList BLOB,PRIMARY KEY(idx));"
     )
 
+    # category -> value, the slots DbAccessor::Init's version struct is filled from
+    # (struct offsets: appver 0, locale 4, region 8, appinfokeyver 0xc, appinfover 0x10,
+    # appbrowsever 0x14), set to the versions the engine itself expects.
+    _APP_DB_VERSIONS = (("appver", 68), ("locale", 1), ("region", 0), ("appinfokeyver", 5),
+                        ("appinfover", 1), ("appbrowsever", 23))
+
     def _build_app_db(self):
         """Provision a fresh application database with the schema eboot.bin's DB
         engine defines, the way the DB-preparation daemon would on first boot."""
@@ -1370,6 +1387,12 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         try:
             con = sqlite3.connect(path)
             con.executescript(self._APP_DB_DDL)
+            # DbAccessor::Init reads tbl_version by category into a version struct and
+            # compares it with the versions compiled into the engine (read at runtime:
+            # appver 68, appinfokeyver 5, appinfover 1, appbrowsever 23); an unset
+            # category stays -1 and is rejected (error 0x80f50044). A freshly
+            # provisioned database carries exactly the engine's current versions.
+            con.executemany("REPLACE INTO tbl_version VALUES(?, ?)", self._APP_DB_VERSIONS)
             con.commit()
             con.close()
             with open(path, "rb") as fh:

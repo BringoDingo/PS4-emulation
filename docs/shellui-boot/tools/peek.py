@@ -14,7 +14,14 @@ EXE = r"D:\Ps4Tools\ps4kernel\firmware\system_ex\app\NPXS20001\eboot.bin"
 FW = r"D:\Ps4Tools\ps4kernel\firmware"
 secs = float(sys.argv[1])
 addr = int(sys.argv[2], 16)
-specs = [(int(s.split(":")[0], 16), s.split(":")[1]) for s in sys.argv[3:]]
+specs = []
+for s_ in sys.argv[3:]:
+    loc, typ = s_.rsplit(":", 1)
+    if loc.startswith("r"):                       # register-relative, e.g. rbx+0x10
+        reg, _, off = loc.partition("+")
+        specs.append((reg, int(off, 16) if off else 0, typ))
+    else:
+        specs.append(("rbp", int(loc, 16), typ))
 emu = Emulator(EXE, fw_root=FW, backend="whp")
 emu.max_seconds = secs
 emu.max_modules = 80
@@ -27,18 +34,18 @@ def hit(e, uc):
     if st["n"] >= 8:
         return None
     st["n"] += 1
-    rbp = uc.reg_read(X.UC_X86_REG_RBP)
     tid = e.sched.current.tid if e.sched and e.sched.current else 0
     out = []
-    for off, typ in specs:
+    for reg, off, typ in specs:
         try:
+            base = uc.reg_read(getattr(X, "UC_X86_REG_" + reg.upper()))
             if typ == "d":
-                v = struct.unpack("<i", bytes(uc.mem_read(rbp + off, 4)))[0]
+                v = struct.unpack("<i", bytes(uc.mem_read(base + off, 4)))[0]
             else:
-                v = struct.unpack("<Q", bytes(uc.mem_read(rbp + off, 8)))[0]
-            out.append(f"[rbp{off:+#x}]={v:#x}({v})")
+                v = struct.unpack("<Q", bytes(uc.mem_read(base + off, 8)))[0]
+            out.append(f"[{reg}{off:+#x}]={v:#x}({v})")
         except Exception as ex:
-            out.append(f"[rbp{off:+#x}]=err{ex}")
+            out.append(f"[{reg}{off:+#x}]=err{ex}")
     print(f"[{e._time()-e._t0:7.2f}s] tid {tid:#x} @ {addr:#x}: " + "  ".join(out), flush=True)
     return None
 

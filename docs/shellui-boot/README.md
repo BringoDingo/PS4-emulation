@@ -227,3 +227,30 @@ Init is resolved.
 
 Tools added: `appdb_init.py` (AppDb client's syscalls around DbAccessor::Init), `who_corrupt.py`
 (native stack of the corruption-marker writer).
+
+## Update 2026-11-18 (night): app.db accepted - the shell passes the DB check and draws its home screen
+
+The whole app.db blocker was **missing `tbl_version` rows**, not the SQLite engine (so no SQLite shim
+was needed). How it was found (tools `xref.py`, `sdis.py`, `sqltrace.py`, `peek.py`):
+
+* Static analysis had been failing because of an address bug: the eboot's code/rodata LOAD segment
+  maps file offset 0x4000 -> vaddr 0, so `vaddr = 0x100000000 + file_off - 0x4000`.
+* The engine's SQLite wrapper (prepare 0x2d1700 / step 0x2d7800 / column 0x2d80d0) succeeded on
+  every query, so `0x80f50044` was not a SQLite error. It came from the version check in
+  `DbAccessor::Init` (0x23a5d0): the function `0x23b4f0` fills a version struct from `tbl_version`
+  rows by category (`appver`->[0], `locale`->[4], `region`->[8], `appinfokeyver`->[0xc],
+  `appinfover`->[0x10], `appbrowsever`->[0x14]); an unset category stays -1 and is rejected.
+* The engine's expected versions (read at runtime) are 68 / 1 / 0 / 5 / 1 / 23. The provisioned
+  app.db now carries exactly those rows (`_APP_DB_VERSIONS`), after which
+  `[AppDb] DbAccessor::Init() : 0`, no corruption marker, no recovery plugin: BootManager sets
+  0x80000 immediately and the flag set grows to include auto-login and all the layer scenes.
+
+Boot now reaches the real home-screen chrome (function-area icon row, user, clock, and a genuine
+"Less than 1.00 GB free in system storage" notification); the content area is empty (no installed
+titles in the app DB).
+
+New stub-service fallout, fixed: with boot further along, `SceAutoMounterIpc.method0x30023`
+(out=[64,4]) is called. An empty reply zero-filled the full *declared* 64 bytes, but the client's
+real buffer is smaller, so it smashed the stack canary (guest abort in the stack-check tail).
+`IPMI_EMPTY_ZERO_CAP` now caps how much of a declared out buffer an empty reply may touch for that
+method. (A real server writes only what it returns; the declared size is a capacity.)
