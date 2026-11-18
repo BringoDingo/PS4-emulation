@@ -269,3 +269,31 @@ the request by signalling its event flag). `0x8000000` is then set (~18.7 s), fo
 The home screen shows the function-area row, user, clock and a system notification; the content
 area is empty. Next: what stubbed service / data (installed titles in tbl_appinfo, SceLncService,
 SceAppContent...) populates the content row.
+
+## Update 2026-11-18 (night, later still): the app catalogue - tbl_appinfo / tbl_appbrowse_<uid>
+
+`psemu/appdb.py` (+ `sfo.py`, a param.sfo reader) now provisions the shell's application database
+the way the app-install / DB-preparation services would: version rows, `tbl_appinfo`, and the
+per-user tables from the engine's own DDL, with one entry per firmware app that has a
+`sce_sys/param.sfo` (43 titles: the browser, library, TV & Video, media player, ...).
+
+Findings that made this possible (tools `sqltrace.py`, `bindwatch.py`, `xref.py`, `sdis.py`):
+* `tbl_appinfo.key` holds key **names** from the engine's pool (`_title_id`, `TITLE`, `CONTENT_ID`,
+  `_metadata_path`, `PARENTAL_LEVEL`, `CATEGORY`, `#_contents_status`, ...; `#` = integer-valued),
+  not numbers: SQLite's dynamic typing allows text in the declared-INT column.
+* Per-user tables are named with the user id as `%010d` (`tbl_appbrowse_0268435457`,
+  `tbl_addon_0268435457`, `tbl_info_0268435457`); their DDL is a string in the engine
+  (49-column `tbl_appbrowse`). The engine checks the table with `sqlite_master`, then per title
+  runs `SELECT count(*) FROM tbl_appinfo WHERE titleId=?` - with no appinfo rows it never reads
+  the browse table at all.
+* The shell asks for a fixed set of system titles by id (NPXS20102/04/05/09/10/11/17/18/32/33,
+  CUSA02012) with `GetItemByTitleId`, then `SELECT key, val FROM tbl_appinfo WHERE titleId=?`.
+* `/common/mms/av_content.db` (media content) was missing and flagged corrupt, which the content
+  area depends on; it is now provisioned from the firmware's `template_content.db`.
+
+State: no DB errors or corruption flags remain; the ghosting on the status bar is gone. The
+ContentsList is created, creates its `AppBrowseItemIteratorFactory` item source, but
+`ContentsList.OnItemSourceUpdated` never fires, so no tiles are drawn yet. Next: find what the
+item source (Sce.Vsh.Lx) waits for - candidate values to check are the browse-row fields the
+engine filters on (`contentType`, `contentStatus`, `dispLocation`, `folderType`), which the DB
+daemon normally computes at install time (not derivable from param.sfo alone).

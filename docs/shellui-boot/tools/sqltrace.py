@@ -26,27 +26,78 @@ st = {"armed": False, "last": 0.0, "appdb": False}
 PREP, STEP, COL = 0x1002d1700, 0x1002d7800, 0x1002d80d0
 
 
+import re as _re
+_SQL = _re.compile(r"^\s*(SELECT|INSERT|REPLACE|UPDATE|DELETE|CREATE|PRAGMA|BEGIN|COMMIT|ROLLBACK|DROP|ALTER|ATTACH|VACUUM|WITH|END|SAVEPOINT|RELEASE)", _re.I)
+
+
+def _rd(uc, a, n):
+    return bytes(uc.mem_read(a, n))
+
+
 def read_stdstring(uc, p):
-    # libc++ std::string: if LSB of [p] is 0 -> long form {cap,size,data@+16}; else short (inline @ p+1)
-    try:
-        first = bytes(uc.mem_read(p, 24))
-        if first[0] & 1:  # short SSO: size in (first[0]>>1), data at p+1
-            n = first[0] >> 1
-            return first[1:1+n].decode("latin1", "replace")
-        ptr = struct.unpack("<Q", first[16:24])[0]
-        size = struct.unpack("<Q", first[8:16])[0]
-        if 0 < size < 400:
-            return bytes(uc.mem_read(ptr, size)).decode("latin1", "replace")
+    """The call sites pass the SQL in more than one string representation; try each and keep the
+    one that decodes to something that starts like SQL."""
+    cands = []
+    try:                                   # {?@0; union{char* heap; char inline[16]}@8; size@0x18; cap@0x20}
+        size, cap = struct.unpack("<QQ", _rd(uc, p + 0x18, 16))
+        if 0 < size < 4000:
+            if cap <= 0xF:
+                cands.append(_rd(uc, p + 8, size))
+            else:
+                cands.append(_rd(uc, struct.unpack("<Q", _rd(uc, p + 8, 8))[0], size))
     except Exception:
         pass
+    try:                                   # {ptr@0; inline@8; size@0x18; cap@0x20} (app string)
+        size, cap = struct.unpack("<QQ", _rd(uc, p + 0x18, 16))
+        if 0 < size < 4000:
+            cands.append(_rd(uc, p + 8, size) if cap <= 0xF else _rd(uc, struct.unpack("<Q", _rd(uc, p, 8))[0], size))
+    except Exception:
+        pass
+    try:                                   # libc++ short/long
+        first = _rd(uc, p, 24)
+        if first[0] & 1 == 0:
+            n = first[0] >> 1
+            cands.append(first[1:1 + n])
+        else:
+            cands.append(_rd(uc, struct.unpack("<Q", first[16:24])[0], min(struct.unpack("<Q", first[8:16])[0], 4000)))
+    except Exception:
+        pass
+    for off in (0, 8, 0x10):               # {ptr, size} / {size, ptr} / char* at p
+        try:
+            q = struct.unpack("<Q", _rd(uc, p + off, 8))[0]
+            if 0x100000 < q < 0x7fffffffffff:
+                cands.append(_rd(uc, q, 600).split(bytes([0]))[0])
+        except Exception:
+            pass
+    try:
+        cands.append(_rd(uc, p, 600).split(bytes([0]))[0])
+    except Exception:
+        pass
+    for c in cands:
+        t = c.decode("latin1", "replace")
+        if _SQL.match(t):
+            return t
     return None
 
 
 def prep(e, uc):
-    sql = read_stdstring(uc, uc.reg_read(X.UC_X86_REG_RSI))
+    st["n"] = st.get("n", 0) + 1
+    try:
+        sql = read_stdstring(uc, uc.reg_read(X.UC_X86_REG_RSI))
+    except Exception as ex:
+        print("prep error", ex, flush=True); return None
+    if sql is None and st["n"] <= 3:
+        _p = uc.reg_read(X.UC_X86_REG_RSI)
+        _sz, _cp = struct.unpack("<QQ", _rd(uc, _p + 0x18, 16))
+        _dp = struct.unpack("<Q", _rd(uc, _p + 8, 8))[0]
+        try:
+            _txt = _rd(uc, _p + 8, _sz) if _cp <= 0xF else _rd(uc, _dp, min(_sz, 90))
+        except Exception as _e:
+            _txt = repr(_e)
+        print(f"  [undecoded prepare #{st['n']}] size={_sz} cap={_cp} text={_txt!r}", flush=True)
     tid = e.sched.current.tid if e.sched and e.sched.current else 0
-    if sql and ("app" in (sql.lower()) or "tbl_" in sql or "sqlite_master" in sql or "PRAGMA" in sql or st["appdb"]):
-        print(f"[{e._time()-e._t0:7.2f}s] tid {tid:#x} prepare: {sql[:150]!r}", flush=True)
+    if sql:
+        print(f"[{e._time()-e._t0:7.2f}s] tid {tid:#x} prepare: {sql[:700]!r}", flush=True)
         st["appdb"] = True
         ret = struct.unpack("<Q", bytes(uc.mem_read(uc.reg_read(X.UC_X86_REG_RSP), 8)))[0]
         if ret not in e.hle.table:

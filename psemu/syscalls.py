@@ -1333,7 +1333,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         seed = self._db_seed_template(p)
         if seed == "@app_db":
             self.vfs[p] = self._build_app_db()
-            self.emu.log(f"  [db-seed] {p} provisioned (app-DB schema: tbl_version/tbl_appinfo/tbl_cmdfunc)")
+            self.emu.log(f"  [db-seed] {p} provisioned from the firmware app catalogue (appdb.py)")
             return self.vfs[p]
         if seed is not None:
             real = self.emu.resolve_path(seed)
@@ -1364,48 +1364,21 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     # "SELECT count(*) FROM sqlite_master WHERE name='tbl_version'". "@app_db"
     # builds exactly that schema with the host sqlite3. The voice-recognition DBs
     # are plain copies of their firmware masters.
+    # av_content.db is the media-content (photo/video) database; the firmware's read-only template
+    # carries its schema (tbl_PhotoVideo, tbl_Account, ...), copied into place on first use.
     _DB_SEED = {"/mms/app.db": "@app_db",
+                "/mms/av_content.db": "template_content.db",
+                "/mms/av_content_bg.db": "template_content_bg.db",
                 "/nui_data/voice/voice_gnd_gametitle.db": "master_voice_gnd_gametitle.db",
                 "/nui_data/voice/voice_gnd_systemcommand.db": "master_voice_gnd_systemcommand.db"}
 
-    _APP_DB_DDL = (
-        "CREATE TABLE IF NOT EXISTS tbl_version(category TEXT NOT NULL,status INT,PRIMARY KEY(category));"
-        "CREATE TABLE IF NOT EXISTS tbl_appinfo(titleId TEXT NOT NULL,key INT NOT NULL,val,PRIMARY KEY(titleId, key));"
-        "CREATE TABLE IF NOT EXISTS tbl_cmdfunc (idx INT NOT NULL,cmdMsg BLOB NOT NULL,titleIdList BLOB,PRIMARY KEY(idx));"
-    )
-
-    # category -> value, the slots DbAccessor::Init's version struct is filled from
-    # (struct offsets: appver 0, locale 4, region 8, appinfokeyver 0xc, appinfover 0x10,
-    # appbrowsever 0x14), set to the versions the engine itself expects.
-    _APP_DB_VERSIONS = (("appver", 68), ("locale", 1), ("region", 0), ("appinfokeyver", 5),
-                        ("appinfover", 1), ("appbrowsever", 23))
-
     def _build_app_db(self):
-        """Provision a fresh application database with the schema eboot.bin's DB
-        engine defines, the way the DB-preparation daemon would on first boot."""
+        """Provision a fresh application database with the schema, versions and system-app
+        catalogue the shell's DB engine expects (see appdb.py). PSEMU_APPDB_SQL names an extra
+        SQL file applied on top (development aid for schema/value discovery)."""
         import os
-        import sqlite3
-        import tempfile
-        fd, path = tempfile.mkstemp(suffix=".appdb")
-        os.close(fd)
-        try:
-            con = sqlite3.connect(path)
-            con.executescript(self._APP_DB_DDL)
-            # DbAccessor::Init reads tbl_version by category into a version struct and
-            # compares it with the versions compiled into the engine (read at runtime:
-            # appver 68, appinfokeyver 5, appinfover 1, appbrowsever 23); an unset
-            # category stays -1 and is rejected (error 0x80f50044). A freshly
-            # provisioned database carries exactly the engine's current versions.
-            con.executemany("REPLACE INTO tbl_version VALUES(?, ?)", self._APP_DB_VERSIONS)
-            con.commit()
-            con.close()
-            with open(path, "rb") as fh:
-                return bytearray(fh.read())
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        from .appdb import build_app_db
+        return build_app_db(self.emu.fw_root, extra_sql=os.environ.get("PSEMU_APPDB_SQL"))
 
     def _db_seed_template(self, p):
         for suf, tmpl in self._DB_SEED.items():
