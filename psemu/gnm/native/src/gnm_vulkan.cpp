@@ -1356,7 +1356,20 @@ u64 Xxh64(const u8* p, size_t len) {
     return h;
 }
 
+// Lazy write-back of guest-owned render targets. With gnm_set_lazy_writeback(1) a colour surface that
+// nobody but the GPU is known to read is not retiled into guest memory at the end of a submit
+// (gpu_newer: the image is newer than memory). The host is told to watch the surface's pages
+// (gnm_watch_events): a CPU access to them calls gnm_flush_range, which writes it back. Any GPU-side
+// access to the memory still goes through FlushRange as before.
+struct WatchEvent {
+    u64 addr, size, op;   // op 1 = start watching, 0 = stop
+};
+std::vector<WatchEvent> g_watch_events;
+bool g_lazy_release = false;
+u64 g_lazy_watched = 0;
+
 struct Surface {
+    bool watched{};              // host page-watch active for [address, address + footprint)
     u64 address{};
     u64 fingerprint{};           // XXH64 of the guest footprint right after the last write-back
     bool gpu_newer{};            // host-only surface: image newer than memory (write-back deferred)
@@ -1372,12 +1385,24 @@ struct Surface {
         return lo < address + footprint && address < hi;
     }
     ~Surface() {
+        if (watched) g_watch_events.push_back({address, footprint, 0});
         auto dev = Dev().dev;
         if (img.view) dev.destroyImageView(img.view);
         if (img.img) dev.destroyImage(img.img);
         if (img.mem) dev.freeMemory(img.mem);
     }
 };
+
+void SetLazyWatch(Surface& s, bool on) {
+    if (on && !s.watched) {
+        s.watched = true;
+        g_watch_events.push_back({s.address, s.footprint, 1});
+        ++g_lazy_watched;
+    } else if (!on && s.watched) {
+        s.watched = false;
+        g_watch_events.push_back({s.address, s.footprint, 0});
+    }
+}
 
 std::vector<std::unique_ptr<Surface>> g_surfaces;
 u32 g_surface_writebacks = 0;
@@ -1734,6 +1759,7 @@ void FlushRange(u64 lo, u64 hi) {
             c->dirty = true;
             WriteBack(*c);
             c->gpu_newer = false;
+            SetLazyWatch(*c, false);
             c->fingerprint = GuestFingerprint(*c);
             ++g_lazy_flushed;
         }
@@ -2545,8 +2571,21 @@ void ReleaseSurfaces() {
             s->gpu_newer = s->gpu_newer || s->dirty;   // defer: nobody but the host reads it
             s->dirty = false;
             ++g_lazy_skipped;
+        } else if (g_lazy_release) {
+            // defer too, but the guest CPU might read it: the host watches its pages
+            s->gpu_newer = s->gpu_newer || s->dirty;
+            s->dirty = false;
+            if (s->gpu_newer) {
+                SetLazyWatch(*s, true);
+                ++g_lazy_skipped;
+            }
         } else {
+            if (s->gpu_newer) {
+                s->dirty = true;     // a reused deferred surface: bring memory up to date
+            }
             WriteBack(*s);
+            s->gpu_newer = false;
+            SetLazyWatch(*s, false);
         }
     }
     for (auto& s : g_depth_surfaces) {
@@ -2672,6 +2711,29 @@ extern "C" GNM_API int gnm_device_name(char* out, int cap) {
         SetError(out, cap, e.what());
         return 1;
     }
+}
+
+// Defer end-of-submit write-backs of guest render targets (see WatchEvent). The host must watch the
+// ranges reported by gnm_watch_events and call gnm_flush_range on CPU access.
+extern "C" GNM_API void gnm_set_lazy_writeback(int on) {
+    std::lock_guard lk{g_mutex};
+    psemu::g_lazy_release = on != 0;
+}
+
+// Pops up to `cap` watch events as {addr, size, op} u64 triples (op 1 = watch, 0 = unwatch).
+// Returns the number of events written.
+extern "C" GNM_API int gnm_watch_events(uint64_t* out, int cap) {
+    std::lock_guard lk{g_mutex};
+    int n = 0;
+    auto& ev = psemu::g_watch_events;
+    while (n < cap && !ev.empty()) {
+        out[3 * n] = ev.front().addr;
+        out[3 * n + 1] = ev.front().size;
+        out[3 * n + 2] = ev.front().op;
+        ev.erase(ev.begin());
+        ++n;
+    }
+    return n;
 }
 
 extern "C" GNM_API void gnm_set_host_only_range(uint64_t lo, uint64_t hi) {

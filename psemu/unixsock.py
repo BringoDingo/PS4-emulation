@@ -441,6 +441,37 @@ class CompositorRing:
                         except Exception as e:
                             log(f"        {name}[{k}] -> {addr:#x}: unreadable ({e})")
 
+    # ---- lazy write-back of the compositor's render targets -------------------------------------
+    # The compositor's own surfaces are rendered and sampled by the GPU only. Instead of retiling
+    # them into guest memory after every submit, the backend defers that and asks us (watch events)
+    # to watch their pages: a guest CPU access (or a syscall reading the memory) traps, and the
+    # callback below writes the surface back before the access proceeds. Needs the WHP backend (its
+    # guest page tables make the trap possible); PSEMU_NO_LAZY_WB=1 turns it off.
+    def _lazy_ok(self, uc):
+        ok = getattr(self, "_lazy", None)
+        if ok is None:
+            ok = self._lazy = (hasattr(uc, "watch_add") and not os.environ.get("PSEMU_NO_LAZY_WB"))
+        return ok
+
+    def _apply_watch_events(self, uc):
+        for addr, size, op in self._backend.watch_events():
+            if op:
+                uc.watch_add(addr, size, self._watch_fire)
+            else:
+                uc.watch_remove(addr)
+
+    def _watch_fire(self, start, size):
+        """The guest (or a syscall) touched a lazily written-back surface: write it back now."""
+        self.watch_fires = getattr(self, "watch_fires", 0) + 1
+        try:
+            self._backend.flush_range(start, size)
+        except Exception as e:
+            self.server.sc.emu.log(f"  [compositor] lazy write-back flush failed: {e!r}")
+        try:
+            self._apply_watch_events(self.server.sc.emu.uc)
+        except Exception as e:
+            self.server.sc.emu.log(f"  [compositor] watch event handling failed: {e!r}")
+
     def _run_dcb(self, uc, dcb, size):
         """Execute one client command buffer; returns a log suffix."""
         emu = self.server.sc.emu
@@ -451,7 +482,16 @@ class CompositorRing:
                 self.dcb_bad += 1
                 return " [GPU: dcb not host-backed]"
             words = self._np.frombuffer(bytes(uc.mem_read(dcb, size)), dtype=self._np.uint32)
-            stats, err = self._backend.submit(self._patch_dcb(words))
+            patched = self._patch_dcb(words)
+            lazy = self._lazy_ok(uc)
+            if lazy:
+                self._backend.set_lazy_writeback(True)
+            try:
+                stats, err = self._backend.submit(patched)
+            finally:
+                if lazy:
+                    self._backend.set_lazy_writeback(False)
+                    self._apply_watch_events(uc)
         except Exception as e:
             self.dcb_bad += 1
             return f" [GPU: {e}]"

@@ -199,6 +199,10 @@ class WhpUc:
         self._xs_buf = (ctypes.c_ubyte * 16384)()
         self._timer = None
         self.slice_s = 0.004
+        # watched ranges (lazy GPU write-back): start -> [end, saved PTE slices, callback]
+        self._watch = {}
+        self._w_lo, self._w_hi = 1 << 62, 0
+        self.n_watch_hits = 0
         self._init_vcpu()
 
     # ------------------------------------------------------------------ firmware / vCPU setup
@@ -346,6 +350,8 @@ class WhpUc:
         return None
 
     def mem_read(self, addr, size):
+        if self._w_hi > addr and addr + size > self._w_lo:
+            self._watch_touch(addr, size)
         c = self._find(addr)
         if c is not None and addr + size <= c[1]:
             data = ctypes.string_at(c[2] + (addr - c[0]), size)
@@ -367,6 +373,8 @@ class WhpUc:
     def mem_write(self, addr, data):
         if not isinstance(data, (bytes, bytearray)):
             data = bytes(data)
+        if self._w_hi > addr and addr + len(data) > self._w_lo:
+            self._watch_touch(addr, len(data))
         if self._traps:
             data = self._repatch(addr, data)
         n = len(data)
@@ -462,6 +470,8 @@ class WhpUc:
 
     def _pt_fill(self, va, size, prot):
         """Identity-map [va, va+size) (GPA == VA) with `prot` (0 = not present)."""
+        if self._w_hi > va and va + size > self._w_lo:
+            self._watch_touch(va, size)          # the mapping changes under a watch: settle it first
         flags = np.uint64(_pte_flags(prot))
         a = va & MASK48
         end = a + size
@@ -484,6 +494,63 @@ class WhpUc:
         for k, g in enumerate(gpas):
             pt[i0 + k] = np.uint64(g | flags)
         self._tlb_dirty = True
+
+    # ------------------------------------------------------------------ watched pages
+    # watch_add() makes [addr, addr+size) (rounded out to pages) not-present in the guest page
+    # tables: the first guest access takes a #PF, which restores the PTEs and calls cb(start, size)
+    # (the owner brings the memory up to date, e.g. writes a lazily deferred GPU surface back)
+    # before the instruction is retried. Host-side mem_read/mem_write on the range do the same, so
+    # syscall handlers see current data. Ranges are disjoint: adding one that overlaps an existing
+    # watch settles (fires) the old one first.
+    def _recalc_watch(self):
+        if self._watch:
+            self._w_lo = min(self._watch)
+            self._w_hi = max(e for e, _, _ in self._watch.values())
+        else:
+            self._w_lo, self._w_hi = 1 << 62, 0
+
+    def watch_add(self, addr, size, cb):
+        lo = addr & ~(PAGE - 1)
+        hi = (addr + size + PAGE - 1) & ~(PAGE - 1)
+        self._watch_touch(lo, hi - lo)
+        saved = []
+        a = lo & MASK48
+        end = hi & MASK48
+        while a < end:
+            nxt = min(end, (a | 0x1FFFFF) + 1)
+            pt = self._get_pt(a)
+            i0 = (a >> 12) & 0x1FF
+            n = (nxt - a) >> 12
+            saved.append((a, n, pt[i0:i0 + n].copy()))
+            pt[i0:i0 + n] = 0
+            a = nxt
+        self._tlb_dirty = True
+        self._watch[lo] = [hi, saved, cb]
+        self._recalc_watch()
+
+    def _watch_restore(self, start):
+        rec = self._watch.pop(start, None)
+        if rec is None:
+            return None
+        end, saved, cb = rec
+        for a, n, arr in saved:
+            pt = self._get_pt(a)
+            i0 = (a >> 12) & 0x1FF
+            pt[i0:i0 + n] = arr
+        self._tlb_dirty = True
+        self._recalc_watch()
+        return end, cb
+
+    def watch_remove(self, addr):
+        # stop watching the range that starts at `addr` (page-rounded), without calling its cb
+        self._watch_restore(addr & ~(PAGE - 1))
+
+    def _watch_touch(self, addr, size):
+        for s in [s for s, rec in self._watch.items() if s < addr + size and addr < rec[0]]:
+            r = self._watch_restore(s)
+            if r is not None:
+                self.n_watch_hits += 1
+                r[1](s, r[0] - s)
 
     # ------------------------------------------------------------------ HLE traps (int3)
     def hle_add(self, addr):
@@ -685,6 +752,11 @@ class WhpUc:
             cb(self, intno, ud)
 
     def _page_fault(self, addr, err):
+        if self._watch and not err & 1 and self._w_lo <= addr < self._w_hi:
+            n = self.n_watch_hits
+            self._watch_touch(addr, 1)
+            if self.n_watch_hits != n:
+                return                                  # PTEs restored: the access retries
         present, write, fetch = err & 1, err & 2, err & 16
         if present and write and not fetch:
             for cb, ud in self._h_wprot:

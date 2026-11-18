@@ -197,6 +197,53 @@ def main():
     e = run(uc, code)
     check("access after unmap faults", isinstance(e, UcError) and faults and faults[0][1] == HI)
 
+    # 13) watched pages (lazy GPU write-back): a guest access traps once, the callback runs with the
+    #     PTEs already restored, and the access then retries and succeeds
+    # (same partition as above)
+    W = 0x700000
+    vm.map(W, 0x4000, UC_PROT_READ | UC_PROT_WRITE)
+    uc.mem_write(W + 0x1000, struct.pack("<Q", 0x1111))
+    fired = []
+
+    def on_watch(start, size):
+        fired.append((start, size))
+        uc.mem_write(W + 0x1000, struct.pack("<Q", 0x2222))         # "write the surface back"
+    uc.watch_add(W + 0x1000, 0x2000, on_watch)
+    code = bytes.fromhex("488b042500107000" "4889c3" "f4")           # mov rax,[W+0x1000]; mov rbx,rax; hlt
+    e = run(uc, code)
+    check("guest read of a watched page traps", fired == [(W + 0x1000, 0x2000)], "fired=%s" % fired)
+    check("callback's write is what the guest reads", uc.reg_read(X.UC_X86_REG_RBX) == 0x2222)
+    fired.clear()
+    uc.reg_write(X.UC_X86_REG_RBX, 0)
+    run(uc, code)
+    check("watch is one-shot (no trap after)", fired == [] and uc.reg_read(X.UC_X86_REG_RBX) == 0x2222)
+
+    uc.watch_add(W, 0x1000, on_watch)
+    e = run(uc, bytes.fromhex("48c7042500007000" "07000000"))         # mov qword [W],7  (guest write)
+    check("guest write to a watched page traps", fired == [(W, 0x1000)]
+          and struct.unpack("<I", uc.mem_read(W, 4))[0] == 7, "fired=%s" % fired)
+
+    fired.clear()
+    uc.watch_add(W + 0x2000, 0x1000, on_watch)
+    uc.mem_read(W + 0x2010, 8)
+    check("host mem_read of a watched page fires the callback", fired == [(W + 0x2000, 0x1000)])
+    fired.clear()
+    uc.watch_add(W + 0x2000, 0x1000, on_watch)
+    uc.mem_write(W + 0x2ff8, b"" * 8)
+    check("host mem_write of a watched page fires the callback", fired == [(W + 0x2000, 0x1000)])
+    fired.clear()
+    uc.mem_read(W + 0x3000, 8)
+    check("pages outside a watch are untouched", fired == [])
+
+    uc.watch_add(W, 0x1000, on_watch)
+    uc.watch_remove(W)
+    e = run(uc, bytes.fromhex("488b042500007000" "f4"))
+    check("watch_remove restores without a callback", fired == [] and isinstance(e, UcError)
+          and uc.n_watch_hits >= 4)
+    uc.watch_add(W, 0x2000, on_watch)
+    uc.watch_add(W + 0x1000, 0x1000, on_watch)                       # overlaps: old one is settled
+    check("overlapping watch settles the old one", fired == [(W, 0x2000)], "fired=%s" % fired)
+
     print("WhpUc self-test:", "PASS" if ok else "FAIL", "exits=%s" % uc.exits)
     return 0 if ok else 1
 

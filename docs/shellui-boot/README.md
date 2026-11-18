@@ -436,3 +436,35 @@ What is left in the GPU path (per 55 s): end-of-submit write-back of that surfac
 (GPU copy wait + retile + fingerprint), GPU execution ~7 s, shader translation ~4.5 s (10k misses: the
 exact cache keys on descriptor contents that change per draw), render-target setup ~3 s. Deferring the
 write-back needs a way to see CPU reads of the surface (WHP page protection); not done.
+
+## Update 2026-11-18 (late night): lazy write-back of the compositor's surfaces (page-watch)
+
+After direct sampling the biggest remaining cost was writing the 8 MB surface back to guest memory
+(GPU copy + wait + retile + fingerprint) at the end of every submit (~9 s of 55). Nobody reads it, but the
+guest CPU *might*, so it cannot simply be dropped. Now it is deferred and guarded by a page trap:
+
+* **Native** (`gnm_vulkan.cpp`): `gnm_set_lazy_writeback(1)` makes `ReleaseSurfaces` leave a dirty colour
+  surface in the GPU (`gpu_newer`, as host-only surfaces already were) and queue a watch event
+  `{addr, size, 1}` (`gnm_watch_events`). Every GPU-side access to that memory still goes through
+  `FlushRange`, which writes it back and queues the unwatch event. Eviction/destruction unwatches too.
+  A non-lazy submit writes a still-deferred surface back first.
+* **WhpUc** (`whp_uc.py`): `watch_add(addr, size, cb)` clears the pages' PTEs in the guest page tables
+  (we own them). The first guest access takes a #PF, the PTEs are restored, `cb(start, size)` runs and
+  the instruction retries. Host `mem_read`/`mem_write` (syscall handlers) and `_pt_fill` (remap/unmap)
+  on a watched range settle it the same way. Ranges are page-rounded and disjoint (an overlapping
+  `watch_add` fires the old one). The WHP self-test covers guest read/write traps, host access,
+  `watch_remove` and overlap (13 new checks).
+* **Compositor** (`unixsock.py`): only the compositor's own submits are lazy (toggled around each
+  `backend.submit`); the callback calls `backend.flush_range`. Needs the WHP backend (Unicorn has no
+  page trap, so it stays eager); `PSEMU_NO_LAZY_WB=1` disables it.
+
+Result (55 s WHP run): write-backs 1616 -> 4, mean native submit 6.1 -> 3.2 ms, command buffers
+completed 2946 -> 5712; flips in 70 s 1908 -> ~3000 (originally 1224); SceSysCore -> ShellUI chain:
+8500 command buffers in 70 s (was 4500), 0 failed draws. In the home screen nothing touches the surface, so
+the trap never fires in normal runs; a probe in `ring_split.py` (host read of the watched surface)
+shows one write-back and the watch released. Synctest/policytest/whp_uc_test pass.
+
+Known limits: kernel-side access to guest memory that bypasses `mem_read`/`mem_write` (native code
+reading guest pointers directly, other than the GPU backend itself) is not trapped; partial CPU writes
+into a lazily deferred surface are merged correctly only because the trap writes the GPU contents back
+first. A second `WhpUc()` in one process exits silently (pre-existing; the self-test reuses one).

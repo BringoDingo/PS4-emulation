@@ -78,6 +78,10 @@ def dll():
         _dll.gnm_profile.argtypes = [C.c_char_p, C.c_int, C.c_int]
         _dll.gnm_set_host_only_range.argtypes = [C.c_uint64, C.c_uint64]
         _dll.gnm_set_host_only_range.restype = None
+        _dll.gnm_set_lazy_writeback.argtypes = [C.c_int]
+        _dll.gnm_set_lazy_writeback.restype = None
+        _dll.gnm_watch_events.argtypes = [C.POINTER(C.c_uint64), C.c_int]
+        _dll.gnm_watch_events.restype = C.c_int
         _dll.gnm_flush_range.argtypes = [C.c_uint64, C.c_uint64, C.c_char_p, C.c_int]
         _dll.gnm_tiling.argtypes = [C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32, C.c_int,
                                     C.c_void_p, C.c_void_p, C.POINTER(C.c_uint64),
@@ -91,6 +95,23 @@ def profile(reset=True):
     buf = C.create_string_buffer(1024)
     dll().gnm_profile(buf, len(buf), 1 if reset else 0)
     return buf.value.decode(errors="replace")
+
+
+def set_lazy_writeback(on):
+    """While on, guest render targets are written back lazily: watch_events() reports the ranges the
+    host must watch for CPU access (and flush_range() on a hit)."""
+    dll().gnm_set_lazy_writeback(1 if on else 0)
+
+
+def watch_events():
+    """Drain the (addr, size, op) watch events; op 1 = start watching, 0 = stop."""
+    out = []
+    buf = (C.c_uint64 * 96)()
+    while True:
+        n = dll().gnm_watch_events(buf, 32)
+        out.extend((buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]) for i in range(n))
+        if n < 32:
+            return out
 
 
 def set_host_only_range(addr, nbytes):

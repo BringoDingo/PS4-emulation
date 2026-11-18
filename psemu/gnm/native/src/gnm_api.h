@@ -102,6 +102,13 @@ GNM_API int gnm_read_reg(uint32_t index, uint32_t* value);
 // reset != 0 clears the counters after reading.
 GNM_API int gnm_profile(char* out, int outlen, int reset);
 
+// Lazy write-back of guest render targets: while on, a colour surface is not retiled into guest
+// memory at the end of a submit; the host watches its pages (events from gnm_watch_events:
+// {addr, size, op} u64 triples, op 1 = watch / 0 = unwatch) and calls gnm_flush_range when the CPU
+// touches them.
+GNM_API void gnm_set_lazy_writeback(int on);
+GNM_API int gnm_watch_events(uint64_t* out, int cap);
+
 // GCN surface tiling (CPU). mode = Gnm tile-mode index (CB_COLOR_ATTRIB /
 // T# tiling_index), pitch/height in pixels (or 4x4 blocks). direction > 0
 // tiles linear `src` (rows of `pitch` pixels) into `dst`; <= 0 detiles.

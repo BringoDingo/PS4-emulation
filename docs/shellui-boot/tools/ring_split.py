@@ -74,3 +74,19 @@ try:
     print("native profile:", _b.profile(reset=False))
 except Exception as e:
     print("profile unavailable", e)
+print("watch hits (guest/host accesses to lazily written-back surfaces):",
+      getattr(emu.uc, "n_watch_hits", None), " compositor fires:",
+      getattr(srv.ring, "watch_fires", None) if srv is not None else None)
+# probe: touching a lazily written-back surface must write it back first
+w = getattr(emu.uc, "_watch", {})
+print("watched ranges at exit:", [(hex(s), hex(e - s)) for s, (e, _, _) in w.items()])
+if w:
+    s0 = min(w)
+    nz_before = sum(1 for b in bytes(emu.uc._find(s0) and __import__("ctypes").string_at(emu.uc._find(s0)[2] + (s0 - emu.uc._find(s0)[0]), 1 << 20)) if b)
+    wb0 = getattr(__import__("psemu.gnm.backend", fromlist=["x"]), "profile")(reset=False)
+    emu.uc.mem_read(s0 + 0x100, 16)             # host access -> fires -> write-back
+    nz_after = sum(1 for b in __import__("ctypes").string_at(emu.uc._find(s0)[2] + (s0 - emu.uc._find(s0)[0]), 1 << 20) if b)
+    wb1 = __import__("psemu.gnm.backend", fromlist=["x"]).profile(reset=False)
+    import re
+    g = lambda t: re.search(r" wb=(\d+)", t).group(1)
+    print(f"probe: guest memory non-zero bytes in first MB before {nz_before} after {nz_after}; wb {g(wb0)} -> {g(wb1)}; still watched: {s0 in emu.uc._watch}")
