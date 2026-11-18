@@ -508,3 +508,24 @@ longer swallowed: it is attached to the original write-back error (`add_note`). 
 has two new cases (the 2nd of 3 events fails -> 1st applied, rest retained, retry applies each once in
 order; a failing re-arm is reported with the write-back failure). Lazy-writeback and WHP tests were
 repeated 5x each: all pass.
+
+## Update 2026-11-18 (night): what the pad stack needs (DualShock 4 input, first look)
+
+The shell logs `[ScePsP:InputCtrl] LOST PAD DATA: Nmsec` repeatedly: it expects pad data and gets none.
+`tools/hid_trace.py` (syscalls on /dev/hid with caller stacks) and `tools/hid_ioctls.py` (request codes
+compiled into the binaries) show:
+
+* `libScePad` (and a statically linked copy inside the ShellUI `eboot.bin`) talk to **`/dev/hid`** through
+  ioctls only - no read(), no mmap, no kevent on the fd. (`/dev/ctrlp_sync` is also referenced but not
+  opened in 45 s.) `/dev/hid` is not a modelled device in `psemu/devices.py`, so the open succeeds
+  generically and every ioctl returns 0 with the argument untouched.
+* The interface is ~45 `'H'`-group ioctls (`libScePad` 45, `libSceHidControl` 19, eboot 29), all of the
+  form *small struct with an output pointer + arguments in, kernel writes through the pointer*, e.g.
+  `0x80084809` `{u32 3; u32 type}` (open/version) and `0x8010480f` `{u64 *out; u32 arg}` where the
+  wrapper returns the u64 the kernel wrote (called ~33 times/s from managed code via
+  `platform.dll` -> `eboot.bin+0x9fa9e`, arg values 0 / 0x20 / 2 ...). The pad-state read is probably
+  one of nr 0x45 (`0x80184845`, 6 call sites), 0x2e (`0x8030482e`, 4), 0x29 or 0x2a.
+* So input needs a modelled `HidDevice`: decode each request, answer "one DualShock 4 connected,
+  idle" with consistent structures, then feed button/stick state from the host (keyboard/XInput).
+  Next step is to reverse the structures from the call sites (static: `tools/elfdis.py`, `sdis.py`;
+  dynamic: `hid_trace.py` with a fake device that logs all requests the stack makes).
