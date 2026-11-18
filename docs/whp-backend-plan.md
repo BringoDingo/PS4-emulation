@@ -121,3 +121,15 @@ Facts learned while building it (probed, not documented):
 * WHP accepts GPAs anywhere (tested to 2^48), partial/overlapping unmaps and remaps.
 * Do not switch threads mid single-step: TF travels with the saved context.
 * Virtual time is wall-clock; runs are not deterministic. The Unicorn backend stays the reference.
+
+## Full boot: SceSysCore, then the app (2026-11-18)
+
+    python -m psemu.run <fw>/system/sys/SceSysCore.elf --fw-root <fw> --backend whp --spawn-mode stay         --then <fw>/system_ex/app/NPXS20001/eboot.bin --max-seconds 90 --max-modules 80
+
+SceSysCore boots on WHP (orbis_audiod spawn retired, 25 threads, SceMbusIpc / SceSysCoreApp /
+SceSysCoreApp2 servers up, ~8 s). `--then` then replaces the image the way execve() does (fresh
+address space, fds / event flags / named objects inherited, the old process's IPMI servers dropped)
+and the app starts in libkernel as the dynamic interpreter. Result: the same EvalBase stall as
+launching the app directly (same BootManager wait flags, 4 flips, 102 threads), so SceSysCore's
+initialization does not supply what EvalBase is waiting for.
+Note: SceSysCore spins on the unresolved `W7Vpt62Xtf4` button poll (1.2M calls/min), harmless but noisy.

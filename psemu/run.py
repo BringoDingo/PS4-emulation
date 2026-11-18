@@ -42,6 +42,11 @@ def main():
     ap.add_argument("--max-seconds", type=float, default=None,
                     help="wall-clock budget; the stop condition on --backend whp, where there "
                          "is no instruction count")
+    ap.add_argument("--then", default=None, metavar="APP_EBOOT",
+                    help="whp: after the first process (SceSysCore) has initialized its core "
+                         "services, chain-load this app (e.g. .../NPXS20001/eboot.bin)")
+    ap.add_argument("--then-settle", type=float, default=5.0,
+                    help="seconds the core gets after its last service is up (default 5)")
     ap.add_argument("--gpu-profile", action="store_true",
                     help="log per-phase GPU executor time after every /dev/gc submit")
     args = ap.parse_args()
@@ -50,6 +55,8 @@ def main():
     emu = Emulator(args.file, trace=args.trace, max_insns=args.max,
                    fw_root=args.fw_root, backend=args.backend)
     emu.max_seconds = args.max_seconds
+    emu.then_path = args.then
+    emu.then_settle = args.then_settle
     emu.max_modules = args.max_modules
     emu.spawn_mode = args.spawn_mode
     emu.gpu_enabled = not args.no_gpu

@@ -68,6 +68,11 @@ class Emulator:
         self._t0 = time.perf_counter()
         self._time = time.perf_counter
         self.max_seconds = None        # whp: wall-clock budget (an instruction budget is meaningless)
+        # --then: once the first process (SceSysCore) has brought its services up, chain-load this
+        # one (the app, entered through libkernel as the interpreter); whp only
+        self.then_path = None
+        self.then_settle = 5.0         # seconds of SceSysCoreApp2 being up before the handoff
+        self._then_seen = None
         self.path = path
         self.trace = trace
         self.max_insns = max_insns
@@ -566,6 +571,30 @@ class Emulator:
     def _whp_tick(self):
         if self.max_seconds is not None and self._time() - self._t0 >= self.max_seconds:
             self.stop(f"wall-clock budget reached ({self.max_seconds:g} s)")
+        if self.then_path is not None:
+            self._check_then()
+
+    def _check_then(self):
+        """Core-initialized -> app handoff. SceSysCore is "initialized" once its SceSysCoreApp2 IPMI
+        server exists (the last service its boot registers) and has had `then_settle` seconds to
+        finish. Then the process image is replaced the way execve() does it -- fresh address
+        space, the kernel-side state (fds, event flags, named objects) inherited -- by the app,
+        which starts in libkernel acting as the interpreter."""
+        servers = getattr(self.syscalls, "_ipmi_servers", {})
+        if "SceSysCoreApp2" not in servers:
+            return
+        now = self._time()
+        if self._then_seen is None:
+            self._then_seen = now
+            return
+        if now - self._then_seen < self.then_settle:
+            return
+        path, self.then_path = self.then_path, None
+        self.log(f"\n== core initialized after {now - self._t0:.1f} s "
+                 f"({len(servers)} IPMI services up) -> linking into {path} ==")
+        servers.clear()                     # the old process's services die with it
+        self.app_root = os.path.dirname(os.path.abspath(path))
+        self.exec_module(path, [path])
 
     def _native_stop(self):
         """The native hook stopped the CPU before the instruction at
