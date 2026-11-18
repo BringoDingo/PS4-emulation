@@ -1,5 +1,26 @@
 # ShellUI (NPXS20001) boot investigation
 
+## Current status (read this first; the sections below are a chronological log)
+
+Last updated after commit 7ccee36. The log below is append-only, so earlier sections describe
+problems that later sections solved: do not read an intermediate section as the current state.
+
+* **Done:** WHP backend boot to the ShellUI home screen; DB provisioning (app.db / tbl_appinfo /
+  tbl_appbrowse_<uid>); **the home-screen content row renders** (22 firmware apps from param.sfo, icons,
+  focused tile, title, info panel - the `ContentsList.OnItemSourceUpdated` stall described under
+  "where the home-screen content list stops" was fixed in "the home screen draws its content row":
+  the list filters on `dispLocation`/`folderType`/`presentBoxStatus`); native GPU abort fixed;
+  compositor ~5x faster (direct sampling, parallel tiler, lazy write-back behind a WHP page watch);
+  network-listener CPU spin fixed; SceMbusIpc device list + `/dev/hid` model (a DualShock 4 registers and
+  `scePadReadState` is polled).
+* **Open, in order:** (1) with a pad attached (`PSEMU_PAD` != off, default off) the main thread parks on a
+  libScePsm Mono semaphore nobody posts (`addr_sync.py` / `mod_hooks.py` are the tools; do not fake the
+  post); (2) compositor frame spikes of 400-600 ms (shader translation misses, texture uploads) cause the
+  `LOST PAD DATA` lines; (3) the username shows "Unknown" (ProfileCache `_GetLocalUserInfoNative`); (4) app
+  launch via SceLncService / separate app processes; remaining stub IPC services.
+* **Constraints:** only GPL-2.0-or-later code may be reused; no firmware is committed.
+
+
 Notes, derived logs and analysis tools from running the PS4 5.05 system UI under psemu
 (2026-11). Everything here was produced by psemu or by reading the metadata of a
 firmware dump you supply yourself. **No firmware, shader binaries, command-buffer
@@ -298,7 +319,7 @@ item source (Sce.Vsh.Lx) waits for - candidate values to check are the browse-ro
 engine filters on (`contentType`, `contentStatus`, `dispLocation`, `folderType`), which the DB
 daemon normally computes at install time (not derivable from param.sfo alone).
 
-## Update 2026-11-18 (night): where the home-screen content list stops
+## Update 2026-11-18 (night): where the home-screen content list stops (SUPERSEDED: see "the home screen draws its content row")
 
 Traced following the investigation plan (tools `sqltrace2.py`, `cil_calls.py`, `sqlcore.py`,
 `trace_methods.py`). The first expected record is **not** lost in the database:
