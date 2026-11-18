@@ -1315,6 +1315,75 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 return self.vfs[p]
             except OSError:
                 return None
+        seed = self._db_seed_template(p)
+        if seed == "@app_db":
+            self.vfs[p] = self._build_app_db()
+            self.emu.log(f"  [db-seed] {p} provisioned (app-DB schema: tbl_version/tbl_appinfo/tbl_cmdfunc)")
+            return self.vfs[p]
+        if seed is not None:
+            real = self.emu.resolve_path(seed)
+            if real and os.path.isfile(real):
+                try:
+                    with open(real, "rb") as fh:
+                        self.vfs[p] = bytearray(fh.read())
+                    self.emu.log(f"  [db-seed] {p} initialized from template {seed}")
+                    return self.vfs[p]
+                except OSError:
+                    return None
+        return None
+
+    # The /priv/mms media-management databases (app content, thumbnails) are user
+    # data the firmware does not ship: on first boot the DB-preparation daemon
+    # creates each one from a read-only template under mms_ro. psemu has no such
+    # daemon (its SceDbPreparationServer is an IPMI stub), so the content engine
+    # would open app.db, find nothing, mark it corrupt and ask for a rebuild that
+    # never runs. Standing in for the daemon, seed the live DB from its template
+    # the first time it is opened, so the engine finds a valid database.
+    # live-path suffix -> firmware master/template basename (resolve_path finds it
+    # by basename anywhere in the tree). Content DBs come from mms_ro templates;
+    # the voice-recognition DBs from recognition/voice/database masters.
+    # app.db is the application database: the content engine opens it O_RDWR (no
+    # O_CREAT), so a missing one cannot be created in place and is declared
+    # corrupt. Its schema (tbl_version / tbl_appinfo / tbl_cmdfunc, "CREATE TABLE
+    # IF NOT EXISTS") is compiled into eboot.bin; the engine validates it with
+    # "SELECT count(*) FROM sqlite_master WHERE name='tbl_version'". "@app_db"
+    # builds exactly that schema with the host sqlite3. The voice-recognition DBs
+    # are plain copies of their firmware masters.
+    _DB_SEED = {"/mms/app.db": "@app_db",
+                "/nui_data/voice/voice_gnd_gametitle.db": "master_voice_gnd_gametitle.db",
+                "/nui_data/voice/voice_gnd_systemcommand.db": "master_voice_gnd_systemcommand.db"}
+
+    _APP_DB_DDL = (
+        "CREATE TABLE IF NOT EXISTS tbl_version(category TEXT NOT NULL,status INT,PRIMARY KEY(category));"
+        "CREATE TABLE IF NOT EXISTS tbl_appinfo(titleId TEXT NOT NULL,key INT NOT NULL,val,PRIMARY KEY(titleId, key));"
+        "CREATE TABLE IF NOT EXISTS tbl_cmdfunc (idx INT NOT NULL,cmdMsg BLOB NOT NULL,titleIdList BLOB,PRIMARY KEY(idx));"
+    )
+
+    def _build_app_db(self):
+        """Provision a fresh application database with the schema eboot.bin's DB
+        engine defines, the way the DB-preparation daemon would on first boot."""
+        import os
+        import sqlite3
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".appdb")
+        os.close(fd)
+        try:
+            con = sqlite3.connect(path)
+            con.executescript(self._APP_DB_DDL)
+            con.commit()
+            con.close()
+            with open(path, "rb") as fh:
+                return bytearray(fh.read())
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _db_seed_template(self, p):
+        for suf, tmpl in self._DB_SEED.items():
+            if p.endswith(suf):
+                return tmpl
         return None
 
     def _visdir(self, path):

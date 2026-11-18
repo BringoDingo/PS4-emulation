@@ -201,3 +201,29 @@ is absent and not being created, instead of a permissive empty fd whose writes w
 dropped. Verified it does not regress the boot (flags still reach `0x400`) nor the SceSysCore->ShellUI
 `--then` chain (runs clean to budget, exit 0). It does not by itself prevent the corruption verdict,
 because the fresh-DB creation path also goes through the stub app-DB service.
+
+## Update 2026-11-18 (later): DB provisioning - voice DB fixed, app.db scoped
+
+The "database corrupt -> rebuild" verdict comes from the content engine (statically linked in
+eboot.bin) on a worker thread, purely file-side (no daemon call). Several user-data databases the
+firmware does not ship are provisioned on first boot from a read-only master/template; with no
+provisioning they are opened O_RDWR (no O_CREAT), fail, and are declared corrupt.
+
+`syscalls.py` now stands in for that first-boot provisioning in `_vfile` (`_DB_SEED`):
+- `/priv/nui_data/voice/voice_gnd_gametitle.db` <- firmware master `master_voice_gnd_gametitle.db`
+  (and the systemcommand variant). **This clears that DB's corruption flag** - confirmed: the
+  `DbCorruptionOccured ... voice_gnd_gametitle.db` line is gone.
+- `/priv/mms/app.db` is the *application* database (not the photo/video content DB). Its schema is
+  compiled into eboot.bin - `tbl_version`, `tbl_appinfo`, `tbl_cmdfunc` ("CREATE TABLE IF NOT
+  EXISTS"), validated with `SELECT count(*) FROM sqlite_master WHERE name='tbl_version'`. psemu now
+  generates a correct app.db with the host `sqlite3` from that exact DDL ("@app_db").
+
+app.db still ends up flagged corrupt, but the cause is **not** the file: empty / full-schema /
+schema-with-version-row all give the same `[AppDb] InitClient()[444]: DbAccessor::Init() :
+80f50044`. So `DbAccessor::Init` fails for a reason independent of app.db's contents (an app-DB
+client-init step, error family 0x80f500xx), which is the next thing to reverse. The provisioning is
+kept because it is correct (the engine expects app.db to exist with this schema) and is needed once
+Init is resolved.
+
+Tools added: `appdb_init.py` (AppDb client's syscalls around DbAccessor::Init), `who_corrupt.py`
+(native stack of the corruption-marker writer).
