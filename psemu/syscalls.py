@@ -223,7 +223,9 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         # in on first open, so writes never touch the dump on disk; files the
         # guest creates (databases, journals, flags) live here for the run.
         self.vfs = {}
-        self.vdirs = set()        # directories the guest created
+        # the SQLite temp-file directory (osStat("//sqlite") in the engine's orbis VFS) exists on a
+        # console; without it the managed SQLite layer logs orbisTempFileDir ERROR at every open
+        self.vdirs = {"/sqlite"}  # directories the guest created (plus system dirs that must exist)
         self.vgone = set()        # firmware paths the guest deleted
         self.dirfds = set()       # fds opened on a directory
         self._cil_cache = {}      # .dll path -> CIL bytes extracted from .dll.sprx

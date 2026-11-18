@@ -297,3 +297,46 @@ ContentsList is created, creates its `AppBrowseItemIteratorFactory` item source,
 item source (Sce.Vsh.Lx) waits for - candidate values to check are the browse-row fields the
 engine filters on (`contentType`, `contentStatus`, `dispLocation`, `folderType`), which the DB
 daemon normally computes at install time (not derivable from param.sfo alone).
+
+## Update 2026-11-18 (night): where the home-screen content list stops
+
+Traced following the investigation plan (tools `sqltrace2.py`, `cil_calls.py`, `sqlcore.py`,
+`trace_methods.py`). The first expected record is **not** lost in the database:
+
+1. **Title lookups succeed.** `SELECT <49 cols> FROM tbl_appbrowse_<uid> WHERE titleId=?1` returns
+   the row with our values for each default title the shell asks for by id. After the shell's own
+   `UPDATE ... visible=?9` writes (it hides Share Play and TV & Video itself), 9 of the 11 titles
+   are `visible=1`.
+2. **The list pipeline runs.** `ContentsList` -> `AccessorItemSource.StartQuery` -> a `QueryJob`
+   on a worker -> `AccessorIterator` -> `OnQueryFinished` all execute.
+3. **The iterator reports 0 items.** `AccessorIterator.GetCount` returns 0 because
+   `EnhancedAppBrowseItemAccessor.GetTotalCount -> AppBrowseItemAccessor.ExecuteCountQuery` (it
+   builds a FROM/WHERE clause from the accessor's filter type) returns 0 - in the same
+   millisecond, and no filtered count/list statement ever reaches the native `AppDb` SQLite
+   wrapper. That query goes through the *managed* `Sce.Vsh.Db.Shared`/`Sce.Vsh.SQLite` layer
+   (a separate connection, `//priv/mms/app.db` opened ReadOnly), which the wrapper-level SQL
+   tools cannot see. With zero items `ContentsList.OnItemSourceUpdated` has nothing to deliver,
+   which is exactly the observed symptom (plan case B: iterator produces zero items).
+
+Note: the engine's own SQL fragment `WHERE visible <> 0 AND ((contentType & ?1) <> 0 OR
+(contentType & ?2) <> 0)` ANDs `contentType` against masks, so a NULL `contentType` can never
+match; the controlled experiments below vary that one field.
+
+### Controlled experiments (plan priority 3) and result
+
+Fresh emulator process and freshly generated app.db per run, one field changed. `contentType` set
+to 0, 1, 2, 4, 8, 65535 (and NULL as the baseline): `AccessorIterator.GetCount` returned **0 in
+every run**, including 65535 which satisfies any mask. So the filtered count does not depend on
+`contentType` (or on the row data at all); `contentType` is ruled out as the cause. (The 16 run
+did not reach the QueryJob inside its 34 s window - WHP timing varies.)
+
+One environment fix came out of this: the engine's orbis SQLite VFS stat()s `//sqlite` for its
+temp-file directory and logged `orbisTempFileDir ERROR ... returned 0x2` at every managed open.
+`/sqlite` now exists in the virtual filesystem (the error is gone); it did not change the count.
+
+State: stage identified (iterator count query returns 0 before reaching the native SQLite
+wrapper, via the managed Sce.Vsh.Db.Shared / Sce.Vsh.SQLite connection). Still to establish
+*why* the managed query yields 0: the managed layer reuses a cached connection (ConnectionManager
+logs Open ReadOnly x2 then Close key[...app.dbReadOnly]), so a closed/invalid cached connection
+is a candidate. The managed SQLite natives (Prepare2Native/StepNative in Sce.Vsh.SQLite) are not
+reachable by the wrapper-level tools; hooking them is the next step.
