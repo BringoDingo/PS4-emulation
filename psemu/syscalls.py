@@ -570,7 +570,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     # SetVideoOutputColorEffect at boot) by signalling its event flag; unsignalled,
     # that boot task never finishes and BootManager's background-init join, and
     # with it the scene start-up, waits forever.
-    IPMI_EVF_SATISFY = frozenset({"SceVideoCoreServer", "SceAvSettingIpc"})
+    # SceShellCoreUtil: ShellCore answers requests such as ChangeRunLevel (issued by
+    # BootManager.BackgroundInitDaemons) by signalling completion on its event flag;
+    # unsignalled, that thread parks forever and never sets boot flag 0x8000000, which
+    # ResetSurfaceRect and the remote-play controller wait for.
+    IPMI_EVF_SATISFY = frozenset({"SceVideoCoreServer", "SceAvSettingIpc", "SceShellCoreUtil"})
 
     def _ipmi_service_name(self, uc, in_ptr, size):
         import struct

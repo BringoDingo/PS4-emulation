@@ -254,3 +254,18 @@ New stub-service fallout, fixed: with boot further along, `SceAutoMounterIpc.met
 real buffer is smaller, so it smashed the stack canary (guest abort in the stack-check tail).
 `IPMI_EMPTY_ZERO_CAP` now caps how much of a declared out buffer an empty reply may touch for that
 method. (A real server writes only what it returns; the declared size is a capacity.)
+
+## Update 2026-11-18 (night, later): ChangeRunLevel completion - boot flag 0x8000000
+
+After the app.db fix the only boot-flag wait still unsatisfied was `0x8000000` (set by
+`BackgroundInitDaemons`; `ResetSurfaceRect` and the remote-play controller wait on it).
+`BackgroundInitDaemons` calls `ShellCoreUtilWrapper.ChangeRunLevel`, which blocks in
+`sceSystemService` on an IPMI **event flag of SceShellCoreUtil** - ShellCore signals it when the
+run-level change completes. psemu's stub never did, so the thread parked forever.
+`SceShellCoreUtil` is now in `IPMI_EVF_SATISFY` (same model as SceAvSettingIpc: the service answers
+the request by signalling its event flag). `0x8000000` is then set (~18.7 s), followed by
+`0x20000000`; the wait fires once (no spin). Every boot flag the shell waits on is now set.
+
+The home screen shows the function-area row, user, clock and a system notification; the content
+area is empty. Next: what stubbed service / data (installed titles in tbl_appinfo, SceLncService,
+SceAppContent...) populates the content row.
