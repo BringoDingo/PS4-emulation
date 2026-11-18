@@ -1,3 +1,23 @@
+First of all, this is almost entirely driven by Claude AI. I'm fairly certain
+that I could achoeve the same results using a different LLM,
+or by reverse engineering the binaries myself.
+i just dont want to. 
+
+the aim of this project is to run the PS4 on my pc, no tricks.
+i would like to open the program, and have a ps4 fire up using my hardware.
+it most certainly only benefits me, but if youd like you can try it. 
+you can import your own firmware and binaries, or you can wait for me to
+finish everything, and ill compile it all under one umbrella
+as best as i can.
+
+
+
+
+
+
+
+
+
 # PS4-emulation (psemu)
 
 An experimental PlayStation 4 (firmware 5.05) system emulator written in Python,
