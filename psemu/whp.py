@@ -165,8 +165,9 @@ class Partition:
 
     def set_regs(self, pairs, vp=0):
         n = len(pairs)
-        names = (ctypes.c_int * n)(*[k for k, _ in pairs])
-        vals = (WHV_REGISTER_VALUE * n)()
+        cap = max(n, 2)                 # WHP over-reads the arrays by an entry; pad to avoid a fault
+        names = (ctypes.c_int * cap)(*[k for k, _ in pairs])
+        vals = (WHV_REGISTER_VALUE * cap)()
         for i, (_, v) in enumerate(pairs):
             if isinstance(v, WHV_REGISTER_VALUE):
                 vals[i] = v
@@ -177,8 +178,9 @@ class Partition:
 
     def get_regs(self, names, vp=0):
         n = len(names)
-        arr = (ctypes.c_int * n)(*names)
-        vals = (WHV_REGISTER_VALUE * n)()
+        cap = max(n, 2)
+        arr = (ctypes.c_int * cap)(*names)
+        vals = (WHV_REGISTER_VALUE * cap)()
         _chk(dll().WHvGetVirtualProcessorRegisters(self.h, vp, arr, n, vals),
              "WHvGetVirtualProcessorRegisters")
         return [vals[i].Reg64 for i in range(n)]
@@ -270,8 +272,110 @@ def _selftest():
     print("  long-mode + mem + I/O exit: %s (io=%#x wrote=%#x rbx=%#x halt=%#x)"
           % ("PASS" if ok2 else "FAIL", r1, wrote, rbx, r2))
 
-    print("WHP self-test:", "PASS" if (ok1 and ok2) else "FAIL")
-    return 0 if (ok1 and ok2) else 1
+    ok3 = _test_syscall()
+    ok4 = _test_umtx_fastpath()
+    ok5 = _test_context()
+    allok = ok1 and ok2 and ok3 and ok4 and ok5
+    print("WHP self-test:", "PASS" if allok else "FAIL")
+    return 0 if allok else 1
+
+
+def _longmode_part(code_at_4000, stub_at_6000=None):
+    """A 2 MB identity-mapped long-mode guest with `code` at 0x4000 (and an optional LSTAR stub
+    at 0x6000). Returns (Partition, host_addr) with the vCPU set to enter at 0x4000."""
+    SIZE = 0x200000
+    host = _alloc(SIZE)
+    for off, v in ((0x1000, 0x2003), (0x2000, 0x3003), (0x3000, 0x0083)):
+        ctypes.memmove(host + off, struct.pack("<Q", v), 8)
+    ctypes.memmove(host + 0x4000, code_at_4000, len(code_at_4000))
+    if stub_at_6000:
+        ctypes.memmove(host + 0x6000, stub_at_6000, len(stub_at_6000))
+    p = Partition()
+    p.map_gpa(host, 0, SIZE)
+    return p, host
+
+
+def _test_syscall():
+    """Guest `syscall` -> our LSTAR stub -> host services it -> return to user (restore RIP from
+    the saved RCX). psemu owns the syscall MSRs; the guest is ring3 with no guest kernel."""
+    user = bytes.fromhex("b82a000000" "bf11110000" "0f05" "4889c3" "f4")  # eax=42;edi=0x1111;syscall;rbx=rax;hlt
+    p, host = _longmode_part(user, stub_at_6000=b"\xf4")
+    with p:
+        p.set_regs([(CR3, 0x1000), (CR4, 0x20), (CR0, 0x80000011), (EFER, 0x501),  # EFER.SCE
+                    (STAR, 0x0000000800000000), (LSTAR, 0x6000), (SFMASK, 0x0),
+                    (CS, seg(0, 0x08, ATTR_CODE64)), (SS, seg(0, 0x10, ATTR_DATA)),
+                    (DS, seg(0, 0x10, ATTR_DATA)), (ES, seg(0, 0x10, ATTR_DATA)),
+                    (RIP, 0x4000), (RFLAGS, 0x2)])
+        r1 = p.run()
+        rax, rdi, rcx, rip = p.get_regs([RAX, RDI, RCX, RIP])
+        in_stub = 0x6000 <= rip <= 0x6002
+        p.set_regs([(RAX, rax * 2), (RIP, rcx)])    # service: result=nr*2, return to user
+        r2 = p.run()
+        rbx = p.get_regs([RBX])[0]
+    ok = (r1 == EXIT_HALT and in_stub and rax == 42 and rdi == 0x1111 and r2 == EXIT_HALT and rbx == 84)
+    print("  guest syscall -> host dispatch: %s (nr=%d arg0=%#x result=%d)"
+          % ("PASS" if ok else "FAIL", rax, rdi, rbx))
+    return ok
+
+
+def _test_umtx_fastpath():
+    """Uncontended mutex lock handled entirely in the LSTAR stub with an atomic CAS (no host
+    exit); contention traps to the host. ~96% of PS4 syscalls are this uncontended case."""
+    user = bytes.fromhex("b8c6010000" "bf00500000" "be05000000" "0f05" "4889c3" "f4")
+    stub = bytes.fromhex("483dc6010000" "751b" "4883fe05" "7515" "448b042500700000" "31c0"
+                         "f0440fb107" "7504" "31c0" "ffe1" "f4")
+    trap_rip = 0x6000 + len(stub) - 1
+
+    def run_case(mutex_init):
+        p, host = _longmode_part(user, stub_at_6000=stub)
+        ctypes.memmove(host + 0x5000, struct.pack("<I", mutex_init), 4)
+        ctypes.memmove(host + 0x7000, struct.pack("<I", 0x1234), 4)   # host-maintained current tid
+        with p:
+            p.set_regs([(CR3, 0x1000), (CR4, 0x20), (CR0, 0x80000011), (EFER, 0x501),
+                        (STAR, 0x0000000800000000), (LSTAR, 0x6000), (SFMASK, 0x0),
+                        (CS, seg(0, 0x08, ATTR_CODE64)), (SS, seg(0, 0x10, ATTR_DATA)),
+                        (DS, seg(0, 0x10, ATTR_DATA)), (ES, seg(0, 0x10, ATTR_DATA)),
+                        (RIP, 0x4000), (RFLAGS, 0x2)])
+            r = p.run()
+            rbx, rdi, rip = p.get_regs([RBX, RDI, RIP])
+            mutex = struct.unpack_from("<I", bytes((ctypes.c_ubyte * 4).from_address(host + 0x5000)))[0]
+        return r, rbx, rdi, rip, mutex
+
+    rA, rbxA, _, ripA, mutexA = run_case(0)            # uncontended
+    fastA = rA == EXIT_HALT and ripA not in (trap_rip, trap_rip + 1) and rbxA == 0 and mutexA == 0x1234
+    rB, _, rdiB, ripB, mutexB = run_case(0x9999)       # contended
+    trapB = rB == EXIT_HALT and ripB in (trap_rip, trap_rip + 1) and rdiB == 0x5000 and mutexB == 0x9999
+    ok = fastA and trapB
+    print("  umtx fast path (in-guest CAS): %s (uncontended=no-exit, contended=trap)"
+          % ("PASS" if ok else "FAIL"))
+    return ok
+
+
+def _test_context():
+    """Full vCPU context (GP + RIP + RFLAGS + FS/GS base) save/restore -- the cooperative thread
+    switch. FS base matters because the PS4 uses it for TLS."""
+    gp = [RAX, RBX, RCX, RDX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15]
+    ctxregs = gp + [RIP, RFLAGS, FS, GS]
+    p, host = _longmode_part(bytes.fromhex("64488b042500000000") + b"\xf4")  # mov rax, fs:[0]; hlt
+    ctypes.memmove(host + 0x5000, struct.pack("<Q", 0xAAAA0000AAAA), 8)
+    with p:
+        p.set_regs([(CR3, 0x1000), (CR4, 0x20), (CR0, 0x80000011), (EFER, 0x500),
+                    (CS, seg(0, 0x08, ATTR_CODE64)), (SS, seg(0, 0x10, ATTR_DATA)),
+                    (DS, seg(0, 0x10, ATTR_DATA)), (ES, seg(0, 0x10, ATTR_DATA)),
+                    (FS, seg(0x5000, 0x10, ATTR_DATA)), (GS, seg(0, 0x10, ATTR_DATA)),
+                    (RFLAGS, 0x2), (RIP, 0x4000), (R12, 0xCAFED00D)])
+        r = p.run()
+        tls = p.get_regs([RAX])[0]
+        p.set_regs([(RIP, 0x4000)])
+        ctx = dict(zip(ctxregs, p.get_regs(ctxregs)))                 # save
+        p.set_regs([(n, 0) for n in gp] + [(FS, seg(0xDEAD000, 0x10, ATTR_DATA))])  # clobber
+        p.set_regs([(n, seg(v, 0x10, ATTR_DATA) if n in (FS, GS) else v)            # restore
+                    for n, v in ctx.items()])
+        back = dict(zip(ctxregs, p.get_regs(ctxregs)))
+    ok = (r == EXIT_HALT and tls == 0xAAAA0000AAAA and all(back[n] == ctx[n] for n in ctxregs)
+          and back[R12] == 0xCAFED00D and back[FS] == 0x5000)
+    print("  vCPU context save/restore: %s (TLS via FS base, full GP set)" % ("PASS" if ok else "FAIL"))
+    return ok
 
 
 if __name__ == "__main__":
