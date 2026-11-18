@@ -453,25 +453,6 @@ class CompositorRing:
             ok = self._lazy = (hasattr(uc, "watch_add") and not os.environ.get("PSEMU_NO_LAZY_WB"))
         return ok
 
-    def _apply_watch_events(self, uc):
-        for addr, size, op in self._backend.watch_events():
-            if op:
-                uc.watch_add(addr, size, self._watch_fire)
-            else:
-                uc.watch_remove(addr)
-
-    def _watch_fire(self, start, size):
-        """The guest (or a syscall) touched a lazily written-back surface: write it back now."""
-        self.watch_fires = getattr(self, "watch_fires", 0) + 1
-        try:
-            self._backend.flush_range(start, size)
-        except Exception as e:
-            self.server.sc.emu.log(f"  [compositor] lazy write-back flush failed: {e!r}")
-        try:
-            self._apply_watch_events(self.server.sc.emu.uc)
-        except Exception as e:
-            self.server.sc.emu.log(f"  [compositor] watch event handling failed: {e!r}")
-
     def _run_dcb(self, uc, dcb, size):
         """Execute one client command buffer; returns a log suffix."""
         emu = self.server.sc.emu
@@ -491,7 +472,7 @@ class CompositorRing:
             finally:
                 if lazy:
                     self._backend.set_lazy_writeback(False)
-                    self._apply_watch_events(uc)
+                    self._backend.sync_watches(uc)
         except Exception as e:
             self.dcb_bad += 1
             return f" [GPU: {e}]"

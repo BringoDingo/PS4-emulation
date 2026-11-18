@@ -147,6 +147,7 @@ class GcDevice(Device):
         except Exception as e:
             self.log(f"submit #{self.submits}: {e}")
             return 0
+        backend.sync_watches(self.emu.uc)       # a non-lazy submit may have flushed deferred surfaces
         ms = (time.perf_counter() - t0) * 1000
         if self.emu.whp:
             self.emu._excl += ms / 1000.0            # GPU time is not guest time (see Emulator._excl)

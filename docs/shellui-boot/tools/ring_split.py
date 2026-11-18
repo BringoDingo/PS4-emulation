@@ -75,8 +75,7 @@ try:
 except Exception as e:
     print("profile unavailable", e)
 print("watch hits (guest/host accesses to lazily written-back surfaces):",
-      getattr(emu.uc, "n_watch_hits", None), " compositor fires:",
-      getattr(srv.ring, "watch_fires", None) if srv is not None else None)
+      getattr(emu.uc, "n_watch_hits", None))
 # probe: touching a lazily written-back surface must write it back first
 w = getattr(emu.uc, "_watch", {})
 print("watched ranges at exit:", [(hex(s), hex(e - s)) for s, (e, _, _) in w.items()])

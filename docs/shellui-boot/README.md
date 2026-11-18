@@ -468,3 +468,30 @@ Known limits: kernel-side access to guest memory that bypasses `mem_read`/`mem_w
 reading guest pointers directly, other than the GPU backend itself) is not trapped; partial CPU writes
 into a lazily deferred surface are merged correctly only because the trap writes the GPU contents back
 first. A second `WhpUc()` in one process exits silently (pre-existing; the self-test reuses one).
+
+## Update 2026-11-18 (night): hardening the lazy write-back (review follow-up)
+
+An outside review of the page-watch work asked for six things to be checked; results:
+
+* **Failure path.** A failed trap-time write-back used to be logged and the guest resumed with the
+  page restored and stale memory. Now `backend.sync_watches(uc)` owns the trap callback: on any
+  exception it re-arms the watch (so the pages keep trapping) and re-raises. A failed synchronisation
+  is loud and the guest never silently reads stale data. Non-compositor `/dev/gc` submits also drain
+  watch events now (they may flush deferred surfaces).
+* **Eviction.** Verified in the code and by `python -m psemu.tools_lazywb_test` (real firmware shaders,
+  one target per submit, the backend keeps 8): the two oldest surfaces are written back with their
+  drawing *before* the GPU image is freed and are unwatched; the 8 held ones keep the guest memory
+  untouched; `flush_range` on a held surface writes it back + unwatches; a later non-lazy submit that
+  reuses a held surface writes it back + unwatches; an injected write-back failure raises and re-arms.
+  (Shutdown frees deferred surfaces without write-back, which only happens at process exit.)
+* **WHP page-watch tests** (`tools_whp_uc_test`, 13 watch checks in total): guest read/write
+  traps, an 8-byte access straddling into a watched page, a partial guest write landing on top of the
+  write-back (`0xAA` fill + 4 guest bytes), disjoint watches firing independently, overlap settling
+  the old watch, host `mem_read`/`mem_write`, `watch_remove`, and a `mem_protect` remap of a watched
+  range settling it first.
+* **Concurrent guest threads.** The WHP partition has one vCPU; guest threads are interleaved only at
+  preemption exits and the trap callback runs synchronously inside the exit handler before any thread
+  resumes, so two threads cannot race the write-back.
+* **GPU crash after extended rendering.** Long soak (`--frames`, 420 s, WHP, home screen): exit 0,
+  **77,000 command buffers / 773,113 draws, 0 failed**, no abort or GPU message. (`--frames` also
+  writes one `dcb_*.bin` per command buffer: ~21k files in 5 minutes, delete the directory after.)

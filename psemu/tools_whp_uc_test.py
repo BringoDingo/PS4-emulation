@@ -244,6 +244,41 @@ def main():
     uc.watch_add(W + 0x1000, 0x1000, on_watch)                       # overlaps: old one is settled
     check("overlapping watch settles the old one", fired == [(W, 0x2000)], "fired=%s" % fired)
 
+    # 14) more watch cases: an access straddling a page boundary, a partial guest write over the
+    #     callback's write-back, several disjoint watches, a remap under a watch
+    uc.watch_remove(W + 0x1000)
+    fired.clear()
+    uc.watch_add(W + 0x1000, 0x1000, on_watch)
+    e = run(uc, bytes.fromhex("488b0425fc0f7000" "f4"))                # mov rax,[W+0xFFC]: 8 bytes over 2 pages
+    check("access straddling into a watched page traps", fired == [(W + 0x1000, 0x1000)],
+          "fired=%s" % fired)
+
+    fired.clear()
+
+    def fill_aa(start, size):
+        fired.append((start, size))
+        uc.mem_write(start, b"\xaa" * size)                           # "the write-back"
+    uc.watch_add(W + 0x2000, 0x1000, fill_aa)
+    run(uc, bytes.fromhex("c7042508207000" "44332211" "f4"))           # mov dword [W+0x2008], 0x11223344
+    page = bytes(uc.mem_read(W + 0x2000, 0x1000))
+    check("partial guest write lands on top of the write-back",
+          fired == [(W + 0x2000, 0x1000)] and page[8:12] == bytes.fromhex("44332211")
+          and page[:8] == b"\xaa" * 8 and page[12:] == b"\xaa" * (0x1000 - 12))
+
+    fired.clear()
+    uc.watch_add(W, 0x1000, on_watch)
+    uc.watch_add(W + 0x3000, 0x1000, on_watch)
+    uc.mem_read(W + 0x3008, 8)
+    check("disjoint watches fire independently",
+          fired == [(W + 0x3000, 0x1000)] and sorted(uc._watch) == [W], "fired=%s" % fired)
+    uc.watch_remove(W)
+
+    fired.clear()
+    uc.watch_add(W + 0x3000, 0x1000, on_watch)
+    uc.mem_protect(W + 0x3000, 0x1000, UC_PROT_READ)                   # remap under a watch
+    check("remapping a watched range settles the watch first",
+          fired == [(W + 0x3000, 0x1000)] and not uc._watch, "fired=%s" % fired)
+
     print("WhpUc self-test:", "PASS" if ok else "FAIL", "exits=%s" % uc.exits)
     return 0 if ok else 1
 

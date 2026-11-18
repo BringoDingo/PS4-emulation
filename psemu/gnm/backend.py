@@ -114,6 +114,33 @@ def watch_events():
             return out
 
 
+def sync_watches(uc):
+    """Apply the queued watch events to a WhpUc: start/stop trapping CPU access to lazily
+    written-back render targets. A trapped access writes the surface back (flush_range) before it
+    proceeds. If that write-back fails the watch is re-armed (so the guest can never read stale
+    memory) and the error is raised: a failed synchronisation must be loud, not silent."""
+    if not hasattr(uc, "watch_add"):
+        return
+    fire = getattr(uc, "_gnm_watch_fire", None)
+    if fire is None:
+        def fire(start, size):
+            try:
+                flush_range(start, size)
+            except BaseException:
+                try:
+                    uc.watch_add(start, size, fire)
+                except Exception:
+                    pass
+                raise
+            sync_watches(uc)
+        uc._gnm_watch_fire = fire
+    for addr, size, op in watch_events():
+        if op:
+            uc.watch_add(addr, size, fire)
+        else:
+            uc.watch_remove(addr)
+
+
 def set_host_only_range(addr, nbytes):
     """Declare [addr, addr+nbytes) memory that only the host reads (never the guest program).
     Render targets inside it are written back lazily: call flush_range() before reading it."""
