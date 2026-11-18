@@ -8,6 +8,7 @@ in `HostHeap` buffers whose real addresses are written into descriptors.
     vs = sb.load_sb("yuv_vv.sb")
     spirv, summary = backend.translate(vs)
 """
+import collections
 import ctypes as C
 import os
 
@@ -117,28 +118,52 @@ def watch_events():
 def sync_watches(uc):
     """Apply the queued watch events to a WhpUc: start/stop trapping CPU access to lazily
     written-back render targets. A trapped access writes the surface back (flush_range) before it
-    proceeds. If that write-back fails the watch is re-armed (so the guest can never read stale
-    memory) and the error is raised: a failed synchronisation must be loud, not silent."""
+    proceeds.
+
+    Failure handling (a failed synchronisation must be loud, never leave stale memory readable):
+      * events are applied one at a time from a persistent per-uc pending queue; an event leaves the
+        queue only after it was applied, so if one fails the rest (and the failed one) are kept and
+        retried, in order, by the next sync;
+      * if a trap-time write-back fails, the watch is re-armed (the pages keep trapping) and the
+        error is re-raised; if the re-arm fails too, that failure is attached to the original error
+        (add_note) instead of being swallowed."""
     if not hasattr(uc, "watch_add"):
         return
+    if getattr(uc, "_gnm_syncing", False):
+        return                      # re-entrant (a trap inside an event): the outer loop drains on
     fire = getattr(uc, "_gnm_watch_fire", None)
     if fire is None:
         def fire(start, size):
             try:
                 flush_range(start, size)
-            except BaseException:
+            except BaseException as err:
                 try:
                     uc.watch_add(start, size, fire)
-                except Exception:
-                    pass
+                except BaseException as rearm_err:
+                    err.add_note("the watch re-arm also failed: %r" % (rearm_err,))
                 raise
             sync_watches(uc)
         uc._gnm_watch_fire = fire
-    for addr, size, op in watch_events():
-        if op:
-            uc.watch_add(addr, size, fire)
-        else:
-            uc.watch_remove(addr)
+    pending = getattr(uc, "_gnm_pending", None)
+    if pending is None:
+        pending = uc._gnm_pending = collections.deque()
+    uc._gnm_syncing = True
+    try:
+        while True:
+            pending.extend(watch_events())          # native events produced meanwhile (flushes)
+            if not pending:
+                return
+            addr, size, op = pending.popleft()
+            try:
+                if op:
+                    uc.watch_add(addr, size, fire)
+                else:
+                    uc.watch_remove(addr)
+            except BaseException:
+                pending.appendleft((addr, size, op))
+                raise
+    finally:
+        uc._gnm_syncing = False
 
 
 def set_host_only_range(addr, nbytes):

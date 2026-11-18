@@ -495,3 +495,16 @@ An outside review of the page-watch work asked for six things to be checked; res
 * **GPU crash after extended rendering.** Long soak (`--frames`, 420 s, WHP, home screen): exit 0,
   **77,000 command buffers / 773,113 draws, 0 failed**, no abort or GPU message. (`--frames` also
   writes one `dcb_*.bin` per command buffer: ~21k files in 5 minutes, delete the directory after.)
+
+## Update 2026-11-18 (night): watch events are transactional
+
+A second review pass found that `sync_watches` drained the native event queue *before* applying the
+events, so a `watch_add` that failed part-way lost the remaining events and left the Python page
+watches out of step with the backend. Now a persistent per-CPU pending queue is filled from the
+native queue and events are applied one at a time, leaving the queue only after they were applied: a
+failure keeps the failed event and all later ones, in order, for the next sync. Re-entrant syncs
+(a trap inside an event) return and let the outer loop drain. A failed trap-time re-arm is no
+longer swallowed: it is attached to the original write-back error (`add_note`). `tools_lazywb_test`
+has two new cases (the 2nd of 3 events fails -> 1st applied, rest retained, retry applies each once in
+order; a failing re-arm is reported with the write-back failure). Lazy-writeback and WHP tests were
+repeated 5x each: all pass.

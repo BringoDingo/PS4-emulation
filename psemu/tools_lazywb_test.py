@@ -170,6 +170,73 @@ def main(argv=None):
           any(ad == heap.addr(t) for ad, sz, _ in uc.added),
           "(re-armed %d)" % len(uc.added))
 
+    print("transactional event handling (the 2nd of 3 events fails):")
+    backend.sync_watches(FakeUc())               # drain whatever is still queued
+    fresh = [heap.alloc(W * H * 4) for _ in range(3)]
+    for rt in fresh:
+        draw(rt, True)                           # three new watch transitions queued natively
+    want = [heap.addr(t) for t in fresh]
+
+    class FailSecond(FakeUc):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.armed_fail = True
+
+        def watch_add(self, addr, size, cb):
+            self.calls += 1
+            if self.armed_fail and self.calls == 2:
+                raise RuntimeError("injected watch_add failure")
+            super().watch_add(addr, size, cb)
+
+    uc2 = FailSecond()
+    raised = False
+    try:
+        backend.sync_watches(uc2)
+    except RuntimeError:
+        raised = True
+    check("the failure propagates", raised)
+    check("the 1st event was applied", [ad for ad, _, _ in uc2.added] == want[:1],
+          "(%s)" % [hex(ad) for ad, _, _ in uc2.added])
+    check("the failed and the 3rd event are retained, in order",
+          [ev[0] for ev in uc2._gnm_pending if ev[2]] == want[1:],
+          "(%d pending incl. unwatches of evicted surfaces)" % len(uc2._gnm_pending))
+    uc2.armed_fail = False
+    backend.sync_watches(uc2)                    # retry
+    check("a retry applies each remaining event exactly once, in order",
+          [ad for ad, _, _ in uc2.added] == want and not uc2._gnm_pending)
+    check("...and the guard is released", not uc2._gnm_syncing)
+
+    print("a failed re-arm is reported together with the write-back failure:")
+
+    class NoRearm(FakeUc):
+        def watch_add(self, addr, size, cb):
+            if self.fail:
+                raise RuntimeError("injected re-arm failure")
+            super().watch_add(addr, size, cb)
+
+    uc3 = NoRearm()
+    uc3.fail = False
+    t = heap.alloc(W * H * 4)
+    draw(t, True)
+    backend.sync_watches(uc3)
+    cb3 = [c for ad, _, c in uc3.added if ad == heap.addr(t)][-1]
+    uc3.fail = True
+    backend.flush_range = failing
+    try:
+        err = None
+        try:
+            cb3(heap.addr(t), t.nbytes)
+        except BaseException as e:
+            err = e
+    finally:
+        backend.flush_range = real
+    check("the original write-back failure is raised",
+          isinstance(err, backend.GnmError) and "injected write-back failure" in str(err))
+    check("...with the re-arm failure attached",
+          err is not None and any("re-arm also failed" in n and "injected re-arm failure" in n
+                                  for n in getattr(err, "__notes__", [])))
+
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
