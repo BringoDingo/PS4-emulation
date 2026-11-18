@@ -41,6 +41,8 @@ class HleHooks:
         native = getattr(self.emu, "native", None)
         if native is not None:
             native.hle_add(addr)
+        elif getattr(self.emu, "whp", False) and hasattr(self.uc, "hle_add"):
+            self.uc.hle_add(addr)
 
     def has(self, addr):
         return addr in self.table

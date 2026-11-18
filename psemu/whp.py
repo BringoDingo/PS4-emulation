@@ -114,6 +114,10 @@ def _set_argtypes(h):
     h.WHvGetVirtualProcessorRegisters.argtypes = [P, ctypes.c_uint32,
                                                   ctypes.POINTER(ctypes.c_int), ctypes.c_uint32,
                                                   ctypes.POINTER(WHV_REGISTER_VALUE)]
+    h.WHvGetVirtualProcessorXsaveState.argtypes = [P, ctypes.c_uint32, ctypes.c_void_p,
+                                                   ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+    h.WHvSetVirtualProcessorXsaveState.argtypes = [P, ctypes.c_uint32, ctypes.c_void_p,
+                                                   ctypes.c_uint32]
     h.WHvDeleteVirtualProcessor.argtypes = [P, ctypes.c_uint32]
     h.WHvDeletePartition.argtypes = [P]
 
@@ -141,13 +145,21 @@ def seg(base, selector, attributes, limit=0xFFFFFFFF):
 class Partition:
     """One WHP partition with a single vCPU. Memory is mapped from host buffers the caller owns."""
 
-    def __init__(self, vcpus=1):
+    def __init__(self, vcpus=1, exception_bitmap=0, extended_exits=0):
         self.h = ctypes.c_void_p()
         d = dll()
         _chk(d.WHvCreatePartition(ctypes.byref(self.h)), "WHvCreatePartition")
         count = ctypes.c_uint32(vcpus)
         _chk(d.WHvSetPartitionProperty(self.h, PROP_PROCESSOR_COUNT, ctypes.byref(count), 4),
              "SetPartitionProperty(ProcessorCount)")
+        if extended_exits:                  # bit0 CPUID, bit1 MSR, bit2 exception, bit3 RDTSC
+            v = ctypes.c_uint64(extended_exits)
+            _chk(d.WHvSetPartitionProperty(self.h, PROP_EXTENDED_VM_EXITS, ctypes.byref(v), 8),
+                 "SetPartitionProperty(ExtendedVmExits)")
+        if exception_bitmap:                # bit n: exit on guest exception vector n
+            v = ctypes.c_uint64(exception_bitmap)
+            _chk(d.WHvSetPartitionProperty(self.h, PROP_EXCEPTION_EXIT_BITMAP, ctypes.byref(v), 8),
+                 "SetPartitionProperty(ExceptionExitBitmap)")
         _chk(d.WHvSetupPartition(self.h), "WHvSetupPartition")
         for i in range(vcpus):
             _chk(d.WHvCreateVirtualProcessor(self.h, i, 0), "WHvCreateVirtualProcessor")

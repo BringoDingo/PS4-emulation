@@ -36,13 +36,20 @@ def main():
                     help="save displayed frames (VideoOut flips) as PNGs in this directory")
     ap.add_argument("--frame-every", type=int, default=60,
                     help="with --frames: save every Nth flip (default 60, and the first)")
+    ap.add_argument("--backend", choices=("unicorn", "whp"), default=None,
+                    help="CPU engine: 'unicorn' (default, deterministic, instruction-counted) or "
+                         "'whp' (hardware virtualization via the Windows Hypervisor Platform)")
+    ap.add_argument("--max-seconds", type=float, default=None,
+                    help="wall-clock budget; the stop condition on --backend whp, where there "
+                         "is no instruction count")
     ap.add_argument("--gpu-profile", action="store_true",
                     help="log per-phase GPU executor time after every /dev/gc submit")
     args = ap.parse_args()
 
     start = int(args.start, 0) if args.start else None
     emu = Emulator(args.file, trace=args.trace, max_insns=args.max,
-                   fw_root=args.fw_root)
+                   fw_root=args.fw_root, backend=args.backend)
+    emu.max_seconds = args.max_seconds
     emu.max_modules = args.max_modules
     emu.spawn_mode = args.spawn_mode
     emu.gpu_enabled = not args.no_gpu

@@ -58,8 +58,16 @@ def _align_down(x, a=PAGE4K):
 
 class Emulator:
     def __init__(self, path, trace=False, max_insns=2_000_000, verbose=True,
-                 fw_root=None):
+                 fw_root=None, backend=None):
         import collections
+        import time
+        # CPU backend: "unicorn" (default: deterministic reference, instruction-counted clock)
+        # or "whp" (hardware-virtualized guest on the Windows Hypervisor Platform; wall-clock
+        # virtual time, see whp_uc.py). PSEMU_BACKEND=whp selects it from the environment.
+        self.whp = (backend or os.environ.get("PSEMU_BACKEND") or "unicorn").lower() == "whp"
+        self._t0 = time.perf_counter()
+        self._time = time.perf_counter
+        self.max_seconds = None        # whp: wall-clock budget (an instruction budget is meaningless)
         self.path = path
         self.trace = trace
         self.max_insns = max_insns
@@ -77,7 +85,7 @@ class Emulator:
         # native per-instruction hook (cpu_native.py); --trace keeps the
         # Python hook, which can log every instruction
         from .cpu_native import NativeCpu
-        self.native = None if trace else NativeCpu.load()
+        self.native = None if (trace or self.whp) else NativeCpu.load()
         self._insn_py = 0
         self._last_py = 0
         self.syscalls = SyscallDispatcher(self)   # fd table, handles, objects
@@ -121,7 +129,7 @@ class Emulator:
             self._build_dynamic(path)
             return
         self._dynamic_block = False
-        self.uc = Uc(UC_ARCH_X86, UC_MODE_64)
+        self.uc = self._new_cpu()
         self.vm = HostVM(self.uc, log=self.log)
         self._enable_avx()
         # re-point the helpers at the new CPU
@@ -148,7 +156,7 @@ class Emulator:
         PS4 kernel does. See dynproc.py."""
         from .dynproc import DynamicProcess
         self._dynamic_block = False
-        self.uc = Uc(UC_ARCH_X86, UC_MODE_64)
+        self.uc = self._new_cpu()
         self.vm = HostVM(self.uc, log=self.log)
         self._enable_avx()
         self.avx.uc = self.uc
@@ -184,11 +192,23 @@ class Emulator:
         self.entry_point = lk.entry
         self.log(f"  entry: libkernel @ {lk.entry:#x} (executable entry {self.dyn.exe.entry:#x})")
 
+    def _new_cpu(self):
+        """A fresh CPU for a new address space: Unicorn, or a WHP partition."""
+        old = getattr(self, "uc", None)
+        if self.whp:
+            from .whp_uc import WhpUc
+            if old is not None and hasattr(old, "close"):
+                old.close()                     # execve: the previous partition is gone
+            return WhpUc()
+        return Uc(UC_ARCH_X86, UC_MODE_64)
+
     # ---- cpu features ---------------------------------------------------
     def _enable_avx(self):
         """The module uses AVX (vxorps/vmovups ymm...). Unicorn's default CPU
         model rejects those, so select an AVX2-capable model and turn on the
         SSE/AVX enable bits so instructions don't #UD at runtime."""
+        if self.whp:
+            return          # the vCPU is built with SSE/AVX on (whp_uc.CR4_VAL / XCR0_VAL)
         try:
             self.uc.ctl_set_cpu_model(UC_CPU_X86_HASWELL)
         except Exception as e:
@@ -435,11 +455,17 @@ class Emulator:
     # ---- instruction clock -----------------------------------------------
     @property
     def _insn_count(self):
+        if self.whp:
+            # no instruction counter on hardware: virtual time follows the wall clock, expressed
+            # in "instructions" at the scheduler's NS_PER_INSN so now_ns() stays one formula
+            return int((self._time() - self._t0) * 1e9)
         n = self.native
         return n.s.count if n is not None else self._insn_py
 
     @_insn_count.setter
     def _insn_count(self, v):
+        if self.whp:
+            return
         if self.native is not None:
             self.native.s.count = v
         else:
@@ -523,6 +549,24 @@ class Emulator:
         if self._insn_count >= self.max_insns:
             self.stop(f"instruction limit reached ({self.max_insns})")
 
+    # ---- WHP backend callbacks (whp_uc.WhpUc) --------------------------------------------
+    def _whp_hle(self, uc, addr):
+        """An HLE int3 trap fired at `addr`; True when a 'replace' hook already returned to the
+        caller, False when the real instruction must run (fixup / guard-None)."""
+        return bool(self.hle.has(addr) and self.hle.invoke(uc, addr))
+
+    def _whp_preempt(self, uc, rip):
+        """End of a wall-clock time slice: True when another thread is runnable and a switch is
+        now pending (the vCPU is stopped before `rip`)."""
+        sched = self.sched
+        if sched is None or len(sched.order) < 2:
+            return False
+        return sched.slice_expired(uc, rip)
+
+    def _whp_tick(self):
+        if self.max_seconds is not None and self._time() - self._t0 >= self.max_seconds:
+            self.stop(f"wall-clock budget reached ({self.max_seconds:g} s)")
+
     def _native_stop(self):
         """The native hook stopped the CPU before the instruction at
         stop_addr: do the Python-side work and return where to resume (RIP is
@@ -605,7 +649,13 @@ class Emulator:
     def _install_hooks(self):
         self.uc.hook_add(UC_HOOK_INSN, self._hook_syscall,
                          begin=1, end=0, aux1=UC_X86_INS_SYSCALL)
-        if self.native is not None:
+        if self.whp:
+            self.uc.hle_cb = self._whp_hle
+            self.uc.preempt_cb = self._whp_preempt
+            self.uc.tick_cb = self._whp_tick
+            for a in self.hle.table:
+                self.uc.hle_add(a)
+        elif self.native is not None:
             self.native.attach(self.uc, self.hle.table.keys())
         else:
             self.uc.hook_add(UC_HOOK_CODE, self._hook_code)
@@ -734,11 +784,14 @@ class Emulator:
             # early-return below (a libthr-managed thread, left alone), so the
             # counter lives here at the top, before any return.
             self._mutex_calls += 1
-            if (not self._mutex_needed and self.native is not None
+            if (not self._mutex_needed and (self.native is not None or self.whp)
                     and self._mutex_calls >= MUTEX_WARMUP):
                 for ent in self._mutex_lock_entries:
                     try:
-                        self.native.trap_remove(ent)
+                        if self.whp:
+                            uc.hle_remove(ent)
+                        else:
+                            self.native.trap_remove(ent)
                         self.hle.table.pop(ent, None)
                     except Exception:
                         pass
@@ -902,6 +955,9 @@ class Emulator:
         if self.native is not None:
             self.log(self.native.vex_summary())
         self.log(self.hle.summary())
+        if self.whp:
+            self.log(f"WHP: {self._time() - self._t0:.1f} s wall, {self.uc.n_syscalls} syscalls, "
+                     f"VM exits {self.uc.exits}")
         self.log(self.sched.summary())
         return self._stop_reason
 

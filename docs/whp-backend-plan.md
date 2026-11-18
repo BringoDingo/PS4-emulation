@@ -1,6 +1,6 @@
 # Plan: a hardware-virtualized CPU backend (Windows Hypervisor Platform)
 
-Status: design notes, nothing implemented. Written while profiling the ShellUI boot showed
+Status: IMPLEMENTED (see `psemu/whp_uc.py`, run with `--backend whp --max-seconds N`; results at the end of this file). Original design notes follow. Written while profiling the ShellUI boot showed
 the CPU layer is the next big cost after the GPU path.
 
 ## Why
@@ -94,3 +94,30 @@ the real libkernel and Mono, which use raw `syscall` and `fs:` everywhere, so ha
 safer way to get native speed.
 
 Hypervisor probe used (read-only): `WinHvPlatform.dll` `WHvGetCapability(0 = HypervisorPresent)`.
+
+
+## Results (2026-11-18, Ryzen 5 3600, Windows 10 19045)
+
+`psemu/whp_uc.py` (`WhpUc`) is a Unicorn-compatible CPU object on a WHP partition; the Emulator
+selects it with `--backend whp`. Self-test: `python -m psemu.tools_whp_uc_test` (syscall exit, HLE
+replace/fixup traps, #PF -> unmapped/write-prot hooks, `int n`, TLB flush on unmap, FS base,
+context save/restore, memory above 2^43).
+
+ShellUI (NPXS20001) boot, same firmware, same command line apart from the backend:
+
+| backend | time to the EvalBase stall state |
+|---|---|
+| Unicorn + native AVX hook, GPU caches | 12.9 min (8B instructions) |
+| WHP | about 15 s |
+
+"Stall state" = the BootManager waits on exactly the same flag set (0x400, 0x8000000 x2,
+0x40000000000, 0x100000000000), 4 compositor flips, same IPMI services busy. At 240 s the WHP run is
+still in that state (4.67M syscalls, 1.42M thread switches), i.e. the earlier finding stands: nothing
+new initializes past it. WHP run created 101 threads against 117 for Unicorn (not yet explained).
+
+Facts learned while building it (probed, not documented):
+* Partition exception-exit bitmap accepts only vectors 0,1,3,4,5,6,7,8,10-14,16-19.
+* XCR0 is register 0x27 (Dr0-3 = 0x21-0x24, Dr6 0x25, Dr7 0x26).
+* WHP accepts GPAs anywhere (tested to 2^48), partial/overlapping unmaps and remaps.
+* Do not switch threads mid single-step: TF travels with the saved context.
+* Virtual time is wall-clock; runs are not deterministic. The Unicorn backend stays the reference.

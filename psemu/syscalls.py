@@ -283,6 +283,9 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         # The six syscall argument registers are read on every syscall. Unicorn's
         # Python wrapper spends ~2us per register choosing a register class; calling
         # its batched C entry point with preallocated buffers reads all six in ~2us.
+        sa = getattr(uc, "syscall_args", None)       # WHP backend: registers are cached
+        if sa is not None:
+            return sa()
         rd = self.__dict__.get("_argrd")
         if rd is None or rd[0] is not uc:
             try:
