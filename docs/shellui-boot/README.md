@@ -564,3 +564,51 @@ no `scePadOpen`, no `scePadReadState`, no `scePadGetControllerInformation`. From
 Next: find which managed/native call registers a pad (hook `libScePsm+0x81a..` and walk back), and
 decide how a connected controller is announced (user-service login / pad events), then the
 `scePadGetControllerInformation` ioctl; separately the 100 ms vblank gaps.
+
+## Update 2026-11-18 (late night): the libScePsm pad trigger, a network spin, and the vblank gaps
+
+**What was gating pad use.** The shell never called `scePadReadState` because `libScePsm` only polls
+pad slots that its enumeration (`+0x7fca0`) has filled, and that enumeration got nothing from the
+**SceMbusIpc** service (a stub: empty success). It asks `SceMbusIpc.0xce110028` (GetDeviceList) for
+devices of the classes it can drive (2, 3, 12, 14, 13) and reads back 0x100-byte entries
+(`+0x00` u64 device id, `+0x08` connection kind - 4 = remote play, 5 = share play, else local,
+`+0x0c` class, `+0xc8` user id). The **method result code is the device count** (libSceMbus hands it
+back as the return value; returning 0 there reads as "no devices"). `mbus.py` + `Syscalls._ipmi_mbus_device_list`
+now answer with one DualShock 4 (class 2, local, assigned to the logged-in user) when `PSEMU_PAD` is not
+`off`. After that the shell registers it exactly like a console: `scePadOpenByMbusDevice`,
+`scePadGetControllerInformation`, `scePadGetCapability`, then `scePadReadState` ~30x/s, a "user logged
+in" toast ("Unknown": the open username item) and `ConnectedDeviceStatus: [DUALSHOCK4][user]`.
+Corrections to the first `/dev/hid` model found on the way: **open is `0x800c4802`** (`{i32 id, i32 type,
+i32 0}`, returns the handle, which must be 1..3 because the read takes a port <= 3) and `0x80084803` is the
+close; `0x8010480e` fills the controller-information block (a 0x48-byte buffer: writing 0x60 smashed the
+canary and aborted the guest), `0x80104801` the capability block.
+
+**The new problem (why the pad is opt-in).** With a pad registered the home screen renders ~15x less
+(400-700 command buffers per 50 s vs ~7200). The main thread ends up parked in a Mono semaphore wait
+(`libmonosgen` called from `libScePsm+0x1d8a94`, a `sem_wait` on a `libScePsm` data address) that
+nothing posts, all threads are blocked, and the scheduler skips virtual time (95 s in 30 s of wall) while
+timers churn (141k thread switches). Not the report stream (constant timestamps made no difference), not
+the idle clock skipping (a real-time idle wait gave the same), not the model string. Still to find: who
+should post that semaphore (a Mono stop-the-world handshake with the pad thread is the leading guess).
+`PSEMU_PAD` therefore defaults to `off` (no controller attached); `auto|none|xinput|script` attach it.
+
+**A network spin, fixed.** In every run (pad or not) one managed network listener (System.dll ->
+libSceNet) spun on `setsockopt` / `netcontrol` / `recvfrom(0, buf, 0x300, 0x40000000)` ~6000 times a second
+and took 45-75 % of all guest CPU: `socket()` returns a stub fd and `recvfrom` "succeeded" with 0 bytes
+at once. `sys_recvfrom` now behaves like a console with no network: a blocking receive on an unmodelled
+socket parks the thread, a MSG_DONTWAIT poll gets EAGAIN after 5 ms of virtual time. Default boots went
+from 403-5400 (very noisy) to a steady ~7200 command buffers per 50 s, the chain run from 4500-7500 to 9000
+per 60 s.
+
+**The vblank gaps.** `[ScePsP:InputCtrl] LOST PAD DATA: N msec` is not about pad data: the thread
+(`libScePsm+0x7f690`) waits on an equeue fed by a VideoOut event and prints when two events are more than
+100 ms apart. It appears ~5x/s (250 per 50 s). The vblank/flip events come from the compositor stand-in,
+so a gap is a slow compositor frame: `ring_split.py` shows 40-60 ms mean per ring service and spikes of
+400-600 ms (new shader translation - ~10k translate-cache misses - and texture uploads). The netctl spin
+made it worse by starving threads; what is left are those frame spikes.
+
+New helpers (`docs/shellui-boot/tools/`): `mod_hooks.py` (hook module-relative function entries, GOT target
+of PLT thunks), `plt_targets.py` / `plt_callers.py` / `elfsyms.py` / `xref_mod.py` (imports, NIDs, call sites,
+string xrefs in any module), `kev_filters.py`, `thread_syscalls.py` (per-thread syscall histogram),
+`spin_who.py`, `addr_sync.py` (who waits/wakes an address), `rip_sample.py`, `pad_calls.py`.
+`python -m psemu.tools_hidtest` covers the Mbus list, filters, open/close/info/capability and the buffer sizes.

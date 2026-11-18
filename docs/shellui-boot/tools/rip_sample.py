@@ -1,49 +1,46 @@
-"""Sample where threads are executing: run START instructions, then for WINDOW more
-instructions record, at the end of every scheduling slice, the current thread's resume
-address (module + offset). Slices end on instruction counts, so this is an unbiased
-sample (unlike sampling at context switches, which lands on syscall stubs).
+"""Statistical guest profile on WHP: sample RIP at every time-slice exit, histogram by module/function.
 
-    python rip_sample.py START WINDOW [tid-hex]     e.g.  rip_sample.py 1400000000 300000000
+    python rip_sample.py 40            # PSEMU_PAD=... etc. are honoured
 """
-import os
+import collections
 import sys
-from collections import Counter, defaultdict
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.normpath(os.path.join(HERE, "..", "..", "..")))
+sys.path.insert(0, r"D:\CLAUDEGODOT2")
+import unicorn.x86_const as X
 from psemu.emulator import Emulator
 
 EXE = r"D:\Ps4Tools\ps4kernel\firmware\system_ex\app\NPXS20001\eboot.bin"
 FW = r"D:\Ps4Tools\ps4kernel\firmware"
-START, WINDOW = int(sys.argv[1]), int(sys.argv[2])
-WANT = int(sys.argv[3], 16) if len(sys.argv) > 3 else 0x10001
-
-emu = Emulator(EXE, max_insns=START + WINDOW + 1_000_000, fw_root=FW)
+secs = float(sys.argv[1]) if len(sys.argv) > 1 else 40
+emu = Emulator(EXE, fw_root=FW, backend="whp")
+emu.max_seconds = secs
 emu.max_modules = 80
 emu.log = lambda *a, **k: None
+hist = collections.Counter()
+bythread = collections.Counter()
+orig_tick = emu._whp_tick
+n = [0]
 
 
-def where(addr):
-    lm = emu.dyn.module_at(addr)
-    if lm is None:
-        return "?%#x" % addr
-    return "%s+%#x" % (lm.mod.name if hasattr(lm.mod, "name") else os.path.basename(lm.mod.path),
-                       addr - lm.base)
+def tick():
+    orig_tick()
+    uc = emu.uc
+    try:
+        rip = uc.reg_read(X.UC_X86_REG_RIP)
+    except Exception:
+        return
+    lm = emu.dyn.module_at(rip) if emu.dyn else None
+    key = f"{lm.name}+{(rip - lm.base) >> 8 << 8:#x}" if lm else f"{rip >> 12 << 12:#x}"
+    hist[key] += 1
+    t = emu.sched.current.tid if emu.sched and emu.sched.current else 0
+    bythread[t] += 1
+    n[0] += 1
 
 
-samples = defaultdict(Counter)       # tid -> Counter(where)
-cur = emu.begin_run()
-while cur is not None:
-    cur = emu._run_segment(cur)
-    n = emu._insn_count
-    if n >= START and cur is not None and emu.sched.current is not None:
-        samples[emu.sched.current.tid][where(cur)] += 1
-    if n >= START + WINDOW:
-        break
-
-tot = sum(sum(c.values()) for c in samples.values()) or 1
-print("insns now %d; samples %d" % (emu._insn_count, tot))
-for tid, c in sorted(samples.items(), key=lambda kv: -sum(kv[1].values()))[:6]:
-    print("tid %#x: %d samples" % (tid, sum(c.values())))
-    for w, k in c.most_common(12 if tid == WANT else 4):
-        print("    %-48s %d" % (w, k))
+emu.uc.tick_cb = tick
+emu.run()
+print(f"\nsamples {n[0]}")
+print("top code regions (256-byte buckets):")
+for k, v in hist.most_common(14):
+    print(f"  {v:6d} {100 * v / max(n[0], 1):5.1f}%  {k}")
+print("top threads:", [(hex(t), c) for t, c in bythread.most_common(6)])

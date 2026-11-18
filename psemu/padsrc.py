@@ -3,7 +3,9 @@
 The guest never sees host devices: devices.HidDevice asks a PadSource for the current button/stick
 state and encodes it the way libScePad's kernel interface reports it.
 
-Sources (PSEMU_PAD selects; default "auto"):
+PSEMU_PAD selects (default "off" = no controller attached to the console: the Mbus device list stays
+empty; any other value attaches the emulated DualShock 4 and picks where its state comes from):
+  off      nothing attached (default);
   auto     XInput pad if one is connected (DS4Windows exposes a DualShock 4 as an Xbox 360 pad),
            otherwise an idle controller;
   xinput   XInput only (idle when none is connected);
@@ -140,7 +142,7 @@ class AutoSource(XInputSource):
 
 
 def make_source(mode=None):
-    mode = (mode or os.environ.get("PSEMU_PAD", "auto")).lower()
+    mode = (mode or os.environ.get("PSEMU_PAD", "auto")).lower()   # /dev/hid reads: auto unless told
     if mode == "none":
         return NullSource()
     if mode == "script":
@@ -169,3 +171,19 @@ def encode_report(state, timestamp_us):
     struct.pack_into("<I", rep, 0x0C, state.buttons & 0xFFFFFFFF)
     rep[0x10:0x16] = bytes((state.lx, state.ly, state.rx, state.ry, state.l2, state.r2))
     return bytes(rep)
+
+
+VENDOR_SONY, PRODUCT_DS4_V2 = 0x054C, 0x09CC     # (not 0x054c/0x0bb2: libScePad treats that pair as unusable)
+
+
+def controller_info_block():
+    """The block /dev/hid ioctl 0x8010480e fills for scePadGetControllerInformation: a DualShock 4
+    (v2) with its touchpad (1920x942, density 0x6da) and the usual stick dead zones (0x20)."""
+    b = bytearray(0x48)         # the guest's buffer is 0x48 bytes: the stack canary follows it
+    b[0x00] = 2                                           # device class
+    struct.pack_into("<H", b, 0x10, VENDOR_SONY)
+    struct.pack_into("<H", b, 0x12, PRODUCT_DS4_V2)
+    struct.pack_into("<I", b, 0x34, 0x6DA)                # touchpad pixel density (x 1/rodata)
+    struct.pack_into("<HH", b, 0x38, 1920, 942)           # touchpad resolution
+    b[0x3C] = b[0x3D] = 0x20                              # stick dead zones (left, right)
+    return bytes(b)

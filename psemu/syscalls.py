@@ -538,6 +538,34 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         self.emu.log(f"  [socket] AF_UNIX -> fd {fd}")
         self._ret(uc, fd)
 
+    EAGAIN = 35
+    MSG_DONTWAIT = 0x80
+
+    def sys_recvfrom(self, uc):
+        """recvfrom(fd, buf, len, flags, from, fromlen). The only real sockets are the in-process
+        AF_UNIX endpoints; every other family is a stub that "succeeds" (socket() returns 0). With
+        no network a real receive never completes, but the stub used to return 0 bytes at once:
+        the shell's managed network listener (System.dll -> libSceNet, recvfrom(0, buf, 0x300,
+        0x40000000) in a loop with setsockopt/netcontrol) then spun at ~6000 iterations/s and took
+        45-75% of all guest CPU time, starving the render and input threads (vblank gaps, a low
+        frame rate). A blocking receive now parks the thread (as on a console that never hears
+        anything); MSG_DONTWAIT polls get EAGAIN after a short pause on the virtual clock."""
+        fd, buf, n, flags = self._args(uc)[:4]
+        fd &= 0xFFFFFFFF
+        dev = self.devs.get(fd)
+        if dev is not None and hasattr(dev, "recvfrom"):
+            return dev.recvfrom(uc, buf, n, flags)
+        sched = self.emu.sched
+        if sched is None or getattr(sched, "current", None) is None:
+            return self._ret(uc, self.EAGAIN, error=True)
+        if flags & self.MSG_DONTWAIT:
+            self._ret(uc, self.EAGAIN, error=True)
+            sched.block({"kind": "sleep", "ns": 5_000_000}, deadline_ns=sched.now_ns() + 5_000_000,
+                        timeout_ret=(self.EAGAIN, True))
+            return
+        self._ret(uc, self.EAGAIN, error=True)
+        sched.block({"kind": "net_recv", "fd": fd})          # no deadline: parked for good
+
     def sys_connect(self, uc):
         # connect(fd, sockaddr *, len): FreeBSD sockaddr_un = {u8 len; u8 family;
         # char path[104]}.
@@ -619,6 +647,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         ("SceUserService", 0x3000F): "_ipmi_user_id_list",
         ("SceUserService", 0x3000C): "_ipmi_user_id_one",      # GetForegroundUser
         ("SceUserService", 0x30011): "_ipmi_user_id_one",      # GetInitialUser
+        ("SceMbusIpc", 0xCE110028): "_ipmi_mbus_device_list",  # GetDeviceList (pads for libScePsm)
     }
 
     # An empty reply zeroes each small out buffer the caller declares, because the declared size
@@ -662,6 +691,35 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if call["out"]:
             self._ipmi_out(uc, call, 0, struct.pack("<I", self.USER_ID))
         return 0
+
+    def _ipmi_mbus_device_list(self, uc, call):
+        """SceMbusIpc 0xce110028 (GetDeviceList): in[0] = 0x110 bytes (a 0x100 filter + 0x10), out =
+        [entries (0x100 each, <= 16), u32 count, u32 count]. libScePsm asks for each device class it
+        can drive as a pad; the emulated DualShock 4 (mbus.py) is reported only when PSEMU_PAD is set to
+        something other than 'off' (the default: with a pad registered the shell's main thread later
+        parks on a libScePsm semaphore that nothing posts, see docs/shellui-boot/README.md). The method
+        RESULT code is the number of entries (libSceMbus hands it back as the count)."""
+        import os
+        import struct
+        from . import mbus
+        flt = b""
+        if call["in"]:
+            d, sz = call["in"][0]
+            flt = bytes(uc.mem_read(d, min(sz, 0x100))) if d and sz else b""
+        devices = [] if os.environ.get("PSEMU_PAD", "off").lower() == "off"             else [mbus.pad_entry(0, self.USER_ID)]
+        cap = (call["out"][0][1] // mbus.ENTRY_SIZE) if call["out"] else 0
+        found = mbus.device_list(devices, flt, cap)
+        if call["out"]:
+            self._ipmi_out(uc, call, 0, b"".join(found))
+        for i in (1, 2):
+            if len(call["out"]) > i:
+                self._ipmi_out(uc, call, i, struct.pack("<I", len(found)))
+        seen = self.__dict__.setdefault("_mbus_logged", set())
+        key = (struct.unpack_from("<I", flt.ljust(0x10, b"\xff"), 0xC)[0], len(found))
+        if key not in seen:
+            seen.add(key)
+            self.emu.log(f"  [ipmi] SceMbusIpc GetDeviceList class={key[0]:#x} -> {len(found)} device(s)")
+        return len(found)       # libSceMbus returns the method result code as the device count
 
     def _ipmi_syscore_my_app_id(self, uc, call):
         """SceSysCoreApp2 0xAA120009: out[0] = u32 app id of the calling

@@ -538,19 +538,31 @@ class RandomDevice(Device):
 # 'H' group. All are "small struct holding an output pointer + arguments in, the kernel writes
 # through the pointer". What has been reversed from libScePad (see docs/shellui-boot/README.md):
 #   0x80084809  scePadSetProcessPrivilege  {u32 3; u32 privilege}
-#   0x80084803  scePadOpen / Close          {i32 id; i32 3}; returns the kernel handle (>= 0)
+#   0x800c4802  scePadOpen*                 {i32 id (-1 = any); i32 type; i32 0}: returns the pad
+#                                            handle (1..3: libScePad's read takes a port <= 3)
+#   0x80084803  scePadClose                 {i32 3; i32 handle}
 #   0x80204829  scePadRead/ReadState        {u32 port; u32 _; void *buf; u32 count; u32 _;
 #                                            u32 *out_count}: writes up to `count` pad reports to buf
 #                                            and returns how many (0 = nothing new, < 0 = error);
 #                                            report: +0 u64 timestamp us, +0x0c u32 buttons,
 #                                            +0x10 lx ly rx ry l2 r2 (u8)
+#   0x8010480e  scePadGetControllerInformation  {u32 handle; u64 *out}: fills a 0x40+ byte block
+#                                            (see padsrc.controller_info_block): +0x00 u8 class (2),
+#                                            +0x10 u16 vendor, +0x12 u16 product, +0x34 u32 pixel
+#                                            density, +0x38/+0x3a u16 touchpad size, +0x3c/+0x3d u8
+#                                            stick dead zones
+#   0x80104801  scePadGetCapability         {u32 handle; u64 *out}: a block whose dword at +0x24 is the
+#                                            capability flags (zeros here)
 #   0x8010480f  {u64 *out; u32 arg}: the kernel writes a u64 (a counter/time; semantics unknown)
 # Everything else is logged once and answered with 0 (the generic Device.unknown).
 
 HID_SET_PROCESS_PRIVILEGE = 0x80084809
-HID_PAD_OPEN = 0x80084803
+HID_PAD_OPEN = 0x800C4802
+HID_PAD_CLOSE = 0x80084803
 HID_PAD_READ = 0x80204829
-HID_QUERY_U64 = 0x8010480f
+HID_QUERY_U64 = 0x8010480F
+HID_PAD_INFO = 0x8010480E
+HID_PAD_CAPABILITY = 0x80104801
 HID_MAX_PORTS = 4
 
 
@@ -558,6 +570,7 @@ class HidDevice(Device):
     """/dev/hid: one DualShock 4 on port 0 (the host's XInput pad, or an idle one; see padsrc.py)."""
 
     _handles = 0
+    _last = None            # (PadState, timestamp us) of the last report handed out
 
     def __init__(self, sc, path):
         super().__init__(sc, path)
@@ -570,13 +583,21 @@ class HidDevice(Device):
         return int((t() if t else 0.0) * 1_000_000)
 
     def ioctl(self, uc, req, argp):
+        from . import padsrc
         if req == HID_PAD_READ:
             return self._read(uc, argp)
         if req == HID_PAD_OPEN:
-            HidDevice._handles += 1
-            self.log(f"pad open {self.rd(uc, argp, 8).hex()} -> handle {HidDevice._handles}")
+            HidDevice._handles = HidDevice._handles % 3 + 1
+            self.log(f"pad open {self.rd(uc, argp, 12).hex()} -> handle {HidDevice._handles}")
             return HidDevice._handles
+        if req == HID_PAD_CLOSE:
+            return 0
         if req == HID_SET_PROCESS_PRIVILEGE:
+            return 0
+        if req in (HID_PAD_INFO, HID_PAD_CAPABILITY):
+            out = self.u64(uc, argp + 8)
+            if out:
+                uc.mem_write(out, padsrc.controller_info_block() if req == HID_PAD_INFO else bytes(0x30))
             return 0
         if req == HID_QUERY_U64:
             out = self.u64(uc, argp)
@@ -596,7 +617,14 @@ class HidDevice(Device):
         if count < 1 or not buf:
             return 0
         self.reads += 1
-        uc.mem_write(buf, padsrc.encode_report(self.source.poll(), self._now_us()))
+        state = self.source.poll()
+        now = self._now_us()
+        # An unchanged controller keeps its last timestamp (refreshed every 250 ms): a fresh stamp on
+        # every poll made libScePsm treat each poll as new input and flood the UI with events.
+        last = HidDevice._last
+        if last is None or last[0] != state or now - last[1] >= 250_000:
+            HidDevice._last = last = (state, now)
+        uc.mem_write(buf, padsrc.encode_report(state, last[1]))
         if out_n:
             self.w32(uc, out_n, 1)
         return 1

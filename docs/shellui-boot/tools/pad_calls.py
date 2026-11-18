@@ -27,6 +27,7 @@ NAMES = ("scePadInit scePadOpen scePadClose scePadRead scePadReadState scePadGet
          "scePadIsValidHandle scePadSetProcessPrivilege scePadSetProcessFocus scePadReadHistory "
          "scePadOpenExt scePadResetLightBar scePadSetMotionSensorState").split()
 tab = {elfsyms.nid(n): n for n in NAMES}
+tab["d7bXuEBycDI"] = "scePadOpenByMbusDevice"      # internal: (u64 device id, type, flags)
 exports = {}
 for sym, val in elfsyms.symtab(LIB).items():
     k = sym.split("#")[0]

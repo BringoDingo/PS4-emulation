@@ -7,7 +7,7 @@ import ctypes
 import struct
 import sys
 
-from . import devices, padsrc
+from . import devices, mbus, padsrc
 
 
 class FakeMem:
@@ -112,6 +112,46 @@ def main():
     check("XInput up on the left stick -> ly 0", full.ly == 0, "(ly=%d)" % full.ly)
     check("XInput source degrades to an idle pad without a controller",
           isinstance(padsrc.XInputSource().poll(), padsrc.PadState))
+    # ---- the SceMbusIpc device list (mbus.py)
+    ent = mbus.pad_entry(0, 0x10000001)
+    check("pad entry is 0x100 bytes with a non-zero device id", len(ent) == 0x100
+          and struct.unpack_from("<Q", ent, 0)[0] != 0)
+    check("entry: class 2, local connection (not remote/share play), user id",
+          struct.unpack_from("<III", ent, 0x08)[0] == 0 and struct.unpack_from("<I", ent, 0x0C)[0] == 2
+          and struct.unpack_from("<I", ent, 0xC8)[0] == 0x10000001)
+    wild = b"\xff" * 0x100
+    f2 = bytearray(wild)
+    struct.pack_into("<I", f2, 0x0C, 2)
+    f3 = bytearray(wild)
+    struct.pack_into("<I", f3, 0x0C, 3)
+    fu = bytearray(wild)
+    struct.pack_into("<I", fu, 0xC8, 0x10000002)
+    check("class filter 2 matches the pad, class 3 does not",
+          len(mbus.device_list([ent], bytes(f2))) == 1 and mbus.device_list([ent], bytes(f3)) == [])
+    check("a wildcard filter matches; another user's filter does not",
+          len(mbus.device_list([ent], wild)) == 1 and mbus.device_list([ent], bytes(fu)) == [])
+    check("the result is capped by the requested count", mbus.device_list([ent, ent, ent], wild, 2) == [ent, ent])
+
+    # ---- open / close / info / capability ioctls
+    uc.mem_write(0x7000, struct.pack("<iii", -1, 3, 0))
+    h = [dev.ioctl(uc, devices.HID_PAD_OPEN, 0x7000) for _ in range(4)]
+    check("pad open (0x800c4802) hands out handles 1..3 (a port number <= 3, never 0)",
+          all(1 <= x <= 3 for x in h) and h[0] != 0, "(%s)" % h)
+    uc.mem_write(0x7100, struct.pack("<ii", 3, h[0]))
+    check("pad close (0x80084803) returns 0", dev.ioctl(uc, devices.HID_PAD_CLOSE, 0x7100) == 0)
+    uc.mem_write(0x7200, struct.pack("<IIQ", h[0], 0, 0x7300))
+    uc.mem_write(0x7300, b"\xee" * 0x60)
+    check("controller information (0x8010480e) returns 0", dev.ioctl(uc, devices.HID_PAD_INFO, 0x7200) == 0)
+    blk = bytes(uc.mem_read(0x7300, 0x60))
+    check("info block: class 2, Sony vendor, DS4 v2 (not the blocked 0x0bb2), touchpad, dead zones",
+          blk[0] == 2 and struct.unpack_from("<HH", blk, 0x10) == (0x054C, 0x09CC)
+          and struct.unpack_from("<HH", blk, 0x38) == (1920, 942) and blk[0x3C] == blk[0x3D] == 0x20)
+    check("info block stays inside the guest's 0x48-byte buffer (the canary follows it)",
+          blk[0x48:0x60] == b"\xee" * 0x18)
+    uc.mem_write(0x7300, b"\xee" * 0x60)
+    check("capability (0x80104801) returns 0 and writes <= 0x30 bytes",
+          dev.ioctl(uc, devices.HID_PAD_CAPABILITY, 0x7200) == 0
+          and bytes(uc.mem_read(0x7330, 0x20)) == b"\xee" * 0x20)
     print("hid model:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
