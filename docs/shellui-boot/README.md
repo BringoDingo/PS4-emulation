@@ -80,3 +80,35 @@ other jobs for part of the run, so the true speedup may be slightly under 3.6x.
 Find out where the main thread is at 4-8B instructions (stack dumps at 4B/6B were running
 when this was written) and whether `PluginManager.Load` of the BGLayer plugin is making
 progress or spinning on something psemu does not provide.
+
+
+## Update 2026-11-18: WHP backend, and the stall moved
+
+Run on the WHP backend (`--backend whp`, see `docs/whp-backend-plan.md`) the boot reaches its stall in
+~15 s, so experiments are cheap. Findings:
+
+* **A WHP-port bug had been masking the real state.** `thr_get_ucontext` read the target thread's
+  registers through Unicorn's `UcContext.reg_read`; the WHP context lacked it, so Mono's stop-the-world
+  saw all-zero contexts and spun on suspend/get/resume (769k `thr_resume_ucontext` in 240 s) while the
+  main thread sat in a Mono sleep loop. `WhpContext` (whp_uc.py) fixed it.
+* **With that fixed the main thread is no longer in EvalBGLayer or hung**: it runs
+  `BootManager.Evaluate` -> EvalBase (all six `BootHelper.Boot` plugins + the Base plugin are requested),
+  `BasePlugin.OnLoading/OnLoaded` run, and the main thread enters the normal frame loop
+  (`Application.Run -> UISystem.Update -> FrameTask.Update`, `UIRenderer.End -> SwapBuffers`).
+  Event flags set by the boot steps: 0x800000 0x400000000000 0x2000000 0x1000000 0x2000 0x200000
+  0x100000 0x10000000 0x4000000 0x20 0x40 0x200 0x1000000000 ... 0x80000000000.
+* **What still never happens:** `PluginManager.ProcessLoaded` runs for BGLayer + the six Boot plugins
+  (7 calls) but not for the Base plugin, so its Loaded callback `BootManager.<EvalBase>b__e`
+  (ClearInitialPowerLock + SetEventFlag 0x400) never fires, and `BackgroundInitDaemons` /
+  `BackgroundInitResetSurfaceRect` keep waiting on 0x400 / 0x8000000. A ninth `BootHelper.Boot`
+  plugin load (after Base) also never reaches ProcessLoaded. The open question is why the Base
+  scene's Loaded action (`SceneManager.UpdateSceneAction`+0x26b -> `<LoadInternal>b__2`) is not
+  dispatched although `BasePlugin.OnLoaded` ran.
+* Exceptions seen in 40 s: ProfileCache `UnauthorizedAccessException` (FileStream, user image files),
+  `KeyNotFoundException` in `QuickMenuPlugin.OnLoading -> CxmlLoader.GetResource` (resource not loaded),
+  `GlsConfigFile.Parse` `ArgumentNullException`. None is inside BasePlugin.OnLoaded.
+
+New tools (WHP backend, frame-pointer based, run in 20-60 s): `fp_stacks.py` (live stacks, `all`),
+`fp_timeline.py` (sample one thread's stack over time), `trace_methods.py` (int3-trace named managed
+methods with args / call chains, any assembly via `MODULE=`), `bootmgr_evf.py` (BootManager event
+flag sets with time). `shellui_stacks.py` also accepts `20s` for WHP.

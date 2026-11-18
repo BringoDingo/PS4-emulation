@@ -7,8 +7,13 @@ from psemu.emulator import Emulator
 from aotsym import AotResolver, FILE_INFO_NID
 EXE = r"D:\Ps4Tools\ps4kernel\firmware\system_ex\app\NPXS20001\eboot.bin"
 FW = r"D:\Ps4Tools\ps4kernel\firmware"
-N = int(sys.argv[1]) if len(sys.argv) > 1 else 900_000_000
-emu = Emulator(EXE, max_insns=N, fw_root=FW); emu.max_modules = 80
+# argument: instruction count (Unicorn), or "20s" = run 20 wall-clock seconds on the WHP backend
+arg = sys.argv[1] if len(sys.argv) > 1 else "900000000"
+if arg.endswith("s"):
+    emu = Emulator(EXE, fw_root=FW, backend="whp"); emu.max_seconds = float(arg[:-1])
+else:
+    emu = Emulator(EXE, max_insns=int(arg), fw_root=FW)
+emu.max_modules = 80
 emu.log = lambda *a, **k: None
 emu.run()
 uc = emu.uc
@@ -65,7 +70,7 @@ for t in sched.threads.values():
         rsp = uc.reg_read(X.UC_X86_REG_RSP)
     else:
         try:
-            rsp = t.ctx.reg_read(X.UC_X86_REG_RSP)
+            rsp = t.ctx.r[4] if isinstance(t.ctx, tuple) else t.ctx.reg_read(X.UC_X86_REG_RSP)
         except Exception:
             continue
     w = t.wait if isinstance(t.wait, dict) else t.wait

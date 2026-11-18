@@ -111,6 +111,37 @@ def _pte_flags(prot):
     return f
 
 
+class WhpContext:
+    """A saved thread context (what Unicorn's UcContext is): registers + FS/GS base + vector state.
+    reg_read/reg_write let code that inspects a suspended thread (thr_get_ucontext /
+    thr_set_ucontext, Mono's stop-the-world) work on it exactly like on a live CPU."""
+    __slots__ = ("r", "fs", "gs", "xs")
+
+    def __init__(self, r, fs, gs, xs):
+        self.r, self.fs, self.gs, self.xs = r, fs, gs, xs
+
+    def reg_read(self, reg):
+        i = IDX.get(reg)
+        if i is not None:
+            return self.r[i]
+        if reg == X.UC_X86_REG_FS_BASE:
+            return self.fs
+        if reg == X.UC_X86_REG_GS_BASE:
+            return self.gs
+        raise UcError(21)
+
+    def reg_write(self, reg, value):
+        i = IDX.get(reg)
+        if i is not None:
+            self.r[i] = value & 0xFFFFFFFFFFFFFFFF
+        elif reg == X.UC_X86_REG_FS_BASE:
+            self.fs = value & 0xFFFFFFFFFFFFFFFF
+        elif reg == X.UC_X86_REG_GS_BASE:
+            self.gs = value & 0xFFFFFFFFFFFFFFFF
+        else:
+            raise UcError(21)
+
+
 class WhpUc:
     """Drop-in for the parts of unicorn.Uc that psemu uses (see module docstring)."""
 
@@ -288,16 +319,15 @@ class WhpUc:
                  "xsave set")
 
     def context_save(self):
-        return (list(self._r), self.fs_base, self.gs_base, self._xsave_get())
+        return WhpContext(list(self._r), self.fs_base, self.gs_base, self._xsave_get())
 
     def context_restore(self, ctx):
-        r, fs, gs, xs = ctx
-        self._r = list(r)
+        self._r = list(ctx.r)
         self._dirty = True
-        if (fs, gs) != (self.fs_base, self.gs_base):
-            self.fs_base, self.gs_base = fs, gs
+        if (ctx.fs, ctx.gs) != (self.fs_base, self.gs_base):
+            self.fs_base, self.gs_base = ctx.fs, ctx.gs
             self._seg_dirty = True
-        self._xsave_set(xs)
+        self._xsave_set(ctx.xs)
 
     # ------------------------------------------------------------------ guest memory
     def _find(self, addr):
