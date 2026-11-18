@@ -529,3 +529,38 @@ compiled into the binaries) show:
   idle" with consistent structures, then feed button/stick state from the host (keyboard/XInput).
   Next step is to reverse the structures from the call sites (static: `tools/elfdis.py`, `sdis.py`;
   dynamic: `hid_trace.py` with a fake device that logs all requests the stack makes).
+
+## Update 2026-11-18 (night): /dev/hid model and what gates pad use in the shell
+
+**Controller on the host.** Nothing to wake: no XInput pad is connected (all four slots report
+"not connected") and no Sony HID interface (VID 054C) is visible to Windows, i.e. DS4Windows is not
+running, the pad is off, or HidHide is hiding it. Nothing was sent to any device.
+
+**Model.** `devices.HidDevice` (`/dev/hid`) decodes what libScePad was reversed to send:
+`0x80204829` = `scePadReadState` read `{u32 port; u32 _; void *buf; u32 count; u32 _; u32 *out_count}`
+-> writes a report (`+0` u64 timestamp us, `+0x0c` u32 button word, `+0x10` lx ly rx ry l2 r2) and
+returns the count; `0x80084803` = `scePadOpen` (returns a handle); `0x80084809` =
+`scePadSetProcessPrivilege`; `0x8010480f` `{u64 *out; u32 arg}` writes a u64 (semantics unknown);
+every other request is logged once and answered 0. `padsrc.py` supplies the state: the first XInput pad
+(DS4Windows exposes the DS4 as an Xbox 360 pad: A/B/X/Y = cross/circle/square/triangle, Back = touchpad
+click), else an idle controller; `PSEMU_PAD=none|xinput|script` (`PSEMU_PAD_BUTTONS=CROSS,DOWN`).
+`python -m psemu.tools_hidtest` covers the layout, return values, button/axis encoding.
+
+**The shell never reaches it yet.** `tools/pad_calls.py` (hooks every libScePad export) shows that in
+60 s of boot only `scePadInit` (from `libScePsm`) and `scePadSetProcessPrivilege(1)` (from the eboot) run:
+no `scePadOpen`, no `scePadReadState`, no `scePadGetControllerInformation`. From the disassembly:
+
+* The ShellUI (a privileged system app) and `libScePsm` import only `scePadReadState` (not `scePadOpen`):
+  they read by port number. `libScePsm`'s poll function (`+0x80bac`) walks up to 8 pad slots and calls
+  `scePadReadState` only for slots whose active flag was set by its add-pad function (`+0x81a..`), which
+  first calls `scePadGetControllerInformation` for the pad's port. That registration is driven from the
+  managed side and has not happened: nothing has told the shell a controller exists.
+* The `[ScePsP:InputCtrl] LOST PAD DATA` thread (`libScePsm+0x7f690`) is *not* about missing data: it
+  waits on an equeue fed by a **video-out event** (kevent filter -13) and logs when two events are
+  more than 100 ms apart, so it measures our vblank cadence (a pacing symptom, ~60 lines per minute).
+* `tools/kev_filters.py` (kevent registrations by filter/ident), `plt_callers.py` (call sites of an
+  imported function), `elfsyms.py` (export table + NIDs), `xref_mod.py` are the new helpers.
+
+Next: find which managed/native call registers a pad (hook `libScePsm+0x81a..` and walk back), and
+decide how a connected controller is announced (user-service login / pad events), then the
+`scePadGetControllerInformation` ioctl; separately the 100 ms vblank gaps.

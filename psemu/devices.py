@@ -532,7 +532,78 @@ class RandomDevice(Device):
         return n
 
 
+# ---------------------------------------------------------------- /dev/hid
+#
+# libScePad (and the copy linked into the ShellUI) drive the controllers through ioctls on /dev/hid,
+# 'H' group. All are "small struct holding an output pointer + arguments in, the kernel writes
+# through the pointer". What has been reversed from libScePad (see docs/shellui-boot/README.md):
+#   0x80084809  scePadSetProcessPrivilege  {u32 3; u32 privilege}
+#   0x80084803  scePadOpen / Close          {i32 id; i32 3}; returns the kernel handle (>= 0)
+#   0x80204829  scePadRead/ReadState        {u32 port; u32 _; void *buf; u32 count; u32 _;
+#                                            u32 *out_count}: writes up to `count` pad reports to buf
+#                                            and returns how many (0 = nothing new, < 0 = error);
+#                                            report: +0 u64 timestamp us, +0x0c u32 buttons,
+#                                            +0x10 lx ly rx ry l2 r2 (u8)
+#   0x8010480f  {u64 *out; u32 arg}: the kernel writes a u64 (a counter/time; semantics unknown)
+# Everything else is logged once and answered with 0 (the generic Device.unknown).
+
+HID_SET_PROCESS_PRIVILEGE = 0x80084809
+HID_PAD_OPEN = 0x80084803
+HID_PAD_READ = 0x80204829
+HID_QUERY_U64 = 0x8010480f
+HID_MAX_PORTS = 4
+
+
+class HidDevice(Device):
+    """/dev/hid: one DualShock 4 on port 0 (the host's XInput pad, or an idle one; see padsrc.py)."""
+
+    _handles = 0
+
+    def __init__(self, sc, path):
+        super().__init__(sc, path)
+        from . import padsrc
+        self.source = padsrc.get_source()
+        self.reads = 0
+
+    def _now_us(self):
+        t = getattr(self.emu, "_time", None)
+        return int((t() if t else 0.0) * 1_000_000)
+
+    def ioctl(self, uc, req, argp):
+        if req == HID_PAD_READ:
+            return self._read(uc, argp)
+        if req == HID_PAD_OPEN:
+            HidDevice._handles += 1
+            self.log(f"pad open {self.rd(uc, argp, 8).hex()} -> handle {HidDevice._handles}")
+            return HidDevice._handles
+        if req == HID_SET_PROCESS_PRIVILEGE:
+            return 0
+        if req == HID_QUERY_U64:
+            out = self.u64(uc, argp)
+            if out:
+                self.w64(uc, out, 0)
+            return 0
+        return self.unknown(uc, req, argp)
+
+    def _read(self, uc, argp):
+        from . import padsrc
+        port = self.u32(uc, argp)
+        buf = self.u64(uc, argp + 8)
+        count = self.u32(uc, argp + 0x10)
+        out_n = self.u64(uc, argp + 0x18)
+        if port >= HID_MAX_PORTS:
+            return -22                                   # EINVAL
+        if count < 1 or not buf:
+            return 0
+        self.reads += 1
+        uc.mem_write(buf, padsrc.encode_report(self.source.poll(), self._now_us()))
+        if out_n:
+            self.w32(uc, out_n, 1)
+        return 1
+
+
 DEVICES = {
+    "/dev/hid": HidDevice,
     "/dev/urandom": RandomDevice,
     "/dev/random": RandomDevice,
     "/dev/gc": GcDevice,
