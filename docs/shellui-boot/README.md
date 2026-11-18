@@ -340,3 +340,34 @@ wrapper, via the managed Sce.Vsh.Db.Shared / Sce.Vsh.SQLite connection). Still t
 logs Open ReadOnly x2 then Close key[...app.dbReadOnly]), so a closed/invalid cached connection
 is a candidate. The managed SQLite natives (Prepare2Native/StepNative in Sce.Vsh.SQLite) are not
 reachable by the wrapper-level tools; hooking them is the next step.
+
+## Update 2026-11-18 (night): the home screen draws its content row
+
+Hooking the managed SQLite calls (`msql.py`: `Sce.Vsh.SQLite.SQLite3.Open/Prepare2/Step/Column*`
+and `ConnectionManager`) showed the real list queries, which the native-wrapper tools could not
+see. The home content area is fed by:
+
+    select count(*) from tbl_appbrowse_<uid> where (visible = 1) and ((dispLocation & 1) <> 0)
+                                              and (parentFolderId IS NULL)
+    ... where (visible = 1) and ((dispLocation & 2) <> 0) and (folderType <> 1) order by lastAccessIndex desc
+    ... where (visible = 1) and (presentBoxStatus = 0) and (category <> 'pn3' and <> 'pn4')
+                                              and (folderType <> 1) order by sortPriority, lastAccessIndex desc
+
+In SQL a comparison with NULL is never true, so rows with NULL `dispLocation`, `folderType` or
+`presentBoxStatus` can never match - which is why `AccessorIterator.GetCount` was 0 (and why the
+`contentType` experiments changed nothing). The apps' own `param.sfo` carries `DISP_LOCATION_1` /
+`DISP_LOCATION_2` (position in the two display areas; non-zero = shown, 0xFFFFFFFF = shown without
+a fixed slot) on 23 of 44 apps. `appdb.py` now carries those into `tbl_appinfo` and derives
+`dispLocation` (bit n-1 set when DISP_LOCATION_n is set; the bit semantics are inferred from the
+filters), and sets `folderType = 0`, `presentBoxStatus = 0` like a normal non-folder row.
+
+Result: the home-count query matches 22 rows (What's New, TV & Video, Library, PlayStation Store,
+PlayStation Video/Now/Music Unlimited, Spotify, Media Player, ... - what a PS4 home lists),
+`AccessorIterator.GetCount` returns 21 instead of 0, and the shell draws its content row with the
+icons loaded from each app's `sce_sys/icon0.png`, a focused tile with its "Start" button, the title
+label, the info panel and the bottom hint bar.
+
+Open issue (separate): in `--frames` runs the process aborts inside the native GPU library
+(`gnm_submit` -> "Fatal Python error: Aborted") after ~1000 command buffers once these richer
+frames render; a plain run without `--frames` completed cleanly (exit 0, 70 s). Not yet
+diagnosed - likely a path exercised by the scanout write-back used for frame dumps.

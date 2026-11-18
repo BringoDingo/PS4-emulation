@@ -67,6 +67,23 @@ def discover_titles(fw_root):
     return out
 
 
+def _num(v):
+    """param.sfo values arrive as int or numeric str; 0xFFFFFFFF is a valid 'set' marker."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def disp_location(sfo):
+    """The browse table's dispLocation bitmask. param.sfo carries DISP_LOCATION_1 / _2 (the app's
+    position in the two display areas; non-zero = shown there, 0xFFFFFFFF = shown, no fixed slot);
+    the shell's list queries test bit 0 / bit 1 of dispLocation (`(dispLocation & 1) <> 0` for the
+    home content area, `& 2` for the second list), so bit n-1 is set when DISP_LOCATION_n is set.
+    An app with neither key is not listed in either area."""
+    return (1 if _num(sfo.get("DISP_LOCATION_1")) else 0) | (2 if _num(sfo.get("DISP_LOCATION_2")) else 0)
+
+
 def _browse_row(tid, rel_dir, sfo, order):
     """One tbl_appbrowse_<uid> row. Values chosen to describe an installed, visible application."""
     return {
@@ -81,6 +98,11 @@ def _browse_row(tid, rel_dir, sfo, order):
         "category": sfo.get("CATEGORY", ""),
         "uiCategory": sfo.get("CATEGORY", ""),
         "entitlement": 0,
+        # the shell's list queries compare these with =, <> and &: a NULL never matches, so a real
+        # row has them set (folderType 0 = not a folder; presentBoxStatus 0 = no present-box state)
+        "dispLocation": disp_location(sfo),
+        "folderType": 0,
+        "presentBoxStatus": 0,
     }
 
 
@@ -104,8 +126,8 @@ def _appinfo_rows(tid, rel_dir, sfo, order):
         "#_access_index": 0,
         "#_size": 0,
         "#_mtime": 0,
-        "DISP_LOCATION_1": 0,
-        "DISP_LOCATION_2": 0,
+        "DISP_LOCATION_1": _num(sfo.get("DISP_LOCATION_1")),
+        "DISP_LOCATION_2": _num(sfo.get("DISP_LOCATION_2")),
         "_contents_location": 0,
         "_path_info": 0,
         "_path_info_2": 0,
