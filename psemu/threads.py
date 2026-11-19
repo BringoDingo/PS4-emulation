@@ -298,6 +298,6 @@ class Scheduler:
 
     def summary(self):
         if self.created == 0:
-            return "threads: main only"
+            return "threads: main only; " + self.describe()
         return (f"threads: {len(self.threads)} ({self.created} created), "
                 f"{self.switches} switches; " + self.describe())

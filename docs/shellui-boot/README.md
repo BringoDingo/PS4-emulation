@@ -1035,3 +1035,20 @@ What it hits next (open): `SceLncService.0x30010` (getAppStatus) -> `0x80940004`
 `0xaa110012`/`0xaa110002` -> `0x80aa000c` (the app is not a registered application in SceSysCore/LncService: the
 real launch registers the spawned pid with SceSysCoreApp2 and LncService before the app asks), then the process
 ends with `exit(0)`. ShellCore itself reports `Main thread has frozen in sceApplicationSignalShellCoreHeartBeat()`.
+
+### 2026-11-19 (end 3): the spawned ShellUI gets through Mono/PSM start-up and fails in `initializeSystemAfterPsm`
+What it took (each found from the real firmware's own output):
+* **App id**: SceSysCore's spawn *sets* `sysctl kern.proc.appinfo.<pid>` (0x48-byte AppInfo, app id first: ShellCore
+  `0x60000100`, NPXS20001 `0x60000201`); a read returns that. The ShellUI asked SceSysCore about the id psemu used to
+  invent (`0x3e8`) and got `0x80aa000c`. The set is stored machine-wide (`System.appinfo`), reads use it, each
+  process's own id follows, and the old HLE "my app id" answer (SceSysCoreApp2 0xaa120009) returns it too.
+* **SceLncService.0x30010 (getAppStatus)** now answers 0 for the ShellUI; **SceNpService / SceNpTrophyIpc / SceNpMgrIpc**
+  stay on the HLE: ShellCore's np_ipc2 servers answer the ShellUI's first calls with "invalid syncMethodId" and never
+  reply (their method tables depend on state psemu does not model), and the ShellUI then fails. A request the server
+  drops (thread back in `receive` without a reply) now completes with an error instead of hanging the client.
+* `kern.backup_restore_mode`, `machdep.curr_manumode`, `machdep.idps` (dummy 16 bytes) exist.
+Now the process prints `[PSM] ... Loading ...`, starts MonoVM, the Login manager, the pad stack, `/dev/dce` ... and stops
+with `init_system.cpp(715) initializeSystemAfterPsm: LX_ISOK2::0x80f61308` -> `Assertion Failed (0 <=
+initializeSystemAfterPsm())`. The failing call (`eboot+0x87860` -> `0x87fb0`) is two libSceAudioIn/Out exports (NIDs
+`IQtWgnrw6v8`, `O3FM2WXIJaI`, both called with `(0x107, 0)`, the restricted-port type) that must return 0; one
+does not. Next: find what they check (state kept in libSceAudioIn/Out, filled by the SceSysAudioSystemIpc answers).

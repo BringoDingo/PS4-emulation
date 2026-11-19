@@ -132,6 +132,11 @@ NAMED_SYSCTLS = {
     # name made ShellCore abort its init ("*CRITICAL ERROR* Failed to initialize DataTransfer") and shut down.
     # 0 = the console is not in backup/restore mode.
     "kern.backup_restore_mode": _struct.pack("<i", 0),
+    # The ShellUI's initializeSystemAfterPsm reads both (the shell's own init failed with 0x80f61308 when they were
+    # missing): the current manufacturing mode (0 = a normal retail unit) and the console IDPS (16 bytes; a fixed
+    # dummy value, not any real console's).
+    "machdep.curr_manumode": _struct.pack("<i", 0),
+    "machdep.idps": bytes(range(0xC0, 0xD0)),
 }
 
 SYSCALLS.update(DYNLIB_SYSCALLS)
@@ -478,6 +483,12 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             self.emu.log(f"  [rfork] flags={flags:#x}: no RFMEM - continuing as the child")
             uc.reg_write(UC_X86_REG_RDX, 1)
             return self._ret(uc, self.PID)
+        try:
+            a1 = self._args(uc)[1]
+            if a1 > 0x10000 and os.environ.get('PSEMU_IPMI_TRACE'):
+                self.emu.log('  [rfork] arg1 struct: ' + bytes(uc.mem_read(a1, 0x80)).hex())
+        except Exception:
+            pass
         sysm = getattr(self.emu, 'system', None)
         if sysm is not None:                           # one pid space for the whole machine
             pid = sysm.alloc_pid()
@@ -800,7 +811,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         the kernel's AppInfo reports - the two must agree."""
         import struct
         if call["out"]:
-            self._ipmi_out(uc, call, 0, struct.pack("<I", self.APP_ID))
+            self._ipmi_out(uc, call, 0, struct.pack("<I", (getattr(self.emu, 'app_id', None) or self.APP_ID)))
         return 0
 
     def _ipmi_out(self, uc, call, i, data):
@@ -1486,6 +1497,9 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             else:
                 self.emu.log(f"  [execve] spawn '{path}' -> new process")
                 child = mgr.spawn(self.emu, resolved, argv or [path], app_root=app_root)
+                ipk = getattr(getattr(self.emu, 'system', None), 'ipmi', None)
+                if app_root and ipk is not None and ipk.last_app_id:
+                    child.app_id = ipk.last_app_id        # what SceSysCore's AppMgr allocated for it
                 self.emu.log(f"  [execve]   -> {resolved}")
                 child.child_pid = getattr(cur, "child_pid", 0)
                 self.proc_event(self.NOTE_EXEC, 0)
@@ -2823,13 +2837,29 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             return
 
         if tuple(mib[:3]) == (1, 14, 35):
-            # kern.proc.appinfo.<pid> (sceKernelGetAppInfo): the 0x48-byte
-            # AppInfo, app id first. The same id is what SceSysCore reports for
-            # this process (see _ipmi_syscore_my_app_id).
-            info = bytearray(0x48)
-            struct.pack_into("<I", info, 0, self.APP_ID)
-            self.emu.log(f"  [sysctl] kern.proc.appinfo.{mib[3] if len(mib) > 3 else '?'} "
-                         f"-> app id {self.APP_ID:#x}")
+            # kern.proc.appinfo.<pid> (sceKernelGetAppInfo): the 0x48-byte AppInfo, app id first. SceSysCore's
+            # process spawn SETS it (newp = the new process's AppInfo, the app id its AppMgr allocated); a read
+            # returns what was set for that pid, else this process's default id.
+            pid = mib[3] if len(mib) > 3 else 0
+            sysm = getattr(self.emu, "system", None)
+            store = sysm.appinfo if sysm is not None else self.__dict__.setdefault("_appinfo", {})
+            if newp and newlen:
+                try:
+                    store[pid] = bytes(uc.mem_read(newp, min(newlen, 0x48))).ljust(0x48, bytes(1))
+                except Exception:
+                    pass
+                self.emu.log(f"  [sysctl] kern.proc.appinfo.{pid} <- app id {struct.unpack_from('<I', store.get(pid, bytes(4)), 0)[0]:#x}")
+                mgr = getattr(self.emu, 'manager', None)
+                for q in (mgr.procs if mgr is not None else []):
+                    if getattr(q[0], 'child_pid', 0) == pid:
+                        q[0].app_id = struct.unpack_from('<I', store[pid], 0)[0]     # that process's own id
+                self._ret(uc, 0)
+                return
+            info = store.get(pid)
+            if info is None:
+                info = bytearray(0x48)
+                struct.pack_into("<I", info, 0, getattr(self.emu, 'app_id', None) or self.APP_ID)
+            self.emu.log(f"  [sysctl] kern.proc.appinfo.{pid} -> app id {struct.unpack_from('<I', bytes(info), 0)[0]:#x}")
             give(bytes(info))
             return
 

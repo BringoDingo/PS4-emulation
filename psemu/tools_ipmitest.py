@@ -94,7 +94,7 @@ def main():
     k.receive(srv_emu, srv_emu.uc, srv, rx, 0x3200)
     cli_emu.uc.mem_write(0x400, b"hello\0")
     cli_emu.uc.mem_write(0x500, struct.pack("<QQ", 0x400, 6))                  # in info
-    cli_emu.uc.mem_write(0x600, struct.pack("<IIIIQQQ", 0xaa120012, 1, 0, 0, 0x500, 0x700, 0x800))
+    cli_emu.uc.mem_write(0x600, struct.pack("<IIIIQQQI", 0xaa120012, 1, 0, 0, 0x500, 0x700, 0x800, 1))
     r = k.invoke_sync(cli_emu, cli_emu.uc, 0x101, "SceTest", 0x600, 0x850)
     body = bytes(srv_emu.uc.mem_read(0x2000, 0x40))
     ctx, token, method, n_in, n_out = struct.unpack_from("<QIIII", body)

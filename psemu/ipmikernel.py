@@ -56,7 +56,13 @@ class Session:
 class IpmiKernel:
     # orbis_audiod's request handler waits for SceSysAudioSystemEvfTick, a tick the audio hardware
     # model does not produce yet; routing it parks AvControl's main thread, so the HLE answers it.
-    NOT_ROUTED = frozenset({"SceSysAudioSystemIpc"})
+    # SceNpService: ShellCore's own np_ipc2 server rejects the ShellUI's first call (method 0: "invalid syncMethodId";
+    # which service table a session gets is decided from state the emulator does not model yet), and the
+    # ShellUI then fails initializeSystemAfterPsm. The HLE answers it as before.
+    # SceNpService / SceNpTrophyIpc: ShellCore's np_ipc2 servers reject every call the ShellUI makes ("invalid
+    # syncMethodId"; the method table a session gets depends on state not modelled yet) and the ShellUI then
+    # fails initializeSystemAfterPsm; the HLE answers them as before.
+    NOT_ROUTED = frozenset({"SceSysAudioSystemIpc", "SceNpService", "SceNpTrophyIpc", "SceNpMgrIpc"})
 
     def __init__(self, log=print, routed=None):
         self.log = log
@@ -68,6 +74,7 @@ class IpmiKernel:
         self.unknown = set()
         self.handling = {}              # (id(emu), tid) -> Session whose connect packet that server thread is running
         self.next_skid = 0x2000
+        self.last_app_id = None
         self.inflight = {}              # (id(emu), id(thread)) -> (Session, token) of the request that thread is serving
         self.skid_sess = {}             # session handle (cmd 0x4) -> Session
 
@@ -98,6 +105,16 @@ class IpmiKernel:
         """cmd 0x201 on a server kid. Returns True when the call completed now, False when it blocked."""
         if os.environ.get("PSEMU_IPMI_TRACE"):
             self.log(f"  [ipmi-k] {srv.name}: receive called by {getattr(emu.sched.current, 'tid', 0):#x}, queued {len(srv.queue)}")
+        got = self.inflight.pop((id(emu), id(emu.sched.current)), None)
+        if got is not None:
+            # the thread is back in receive without having answered its request (the server's dispatcher
+            # rejected it, e.g. "invalid syncMethodId"): a client must not wait for ever, so it gets an error
+            sess, token = got
+            pend = sess.pending.pop(token, None)
+            if pend is not None:
+                pend["res"] = 0x80020005
+                self.log(f"  [ipmi-k] {srv.name}.{pend['method']:#x}: dropped by the server -> error {pend['res']:#x}")
+                self._finish(pend)
         if srv.queue:
             self._deliver(emu, uc, srv, in_ptr, result_ptr, srv.queue.popleft())
             return True
@@ -114,11 +131,19 @@ class IpmiKernel:
         data = data[:size] if size else data
         if buf and data:
             uc.mem_write(buf, data)
-        if ptype == PKT_INVOKE and sid in self.sessions:
+        if ptype == PKT_INVOKE and sid in self.sessions and os.environ.get("PSEMU_IPMI_TRACE"):
+            self.log(f"  [ipmi-k] {srv.name} request served by thread {(thread if thread is not None else emu.sched.current).tid:#x}")
+        if ptype in (PKT_INVOKE, PKT_SYNC) and sid in self.sessions:
             self.inflight[(id(emu), id(thread if thread is not None else emu.sched.current))] = (self.sessions[sid], struct.unpack_from('<I', data, 8)[0])
         if ptype == PKT_CONNECT and sid in self.sessions:
             self.sessions[sid].conn_buf = buf
             self.handling[(id(emu), id(thread if thread is not None else emu.sched.current))] = self.sessions[sid]
+        if srv.name == "SceNpService" and os.environ.get("PSEMU_IPMI_TRACE") and ptype in (PKT_INVOKE, PKT_SYNC):
+            try:
+                vt = struct.unpack("<Q", bytes(uc.mem_read(srv.obj, 8)))[0]
+                self.log("  [ipmi-k] Np user object %#x vtable %#x: " % (srv.obj, vt) + " ".join(hex(x - 0x100000000) for x in struct.unpack("<10Q", bytes(uc.mem_read(vt, 80)))))
+            except Exception as e:
+                self.log(f"  [ipmi-k] Np vtable unreadable: {e}")
         if ptype in (PKT_SYNC, PKT_INVOKE) and os.environ.get("PSEMU_IPMI_TRACE"):
             try:
                 cx = struct.unpack_from('<Q', data, 0)[0]
@@ -189,6 +214,11 @@ class IpmiKernel:
             return None                                 # not routed: let the HLE answer
         a = bytes(uc.mem_read(in_ptr, 0x30))
         method, n_in, n_out = struct.unpack_from("<III", a, 0)
+        if struct.unpack_from("<I", a, 0x28)[0] == 0:
+            # flags == 0 (the first call of a client, method 0 {u32 in}, no output) is not a method the servers
+            # dispatch: np_ipc2 answers it "invalid syncMethodId: 0" and never replies. It stays with the
+            # kernel-side HLE (an empty success), as before routing.
+            return None
         p_in, p_out, p_res = struct.unpack_from("<QQQ", a, 0x10)
         ins = []
         for i in range(min(n_in, 10)):
@@ -203,11 +233,13 @@ class IpmiKernel:
             outs.append((d, sz, info))
         # packet type 0x41 (what a client sync invoke becomes on the server): u64 context, u32 token,
         # u32 method, u32 n_in, u32 n_out, then the inputs as {u32 len; bytes}, then each output's capacity
-        body = struct.pack("<QIIII", getattr(sess, "ctx", 0), token, method, len(ins), len(outs)) + b"".join(
-            struct.pack("<I", len(x)) + x for x in ins) + b"".join(struct.pack("<I", o[1]) for o in outs)
+        wire_outs = [o for o in outs if o[1] > 0]      # an output with no room is not sent
+        body = struct.pack("<QIIII", getattr(sess, "ctx", 0), token, method, len(ins), len(wire_outs)) + b"".join(
+            struct.pack("<I", len(x)) + x for x in ins) + b"".join(struct.pack("<I", o[1]) for o in wire_outs)
         th = emu.sched.current
         sess.pending[token] = {"thread": th, "emu": emu, "method": method, "outs": outs, "p_res": p_res, "rp": result_ptr}
-        self._enqueue(sess.server, PKT_INVOKE, sess.sid, body)
+        ptype = PKT_INVOKE
+        self._enqueue(sess.server, ptype, sess.sid, body)
         if os.environ.get("PSEMU_IPMI_TRACE") == "3":
             try:
                 from unicorn.x86_const import UC_X86_REG_RSP
@@ -220,7 +252,7 @@ class IpmiKernel:
                 self.log("  [ipmi-k]   client stack: " + " ".join(ch[:40]))
             except Exception as e:
                 self.log(f"  [ipmi-k]   no stack: {e}")
-        self.log(f"  [ipmi-k] sync {name}.{method:#x} in={[len(x) for x in ins]} out={[o[1] for o in outs]} flags {a[0x28:0x30].hex()} token {token}")
+        self.log(f"  [ipmi-k] sync {name}.{method:#x} in={[x[:12].hex() if len(x) <= 12 else len(x) for x in ins]} out={[o[1] for o in outs]} flags {a[0x28:0x30].hex()} token {token}")
         emu.sched.block({"kind": "ipmi_invoke", "name": name, "method": method})
         return False
 
@@ -240,6 +272,11 @@ class IpmiKernel:
             slot = struct.unpack('<Q', bytes(uc.mem_read(aux + 8, 8)))[0]
         except Exception:
             slot = 0
+        if os.environ.get('PSEMU_IPMI_TRACE'):
+            try:
+                self.log(f'  [ipmi-k]   cmd4 operands: obj {bytes(uc.mem_read(obj, 0x30)).hex()} aux {bytes(uc.mem_read(aux, 0x30)).hex()}')
+            except Exception as e:
+                self.log(f'  [ipmi-k]   cmd4 operands unreadable {e}')
         sess.ctx, sess.skid, sess.slot = obj, kid, slot
         self.skid_sess[kid] = sess
         self.log(f"  [ipmi-k] session {sess.sid:#x}: object {obj:#x}, slot {slot:#x} registered as handle {kid:#x}")
@@ -306,6 +343,8 @@ class IpmiKernel:
         except Exception as e:
             self.log(f"  [ipmi-k] reply (unreadable: {e})")
         pend["res"] = res
+        if pend["method"] == 0xaa120000 and res < 0x80000000:
+            self.last_app_id = res          # SceSysCoreApp2 createApp: the new application's id (it is then spawned)
         self._finish(pend)
         if result_ptr:
             uc.mem_write(result_ptr, struct.pack("<I", 0))
@@ -346,7 +385,9 @@ class IpmiKernel:
             return True
         if cmd == 0x444:                                  # async dispatch finished: {u32 token}, kid = session id
             sess = self.sessions.get(kid)
-            token = arg6 & 0xFFFFFFFF            # the request serial rides in the 6th argument; the payload is the method
+            token = arg6 & 0xFFFFFFFF            # type 0x41: the request serial rides in the 6th argument, the payload is the method
+            if sess and token not in sess.pending and in_ptr and size >= 4:
+                token = struct.unpack("<I", bytes(uc.mem_read(in_ptr, 4)))[0]        # type 0x43: the payload is the serial
             pend = sess.pending.pop(token, None) if sess else None
             if pend is not None:
                 self._finish(pend)
