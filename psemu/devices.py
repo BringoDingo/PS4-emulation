@@ -547,7 +547,8 @@ class RandomDevice(Device):
 # start-up (sceAjmModuleRegister) failed with 0x80b3f001 and never registered its built-in
 # `BgmPlayStatusCheck` native library; the Bgm player's P/Invoke then threw DllNotFoundException.
 # Decoding itself is not implemented: batches report "done, nothing decoded".
-# Enabled with PSEMU_AJM=1 only (see open_device): on its own it moves the failure into AudioOut.
+# On by default (PSEMU_AJM=0 turns it off, back to the generic stub): with the audio server's pacing
+# (audioserver.py), 16 KiB shm spans and the sched priority syscalls libScePsm's sound start-up completes.
 
 AJM_REQ_BASE = 0xC0288900
 AJM_INSTANCE_CREATE = 5
@@ -683,11 +684,9 @@ DEVICES = {
 
 
 def open_device(sc, path):
-    if path == "/dev/ajm" and os.environ.get("PSEMU_AJM"):
-        # Opt-in. With the decoder answering, libScePsm's audio start-up gets as far as
-        # sceAudioOutOpen and then crashes in libSceAudioOut: the audio server
-        # (SceSysAudioSystemIpc) is not modelled yet. Without it the AJM failure keeps PSM's sound
-        # init failing cleanly (and the Bgm library unregistered, see the README).
+    if path == "/dev/ajm" and os.environ.get("PSEMU_AJM", "1") not in ("0", "off", ""):
+        # The decoder answers "done, nothing decoded"; without it PSM's sound start-up fails and the
+        # Bgm native library is never registered (see the README).
         return AjmDevice(sc, path)
     cls = DEVICES.get(path)
     return cls(sc, path) if cls else None

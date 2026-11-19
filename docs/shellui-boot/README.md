@@ -2,7 +2,7 @@
 
 ## Current status (read this first; the sections below are a chronological log)
 
-Last updated after commit 7ccee36. The log below is append-only, so earlier sections describe
+Last updated after the audio start-up fix (builds on commit 7ccee36). The log below is append-only, so earlier sections describe
 problems that later sections solved: do not read an intermediate section as the current state.
 
 * **Done:** WHP backend boot to the ShellUI home screen; DB provisioning (app.db / tbl_appinfo /
@@ -13,13 +13,16 @@ problems that later sections solved: do not read an intermediate section as the 
   compositor ~5x faster (direct sampling, parallel tiler, lazy write-back behind a WHP page watch);
   network-listener CPU spin fixed; SceMbusIpc device list + `/dev/hid` model (a DualShock 4 registers and
   `scePadReadState` is polled).
-* **Open, in order:** (1) with a pad attached (`PSEMU_PAD` != off, default off) the UI dies on an unhandled
-  `DllNotFoundException: BgmPlayStatusCheck`; root cause = no audio: libScePsm's sound start-up fails, so it
-  never registers its built-in Bgm library (full chain in the 2026-11-18 "pad-attached stall: root cause"
-  section; next step: model the audio server `SceSysAudioSystemIpc` / libSceAudioOut init, then enable
-  `/dev/ajm` by default); (2) compositor frame spikes of 400-600 ms (shader translation misses, texture uploads) cause the
-  `LOST PAD DATA` lines; (3) the username shows "Unknown" (ProfileCache `_GetLocalUserInfoNative`); (4) app
-  launch via SceLncService / separate app processes; remaining stub IPC services.
+* **Pad-attached stall: fixed** (see "audio start-up: the sched priority range" below): with a pad attached
+  (`PSEMU_PAD=none|auto`) the UI keeps rendering (9000 DCBs / 60 s through the SceSysCore -> ShellUI chain,
+  exit 0). Audio start-up now completes, libScePsm registers its Bgm library, `/dev/ajm` is on by default.
+  `PSEMU_PAD` itself still defaults to off.
+* **Open, in order:** (1) the audio mixer thread decodes in a tight loop (`libSceAudiodec` -> AJM batch
+  start/wait, ~2500 ioctls/s) because the AJM model reports "done, nothing decoded" and nothing paces it; real
+  AJM job results / pacing are not modelled, and nothing is played; (2) compositor frame spikes of 400-600 ms
+  (shader translation misses, texture uploads) cause the `LOST PAD DATA` lines; (3) the username shows
+  "Unknown" (ProfileCache `_GetLocalUserInfoNative`); (4) app launch via SceLncService / separate app
+  processes; remaining stub IPC services.
 * **Constraints:** only GPL-2.0-or-later code may be reused; no firmware is committed.
 
 
@@ -678,3 +681,45 @@ Next step: model the audio server enough for `sceAudioOutInit` / `sceAudioOutOpe
 the 45 IPMI methods' replies, the shared port table and event queue), then enable `/dev/ajm` by default; the
 Bgm table registers, `BgmPlayStatusCheck` resolves to `libScePsm+0x128e60`, and the pad-attached run should keep
 rendering. (Not tried: registering the Bgm table from the host, which would hide that audio is down.)
+
+## Update 2026-11-18 (night): audio start-up - the real cause was thread priorities, not the audio server
+
+The previous section ended with "model the audio server". Chasing why `scePssSoundPlayerInitialize()` still
+returned `0x80b3f001` with `/dev/ajm` modelled, one step at a time with `regs_at`-style hooks on the return
+values (not by guessing at the 193 `mov imm, 0x80b3f001` sites: a hook on the *mov* fires whether or not the
+error branch is taken - `strlcpy` at `+0x87980` falsely looked like the culprit), gave this chain:
+
+1. `libScePsm+0x8af20` (AudioSystem init) -> `+0x94a10` (the sound player): `sceAudioOutOpen` returned
+   `0x20000007` (fine), the mixer thread was created (fine), then
+2. `+0x9f900` calls `+0x893d0` -> `+0x89300` to set the new thread's priority to `0x208`:
+   `pthread_getschedparam` -> `sched_get_priority_min/max(policy)` -> `pthread_setschedparam`. It requires
+   `min < max` for the policy, a value in range, and libkernel's `pthread_setschedparam` (`+0xada0`) only
+   accepts `SCHED_FIFO` (1) or `SCHED_RR` (3).
+3. Two gaps in psemu made that fail: syscalls 332/333 (`sched_get_priority_max/min`) were unmodelled and
+   returned 0 for both (min == max), and `rtprio_thread` (466) was unmodelled so the thread's policy read
+   back as 2 (`SCHED_OTHER`) -> `EINVAL`. The failure returned `0x80b3f001` after `sceAudioOutClose`, so
+   the whole sound system was torn down, the Bgm table never registered, and `BgmPlayStatusCheck` threw.
+
+Fixes (all in psemu, nothing hard-wired into the guest):
+* `sys_sched_get_priority_{min,max}`: the PS4 range 256..767 (SCE_KERNEL_PRIO_FIFO_HIGHEST/LOWEST) for
+  policies 1-3; `sys_rtprio_thread`: lookup returns `RTP_PRIO_FIFO` at the default 700, set is remembered
+  per thread (struct rtprio {u16 type; u16 prio}). Unverified against hardware: that FIFO/700 is the exact
+  default a console reports; it is what the libkernel logic and the SDK's default priority imply.
+* **Shared-memory spans round to 16 KiB** (Orbis mmap granularity; libSceAudioOut writes past the first
+  4 KiB page of its port shm) - this was the earlier SIGSEGV.
+* **Audio server pacing** (`audioserver.py`): the owner of `sceAudioOutMix<pid>` posts one bit per port per
+  period. The old external-evf stand-in granted the bits instantly, so with audio working the mixer thread
+  spun (750 000 `evf_wait` calls in 50 s, 1/20th of the frames). A wait on that flag now ends at the next
+  256-frame / 48 kHz period boundary of virtual time (5.33 ms) with the requested bits set. Nothing is
+  mixed or played yet.
+* `/dev/ajm` (`AjmDevice`) is now **on by default** (`PSEMU_AJM=0` -> old generic stub).
+
+Verification: `[PSM] scePssSoundPlayerInitialize()` no longer prints a failure; hooks at `libScePsm+0x1d66ae`
+(`rax == 0`) and `+0x1d68c6` (Bgm table registered) fire; 60 s direct ShellUI runs: pad off 9500 DCBs, pad
+attached (`PSEMU_PAD=none`) 9500 DCBs (before: 500 with the pad, 11500 pad-off without audio); SceSysCore ->
+ShellUI chain with a pad: 9000 DCBs, exit 0. Unit tests: `python -m psemu.tools_audiotest` (new),
+`tools_hidtest`, `tools_synctest` (40/0), `tools_policytest` (34/0), `tools_whp_uc_test`, `tools_lazywb_test`.
+
+Cost: with sound alive the decode loop runs flat out (~2500 AJM batch ioctls/s) - about 17% fewer frames than
+the audio-less boot. Pacing/results for AJM jobs are the next audio item; the audio *server* (mixing,
+`SceSysAudioSystemIpc` replies) is still "empty success" and not needed for start-up.

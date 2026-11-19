@@ -24,6 +24,8 @@ Waiters queue in arrival order (thread priorities are not modelled).
 """
 import struct
 
+from . import audioserver
+
 EPERM, EDEADLK, EACCES, EFAULT, EBUSY, EINVAL = 1, 11, 13, 14, 16, 22
 ESRCH, ETIMEDOUT, ECANCELED = 3, 60, 85
 
@@ -436,6 +438,8 @@ class SyncSyscalls:
         if ef.single and ef.waiters:
             return self._ret(uc, EPERM, error=True)
         timeout_us = self._rd32(uc, timeout_p) if timeout_p else None
+        if ef.external and audioserver.is_mix_evf(ef.name):
+            return self._audio_period_wait(uc, ef, bits, mode, result, timeout_p, timeout_us)
         if ef.external:
             # The owner process isn't emulated; on a booted console it has set
             # these bits (boot status, service ready...). ext_policy decides, per
@@ -472,6 +476,39 @@ class SyncSyscalls:
                      "on_timeout": on_timeout},
                     deadline_ns=None if timeout_us is None else sched.now_ns() + timeout_us * 1000,
                     timeout_ret=(ETIMEDOUT, True))
+
+    def _audio_period_wait(self, uc, ef, bits, mode, result, timeout_p, timeout_us):
+        """Wait on the audio server's per-port event flag: the server (not emulated) sets the bit
+        once per period, so the wait ends at the next period boundary of virtual time."""
+        sched = self.emu.sched
+        now = sched.now_ns()
+        due = audioserver.next_period(now)
+        if timeout_us is not None and now + timeout_us * 1000 < due:
+            if timeout_us == 0:
+                self._evf_result(uc, result, ef.bits)
+                return self._ret(uc, ETIMEDOUT, error=True)
+            def on_timeout(th):
+                self._evf_result(self.emu.uc, result, ef.bits)
+                if timeout_p:
+                    self._wr32(self.emu.uc, timeout_p, 0)
+            sched.block({"kind": "evf_wait", "evf": ef.handle, "name": ef.name, "bits": bits,
+                         "mode": mode, "result": result, "timeout_p": timeout_p,
+                         "on_timeout": on_timeout},
+                        deadline_ns=now + timeout_us * 1000, timeout_ret=(ETIMEDOUT, True))
+            return None
+
+        def on_period(th):
+            ef.bits |= bits                     # the server posted this port's bit
+            self._evf_result(self.emu.uc, result, ef.bits)
+            ef.consume(bits, mode)
+            if timeout_p:
+                left = 0 if timeout_us is None else max(0, now + timeout_us * 1000 - due) // 1000
+                self._wr32(self.emu.uc, timeout_p, left)
+        sched.block({"kind": "evf_wait", "evf": ef.handle, "name": ef.name, "bits": bits,
+                     "mode": mode, "result": result, "timeout_p": timeout_p,
+                     "on_timeout": on_period},
+                    deadline_ns=due, timeout_ret=(0, False))
+        return None
 
     def sys_evf_trywait(self, uc):
         # evf_trywait(handle, u64 pattern, u32 mode, u64 *result): poll

@@ -152,10 +152,12 @@ def main():
     check("capability (0x80104801) returns 0 and writes <= 0x30 bytes",
           dev.ioctl(uc, devices.HID_PAD_CAPABILITY, 0x7200) == 0
           and bytes(uc.mem_read(0x7330, 0x20)) == b"\xee" * 0x20)
-    # ---- /dev/ajm (opt-in: PSEMU_AJM=1)
+    # ---- /dev/ajm (on by default; PSEMU_AJM=0 -> generic stub)
     import os as _os
     saved = _os.environ.pop("PSEMU_AJM", None)
-    check("/dev/ajm stays the generic stub unless PSEMU_AJM is set", devices.open_device(sc, "/dev/ajm") is None)
+    check("/dev/ajm is the AjmDevice by default", isinstance(devices.open_device(sc, "/dev/ajm"), devices.AjmDevice))
+    _os.environ["PSEMU_AJM"] = "0"
+    check("PSEMU_AJM=0 gives back the generic stub", devices.open_device(sc, "/dev/ajm") is None)
     _os.environ["PSEMU_AJM"] = "1"
     aj = devices.open_device(sc, "/dev/ajm")
     check("with PSEMU_AJM=1 /dev/ajm is the AjmDevice", isinstance(aj, devices.AjmDevice))

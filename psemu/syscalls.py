@@ -1112,6 +1112,22 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     def sys_getuid(self, uc):
         self._ret(uc, 0)
 
+    # PS4 priorities run 256 (highest) .. 767 (lowest) for every policy (SCE_KERNEL_PRIO_FIFO_HIGHEST/
+    # LOWEST); libScePsm sets its audio mixer thread to 0x208 only when min < max and the value is in
+    # range (+0x89300). With both reported as 0 that failed, the sound system was torn down and the Bgm
+    # library never registered.
+    SCHED_RANGE = {1: (256, 767), 2: (256, 767), 3: (256, 767)}
+
+    def sys_sched_get_priority_max(self, uc):
+        pol = self._args(uc)[0] & 0xFFFFFFFF
+        r = self.SCHED_RANGE.get(pol)
+        self._ret(uc, 22, True) if r is None else self._ret(uc, r[1])
+
+    def sys_sched_get_priority_min(self, uc):
+        pol = self._args(uc)[0] & 0xFFFFFFFF
+        r = self.SCHED_RANGE.get(pol)
+        self._ret(uc, 22, True) if r is None else self._ret(uc, r[0])
+
     def sys_issetugid(self, uc):
         self._ret(uc, 0)
 
@@ -1881,7 +1897,10 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         shm = self.shms.get(fd) if not flags & MAP_ANON else None
         if shm is not None:
             if shm["addr"] is None:
-                span = max(length, shm["size"], 0x1000)
+                # Orbis maps with 16 KiB granularity: a 0xf28-byte shm still covers 0x4000 bytes.
+                # libSceAudioOut relies on it: its per-port table (8 x 0x250 bytes at +0x20 of a
+                # 0xf28-byte block) reaches past the first 4 KiB page.
+                span = (max(length, shm["size"], 0x1000) + 0x3FFF) & ~0x3FFF
                 # Always read+write: later mappers of the same object may ask
                 # for more access than the first one did (client maps it
                 # read-only, the owner read-write) and all share this memory.
@@ -2347,6 +2366,31 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         tid = sched.current.tid if sched and sched.current else DEFAULT_TID
         try:
             uc.mem_write(ptr, struct.pack("<q", tid))
+        except Exception:
+            return self._ret(uc, EINVAL, error=True)
+        self._ret(uc, 0)
+
+    # rtprio_thread(function, lwpid, struct rtprio *rtp {u16 type; u16 prio}): libkernel's pthread layer
+    # derives a thread's scheduling policy from it (+0x31870 getschedparam / thread init), and
+    # pthread_setschedparam rejects anything but SCHED_FIFO/SCHED_RR. A PS4 thread runs a FIFO priority
+    # (default SCE_KERNEL_PRIO_FIFO_DEFAULT = 700); until a thread sets its own, report that.
+    RTP_LOOKUP, RTP_SET = 0, 1
+    RTP_PRIO_FIFO = 10            # PRI_FIFO_BIT (8) | PRI_REALTIME (2)
+    RTPRIO_DEFAULT = (RTP_PRIO_FIFO, 700)
+
+    def sys_rtprio_thread(self, uc):
+        import struct
+        fn, lwpid, rtp = self._args(uc)[:3]
+        sched = self.emu.sched
+        cur = sched.current.tid if sched and sched.current else 0
+        tid = (lwpid & 0xFFFFFFFF) or cur
+        table = self.__dict__.setdefault("_rtprio", {})
+        try:
+            if (fn & 0xFFFFFFFF) == self.RTP_SET:
+                typ, prio = struct.unpack("<HH", bytes(uc.mem_read(rtp, 4)))
+                table[tid] = (typ, prio)
+            elif (fn & 0xFFFFFFFF) == self.RTP_LOOKUP:
+                uc.mem_write(rtp, struct.pack("<HH", *table.get(tid, self.RTPRIO_DEFAULT)))
         except Exception:
             return self._ret(uc, EINVAL, error=True)
         self._ret(uc, 0)
