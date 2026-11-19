@@ -1068,3 +1068,19 @@ Open: why the lookup of (pid, 7) fails after the registration succeeded - either
 another key (module id `0x20000007` vs index 7), or the 48-byte/4096-byte outputs of `0xce110029`/`0xce110028` (the
 reply descriptor of those has an unexpected length field and psemu does not copy them yet) carry state the client
 library needs.
+
+### 2026-11-19 (end 5): correction - the reply/output copy is fine; Mbus registration is the open question
+Following an outside review of d7bc76e (copy of its advice: instrument the existing reply path before rebuilding anything):
+`IpmiKernel.reply` now logs, with `PSEMU_IPMI_TRACE=1`, each output's client capacity, the server descriptor and pointer,
+the server length, any output it does NOT copy (length above capacity, with the raw descriptor entry) and what was
+copied. The run shows every output copied (`0xce110029` 48 bytes, `0xce110028` 4096 bytes, `0xaa120009` 4 bytes,
+`SceLncService.0x30010` 12 bytes ...), no skipped output: **the earlier note that the Mbus descriptor "has an
+unexpected length" was wrong** (that reply was `0xce11002a`, which has no output). The Mbus outputs really are zero
+(an empty device list).
+So the `0xce11000d` rejection (`not registered pid(0x3ef:0x7)`) is a server-side lookup miss, not a reply problem.
+What is known about the registration: `0xce110007` record = `{u32 1; u32 0x20000007; u32 0xff; 0; 0; 0; u32 pid}`;
+the handler (`SceSysCore+0x7dfe0`) checks the session handle == the pid field, then calls `0x48a30(1, 0x20000007,
+0xff, 0, 0, 0, pid)`, which reads the process's AppInfo (`sysctl kern.proc.appinfo.<pid>` = the 0x48 bytes SceSysCore
+itself set) and switches on a type derived from it (accepts types 0..9, bitmasks `0x2000000`/`0xf`...). The lookup
+(`0xce11000d {kind, 0x107, 0, pid}`) wants index 7 of that process. Next: log what `0x48a30` stores (key) against what
+`setStateIndex` compares (an instruction-level trace of those two functions in SceSysCore).

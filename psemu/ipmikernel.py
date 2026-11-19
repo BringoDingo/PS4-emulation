@@ -342,10 +342,16 @@ class IpmiKernel:
             for i in range(min(cnt, len(pend["outs"]))):
                 sp, ln = struct.unpack("<QQ", bytes(uc.mem_read(p + 16 * i, 16)))
                 d, cap, info = pend["outs"][i]
+                trace = os.environ.get('PSEMU_IPMI_TRACE')
+                if trace:
+                    self.log(f"  [ipmi-k]   out[{i}] {sess.server.name}.{pend['method']:#x}: client cap {cap}, descriptor {p:#x}, server ptr {sp:#x} len {ln}")
+                if sp and d and ln > cap:
+                    self.log(f"  [ipmi-k]   out[{i}] NOT COPIED: server len {ln} exceeds client capacity {cap} (descriptor raw {bytes(uc.mem_read(p + 16 * i, 16)).hex()})")
                 if sp and d and 0 < ln <= cap:
                     pend["emu"].uc.mem_write(d, bytes(uc.mem_read(sp, ln)))
                     pend["emu"].uc.mem_write(info + 16, struct.pack("<Q", ln))
-                    self.log(f"  [ipmi-k]   output {i}: {ln} bytes {bytes(uc.mem_read(sp, ln)).hex()}")
+                    if trace:
+                        self.log(f"  [ipmi-k]   out[{i}] copied {ln} bytes; client length now {ln}; data {bytes(uc.mem_read(sp, min(ln, 32))).hex()}")
             self.log(f"  [ipmi-k] reply to {sess.server.name}.{pend['method']:#x}: result {res:#x}, {cnt} output(s)")
         except Exception as e:
             self.log(f"  [ipmi-k] reply (unreadable: {e})")
