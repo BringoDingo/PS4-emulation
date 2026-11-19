@@ -17,16 +17,16 @@ problems that later sections solved: do not read an intermediate section as the 
   (`PSEMU_PAD=none|auto`) the UI keeps rendering (9000 DCBs / 60 s through the SceSysCore -> ShellUI chain,
   exit 0). Audio start-up now completes, libScePsm registers its Bgm library, `/dev/ajm` is on by default.
   `PSEMU_PAD` itself still defaults to off.
-* **Pad input reaches the UI, the UI does not react yet.** `/dev/hid` now models the read libScePad
-  really uses (`0x8030482e`, 0xa8-byte records; the old `0x80204829` was a different path), and a timed
-  button script (`PSEMU_PAD=script PSEMU_PAD_BUTTONS="14+0.5=RIGHT"`) drives it. Verified down to the
-  managed `GamePad.GetData` result (Right = 4, ButtonsDown on the edge), but focus does not move on
-  RIGHT/UP/DOWN/CROSS - see "pad input: how far it gets" below.
-* **Open, in order:** (1) find why the shell ignores pad edges that GetData delivers (modal/focus/login
-  state, or a second input path); (2) compositor frame spikes of 400-600 ms (shader translation misses,
-  texture uploads) cause the `LOST PAD DATA` lines and doubled text/icons in captured frames; (3) the
-  username shows "Unknown" (ProfileCache `_GetLocalUserInfoNative`); (4) app launch via SceLncService /
-  separate app processes; remaining stub IPC services; no AJM decoding / no audio output.
+* **The home screen now has a user and reacts to the pad.** The "Unknown" name and the ignored controller had
+  one cause: nothing answered `SceUserService` 0x30004 (the per-user string call), so the shell had no
+  logged-in user name; with "Player1" (placeholder, `PSEMU_USER_NAME` overrides) the top bar and hint bar
+  show it and scripted RIGHT/DOWN pulses move the content row. See "the user name" below.
+* **Open, in order:** (1) pad navigation is only checked by scripted pulses and frame montages (no assertion
+  yet; focus tile / launch on CROSS untested); (2) compositor frame spikes of 400-600 ms (shader translation
+  misses, texture uploads) cause the `LOST PAD DATA` lines and doubled text/icons in captured frames; (3) the
+  name is a placeholder - a real account store (user settings, avatar, theme, NP ids) is not modelled;
+  (4) app launch via SceLncService / separate app processes; remaining stub IPC services; no AJM decoding /
+  no audio output.
 * **Constraints:** only GPL-2.0-or-later code may be reused; no firmware is committed.
 
 
@@ -756,3 +756,22 @@ the audio-less boot. Pacing/results for AJM jobs are the next audio item; the au
   (`SceShellCoreUtilCtrlFocus` is an always-set stand-in), or uses a second path. A pitfall found on the way:
   `emu._time()` is an absolute perf counter, so a script timeline must subtract `emu._t0` (a timeline that
   never fired looked exactly like "UI ignores input").
+
+## Update 2026-11-18 (night, later): the user name - and why the pad seemed ignored
+
+* **`SceUserService` 0x30004 is the generic per-user string call.** `libSceUserService+0x630` (used by
+  `sceUserServiceGetUserName` `+0x3f20`, `GetThemeEntitlementId` `+0x8110`, ...) sends `{u32 user id; u32 kind}`
+  and receives a NUL-terminated string (kind 1 = name, 0x800 = theme entitlement id, capacity 17 for the
+  name). It was an "empty success", so the name came back empty and ProfileCache showed "Unknown".
+  `Syscalls._ipmi_user_name` answers kind 1 with `Player1` (`PSEMU_USER_NAME` overrides; max 16 characters),
+  any other kind with an empty string, an unknown user id with `0x80960005`.
+* **First attempt answered every kind with the name** and killed the shell: the theme manager read the
+  entitlement id as "Player1", took the "packaged theme" branch (`[Theme/I] Mount : packaged theme : [EID:Player1]`),
+  got an empty mount path from `SceAppContent` 0x20019 and died on `ArgumentException: UNC paths should be of
+  the form ...`. Found by decoding which libSceUserService export called the same method with another kind,
+  not by guessing: another reason not to give "empty success" answers a plausible value without checking.
+* **Effect on the pad question**: with a named user the avatar/profile path (`//priv/etc/default_avatar_64.dds`),
+  the GLS/QuickMenu/Notification scenes and the user entry in the hint bar load, and scripted pad pulses
+  (`PSEMU_PAD=script PSEMU_PAD_BUTTONS="14+0.5=RIGHT,20+0.5=RIGHT,26+0.5=DOWN"`) now move the content row -
+  the UI had been dropping input because it had no logged-in user. Verified on frame montages; chain run
+  with a pad: 9000 DCBs/60 s, exit 0, no managed fatal. `python -m psemu.tools_usertest` covers the method.

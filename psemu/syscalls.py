@@ -647,6 +647,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         ("SceUserService", 0x3000F): "_ipmi_user_id_list",
         ("SceUserService", 0x3000C): "_ipmi_user_id_one",      # GetForegroundUser
         ("SceUserService", 0x30011): "_ipmi_user_id_one",      # GetInitialUser
+        ("SceUserService", 0x30004): "_ipmi_user_name",        # GetUserName
         ("SceMbusIpc", 0xCE110028): "_ipmi_mbus_device_list",  # GetDeviceList (pads for libScePsm)
     }
 
@@ -680,6 +681,39 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if call["out"]:
             ids = [self.USER_ID] + [self.USER_ID_INVALID] * 19
             self._ipmi_out(uc, call, 0, struct.pack("<20I", *ids))
+        return 0
+
+    # The registered user's name. A placeholder (a console shows the name typed at first-time setup);
+    # PSEMU_USER_NAME overrides it. User names are at most 16 characters.
+    USER_NAME = "Player1"
+
+    # SceUserService 0x30004 is libSceUserService's generic "get a per-user string": every
+    # sceUserServiceGet*(userId, char *buf, size_t size) built on libSceUserService+0x630 sends
+    # {u32 user id; u32 kind}. kind 1 = the user name (sceUserServiceGetUserName), 0x800 = the theme
+    # entitlement id (sceUserServiceGetThemeEntitlementId, +0x8110). Answering every kind with the
+    # name made the theme manager see an entitlement id "Player1", try to mount a packaged theme
+    # and die on an empty mount path.
+    USER_STRING_NAME = 1
+
+    def _ipmi_user_name(self, uc, call):
+        """SceUserService 0x30004: in[0] = {u32 user id; u32 kind}, out[0] = the NUL-terminated string
+        (capacity 17 for the name). Kind 1 is the registered user's name (placeholder, see USER_NAME);
+        every other kind is not set for the user: an empty string. The method result is 0, or 0x80960005
+        (INVALID_ARGUMENT, the code libSceUserService itself uses for a bad argument) for an id that is
+        not the registered user (the exact USER_NOT_FOUND code is not confirmed)."""
+        import os
+        import struct
+        kind = self.USER_STRING_NAME
+        if call["in"]:
+            uid, kind = struct.unpack("<II", bytes(self.emu.uc.mem_read(call["in"][0][0], 8)))
+            if uid != self.USER_ID:
+                return 0x80960005
+        text = b""
+        if kind == self.USER_STRING_NAME:
+            name = os.environ.get("PSEMU_USER_NAME")
+            text = (self.USER_NAME if name is None else name).encode("utf-8")[:16]
+        if call["out"]:
+            self._ipmi_out(uc, call, 0, text + bytes(1))
         return 0
 
     def _ipmi_user_id_one(self, uc, call):
