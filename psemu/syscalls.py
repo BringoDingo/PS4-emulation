@@ -250,8 +250,12 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         return fd
 
     def _new_handle(self, kind, name=""):
-        h = self._next_handle
-        self._next_handle += 1
+        system = getattr(self.emu, "system", None)
+        if system is not None:                      # one handle space for all processes
+            h = system.alloc_handle()
+        else:
+            h = self._next_handle
+            self._next_handle += 1
         self.objects[h] = {"kind": kind, "name": name}
         return h
 
@@ -1233,6 +1237,25 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         sched = self.emu.sched
         cur = sched.current if sched else None
         mode = self.emu.spawn_mode
+        mgr = getattr(self.emu, "manager", None)
+        if cur is not None and getattr(cur, "spawn_child", False) and mode == "spawn" and mgr is not None:
+            # a real second process: the child image runs concurrently (own address space) under the
+            # ProcessManager while this process carries on
+            resolved = self.emu.resolve_path(path)
+            if resolved is None:
+                self.emu.log(f"  [execve] spawn '{path}': not found under {self.emu.fw_root}")
+            else:
+                self.emu.log(f"  [execve] spawn '{path}' -> new process")
+                mgr.spawn(self.emu, resolved, argv or [path])
+                # the parent watches its child with EVFILT_PROC (NOTE_EXEC | NOTE_EXIT): tell it the exec happened
+                NOTE_EXEC = 0x20000000
+                for notes in self.knotes.values():
+                    for (ident, filt), kn in notes.items():
+                        if filt == -5:
+                            kn["fflags"] = NOTE_EXEC
+                self.trigger(-5, None, 0)
+            sched.exit_current()
+            return
         if cur is not None and getattr(cur, "spawn_child", False) and mode not in (None, "follow"):
             follow = (mode != "stay") and (mode in path)
             if not follow:
@@ -1783,7 +1806,19 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             if self._visdir(path):
                 self._write_stat(uc, buf, 0, isdir=True, path=path)
                 return self._ret(uc, 0)
+        elif path.startswith(self.BOOT_DEV_NODES):
+            # device nodes of the console's storage / sensor stack that mini-syscore checks (filecheck)
+            # before mounting the system partitions; the kernel creates them at boot
+            self._write_stat(uc, buf, 0, path=path)
+            st = bytearray(bytes(uc.mem_read(buf, 0x78)))
+            _struct.pack_into("<H", st, 0x08, 0o20600)                  # S_IFCHR | 0600
+            uc.mem_write(buf, bytes(st))
+            return self._ret(uc, 0)
         self._ret(uc, ENOENT, error=True)
+
+    BOOT_DEV_NODES = ("/dev/da", "/dev/ada", "/dev/sflash", "/dev/sbram", "/dev/icc", "/dev/es0",
+                      "/dev/exfatfs", "/dev/geom", "/dev/idata", "/dev/dipsw", "/dev/dngl", "/dev/deci",
+                      "/dev/evlg", "/dev/srtc", "/dev/sbl_srv", "/dev/bt", "/dev/xpt0", "/dev/pass")
 
     def sys_lseek(self, uc):
         fd, off, whence = self._args(uc)[:3]

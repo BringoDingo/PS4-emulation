@@ -372,6 +372,9 @@ class SyncSyscalls:
         name = self._read_cstr(uc, name_ptr, 32)
         h = self._new_handle("evf", name)
         self.evfs[h] = EventFlag(h, name, attr & 0xFFFFFFFF, init)
+        system = getattr(self.emu, "system", None)
+        if system is not None and name:
+            system.evfs[name] = self.evfs[h]          # visible to every process by name
         self.emu.log(f"  [evf] create '{name}' attr={attr & 0xFFFFFFFF:#x} "
                      f"bits={init:#x} -> {h:#x}")
         self._ret(uc, h)
@@ -382,6 +385,11 @@ class SyncSyscalls:
         self._sync_init()
         name = self._read_cstr(uc, self._args(uc)[0], 32)
         ef = next((e for e in self.evfs.values() if e.name == name), None)
+        system = getattr(self.emu, "system", None)
+        if ef is None and system is not None and name in system.evfs:
+            ef = system.evfs[name]                    # created by another process: the same object
+            self.evfs[ef.handle] = ef
+            self.emu.log(f"  [evf] open '{name}': shared with another process -> {ef.handle:#x}")
         if ef is None:
             h = self._new_handle("evf", name)
             seed = self.EXTERNAL_EVF_BITS.get(name, 0)
@@ -416,6 +424,9 @@ class SyncSyscalls:
             self.emu.sched.wake(t, EACCES, True)
         ef.waiters.clear()
         del self.evfs[ef.handle]
+        system = getattr(self.emu, "system", None)
+        if system is not None and system.evfs.get(ef.name) is ef:
+            del system.evfs[ef.name]
         self._ret(uc, 0)
 
     def _evf_result(self, uc, ptr, bits):
@@ -589,6 +600,9 @@ class SyncSyscalls:
         name = self._read_cstr(uc, name_ptr, 32)
         h = self._new_handle("sema", name)
         self.sems[h] = Semaphore(h, name, attr & 0xFFFFFFFF, init, maximum)
+        system = getattr(self.emu, "system", None)
+        if system is not None and name:
+            system.sems[name] = self.sems[h]
         self.emu.log(f"  [sema] create '{name}' attr={attr & 0xFFFFFFFF:#x} "
                      f"count={init} max={maximum} -> {h:#x}")
         self._ret(uc, h)
@@ -598,6 +612,10 @@ class SyncSyscalls:
         self._sync_init()
         name = self._read_cstr(uc, self._args(uc)[0], 32)
         sem = next((x for x in self.sems.values() if x.name == name), None)
+        system = getattr(self.emu, "system", None)
+        if sem is None and system is not None and name in system.sems:
+            sem = system.sems[name]
+            self.sems[sem.handle] = sem
         if sem is None:
             h = self._new_handle("sema", name)
             sem = self.sems[h] = Semaphore(h, name, 1, 0, 0x7FFFFFFF, external=True)

@@ -15,25 +15,98 @@ regression-tested before the harder pieces land.
 """
 
 
+class System:
+    """Kernel state every process on the machine sees: one kernel-handle space and the named
+    event flags / semaphores (the same Python object in every process's table, so a bit one process
+    sets wakes another's waiter). IPMI routing between processes still goes through the HLE layer."""
+
+    def __init__(self):
+        self._next_handle = 0x100
+        self.evfs = {}            # name -> sys_sync.EventFlag
+        self.sems = {}            # name -> sys_sync.Semaphore
+
+    def alloc_handle(self):
+        h = self._next_handle
+        self._next_handle += 1
+        return h
+
+
 class ProcessManager:
     def __init__(self):
         self.procs = []           # list of [emu, cur]  (cur None once finished)
 
     def add(self, emu, start=None):
         """Register and start a process; returns the emulator."""
+        if getattr(self, "system", None) is None:
+            self.system = System()
+        emu.system = self.system
+        emu.manager = self
+        if emu.whp and emu.shared_machine is None:
+            emu.shared_machine = emu.uc.m          # later images (and exec'd ones) join this partition
         cur = emu.begin_run(start)
         self.procs.append([emu, cur])
         return emu
 
+    def spawn(self, parent, path, argv):
+        """Start `path` as a new process next to `parent` (sys_execve with --spawn-mode spawn)."""
+        from .emulator import Emulator
+        emu = Emulator(path, trace=parent.trace, max_insns=parent.max_insns, fw_root=parent.fw_root,
+                       backend="whp" if parent.whp else "unicorn", shared_machine=parent.shared_machine,
+                       host_identity=False)
+        emu.max_seconds = parent.max_seconds
+        emu._t0 = parent._t0
+        emu.max_modules = parent.max_modules
+        emu.spawn_mode = parent.spawn_mode
+        emu.gpu_enabled = getattr(parent, "gpu_enabled", True)
+        emu.frame_dir = getattr(parent, "frame_dir", None)
+        emu.frame_every = getattr(parent, "frame_every", 60)
+        tag = "%s" % path.replace("\\", "/").rsplit("/", 1)[-1]
+        plog = parent.log
+        emu.log = lambda *a, **k: plog(f"[{tag}]", *a)
+        return self.add(emu)
+
+    def others_alive(self, emu):
+        return any(p[0] is not emu and p[1] is not None for p in self.procs)
+
     def step_all(self):
         """Advance every live process by one scheduling segment. Returns True
         while at least one process is still runnable."""
+        from .emulator import IDLE
+        import time
         alive = False
-        for p in self.procs:
-            if p[1] is not None:
+        progressed = False
+        for p in list(self.procs):
+            if p[1] is None:
+                continue
+            if p[1] == IDLE:
+                p[1] = p[0].try_resume()
+                if p[1] != IDLE:
+                    progressed = True
+            else:
                 p[1] = p[0]._run_segment(p[1])
+                if p[1] != IDLE:
+                    progressed = True
             if p[1] is not None:
                 alive = True
+        for p in self.procs:                    # one wall-clock budget for the whole machine
+            ms = p[0].max_seconds
+            if p[1] is not None and ms is not None and p[0]._time() - p[0]._t0 >= ms:
+                for q in self.procs:
+                    if q[1] is not None:
+                        q[0]._stop_reason = q[0]._stop_reason or f"wall-clock budget reached ({ms:g} s)"
+                        q[1] = None
+                return False
+        if alive and not progressed:
+            self._stalled = getattr(self, "_stalled", 0) + 1
+            time.sleep(0.001)
+            if self._stalled > 5000:
+                for q in self.procs:
+                    if q[1] is not None:
+                        q[0]._stop_reason = "deadlock: every process is waiting for another"
+                        q[1] = None
+                return False
+        else:
+            self._stalled = 0
         return alive
 
     def run(self):

@@ -143,19 +143,89 @@ class WhpContext:
             raise UcError(21)
 
 
+class Machine:
+    """The partition, its single vCPU and the page-table pool: shared by every address space.
+
+    A process may back only ONE partition with host memory (a second partition's WHvMapGpaRange
+    fails with 0x8007054f, probed), so several PS4 processes run as several address spaces (WhpUc
+    objects, each with its own PML4 and region table) on this one vCPU, switching CR3 + registers
+    between slices (acquire()). Their guest-physical memory must not overlap: the first address
+    space maps GPA == VA, every later one takes GPAs from a bump allocator above 2**47."""
+
+    GPA_BUMP_BASE = 1 << 47
+    GPA_LIMIT = 1 << 48
+
+    def __init__(self):
+        self.p = whp.Partition(1, exception_bitmap=EXC_BITMAP, extended_exits=EXT_EXITS_EXCEPTION)
+        self.d = whp.dll()
+        self.h = self.p.h
+        self.pool = _valloc(POOL_SIZE)
+        self.p.map_gpa(self.pool, POOL_GPA, POOL_SIZE)
+        self.pool_np = np.frombuffer((ctypes.c_ubyte * POOL_SIZE).from_address(self.pool),
+                                     dtype=np.uint64)
+        self.pool_next = FIRST_TABLE
+        self.gdt_gpa = None
+        self.refs = 0
+        self.spaces = 0
+        self.loaded = None             # the WhpUc whose registers/CR3 are in the vCPU
+        self.gpa_next = self.GPA_BUMP_BASE
+        self.identity_taken = False
+        self.init_r = None
+        self.closed = False
+
+    def alloc_gpa(self, size):
+        size = (size + 0xFFFF) & ~0xFFFF
+        g = self.gpa_next
+        if g + size > self.GPA_LIMIT:
+            raise MemoryError("WHP guest-physical window exhausted")
+        self.gpa_next += size
+        return g
+
+    def acquire(self, uc):
+        """Make `uc` the address space the vCPU runs: save the previous one's CPU state, load ours."""
+        cur = self.loaded
+        if cur is uc:
+            return
+        if cur is not None:
+            cur._xs_saved = cur._xsave_get()          # its registers were pulled after its last exit
+        self.loaded = uc
+        uc._dirty = uc._seg_dirty = uc._tlb_dirty = True      # _flush loads regs, fs/gs, CR3
+        if uc._xs_saved is not None:
+            uc._xsave_set(uc._xs_saved)
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                self.p.close()
+            except Exception:
+                pass
+
+
 class WhpUc:
-    """Drop-in for the parts of unicorn.Uc that psemu uses (see module docstring)."""
+    """Drop-in for the parts of unicorn.Uc that psemu uses (see module docstring).
+
+    `machine` shares an existing partition (see Machine); `identity` asks for GPA == VA (only one
+    address space per machine can have it; it is also the one whose guest memory is host memory at the
+    same address, see hostvm.py)."""
 
     # callbacks installed by the Emulator
     hle_cb = None          # (uc, addr) -> True when a 'replace' hook already moved RIP
     preempt_cb = None      # (uc, rip) -> True when a thread switch is now pending
     tick_cb = None         # () called after every exit (time budget etc.)
 
-    def __init__(self):
-        self.p = whp.Partition(1, exception_bitmap=EXC_BITMAP, extended_exits=EXT_EXITS_EXCEPTION)
-        self._d = whp.dll()
-        self._h = self.p.h
+    def __init__(self, machine=None, identity=True):
+        self.m = machine if machine is not None else Machine()
+        m = self.m
+        m.refs += 1
+        self.p = m.p
+        self._d = m.d
+        self._h = m.h
         self._closed = False
+        self._xs_saved = None
+        self.identity = bool(identity) and not m.identity_taken
+        if self.identity:
+            m.identity_taken = True
         # ---- register cache ----
         self._names = (ctypes.c_int * NREG)(*range(NREG))
         self._vals = (whp.WHV_REGISTER_VALUE * (NREG + 2))()
@@ -168,16 +238,18 @@ class WhpUc:
         self._ctx = (ctypes.c_ubyte * 256)()
         # ---- memory ----
         self._starts = []                      # sorted region starts
-        self._rec = {}                         # start -> [end, host_base_for_start]
+        self._rec = {}                         # start -> [end, host_base_for_start, gpa_for_start]
         self._last = None                      # (start, end, host) lookup cache
         self._keep = []                        # private host allocations
         # ---- page tables ----
-        self._pool = _valloc(POOL_SIZE)
-        self.p.map_gpa(self._pool, POOL_GPA, POOL_SIZE)
-        self._pool_np = np.frombuffer((ctypes.c_ubyte * POOL_SIZE).from_address(self._pool),
-                                      dtype=np.uint64)
-        self._pool_next = FIRST_TABLE
-        self._pml4 = self._pool_np[0:512]
+        self._pool = m.pool
+        self._pool_np = m.pool_np
+        if m.spaces == 0:
+            self._cr3 = POOL_GPA
+            self._pml4 = self._pool_np[0:512]
+        else:
+            self._cr3, self._pml4 = self._alloc_table()
+        m.spaces += 1
         self._pdpt, self._pd, self._pt = {}, {}, {}
         self._tlb_dirty = True
         self._build_firmware()
@@ -203,7 +275,13 @@ class WhpUc:
         self._watch = {}
         self._w_lo, self._w_hi = 1 << 62, 0
         self.n_watch_hits = 0
-        self._init_vcpu()
+        if self.m.init_r is None:
+            self._init_vcpu()
+            self.m.init_r = list(self._r)
+            self.m.loaded = self
+        else:
+            self._r = list(self.m.init_r)
+            self._dirty = True
 
     # ------------------------------------------------------------------ firmware / vCPU setup
     def _pool_page(self, i):
@@ -211,13 +289,15 @@ class WhpUc:
 
     def _build_firmware(self):
         # GDT: null, kernel code64 (0x08), kernel data (0x10)
-        gdt = self._pool_page(PG_GDT)
-        gdt[1] = np.uint64(0x00AF9B000000FFFF)
-        gdt[2] = np.uint64(0x00CF93000000FFFF)
-        self._gdt_gpa = POOL_GPA + PG_GDT * PAGE
-        # syscall stub: a single HLT; the HLT exit at KSTUB_VA is "the guest executed syscall"
-        stub = (ctypes.c_ubyte * PAGE).from_address(self._pool + PG_STUB * PAGE)
-        stub[0] = 0xF4
+        if self.m.gdt_gpa is None:                 # the machine's GDT + stub page, built once
+            gdt = self._pool_page(PG_GDT)
+            gdt[1] = np.uint64(0x00AF9B000000FFFF)
+            gdt[2] = np.uint64(0x00CF93000000FFFF)
+            self.m.gdt_gpa = POOL_GPA + PG_GDT * PAGE
+            # syscall stub: a single HLT; the HLT exit at KSTUB_VA is "the guest executed syscall"
+            stub = (ctypes.c_ubyte * PAGE).from_address(self._pool + PG_STUB * PAGE)
+            stub[0] = 0xF4
+        self._gdt_gpa = self.m.gdt_gpa
         self._pml4[:] = 0
         self._pt_set_pages(KSTUB_VA, [POOL_GPA + PG_STUB * PAGE], 1 | 4)   # present, user, RO, exec
 
@@ -266,7 +346,7 @@ class WhpUc:
                              (whp.GS, whp.seg(self.gs_base, 0, gp))])
             self._seg_dirty = False
         if self._tlb_dirty:
-            self.p.set_regs([(whp.CR3, POOL_GPA)])
+            self.p.set_regs([(whp.CR3, self._cr3)])
             self._tlb_dirty = False
         if self._traps_pending:
             self._apply_traps()
@@ -325,7 +405,9 @@ class WhpUc:
                  "xsave set")
 
     def context_save(self):
-        return WhpContext(list(self._r), self.fs_base, self.gs_base, self._xsave_get())
+        # a space that is not the one on the vCPU keeps its extended state in _xs_saved
+        xs = self._xsave_get() if self.m.loaded is self else (self._xs_saved or b"")
+        return WhpContext(list(self._r), self.fs_base, self.gs_base, xs)
 
     def context_restore(self, ctx):
         self._r = list(ctx.r)
@@ -333,7 +415,11 @@ class WhpUc:
         if (ctx.fs, ctx.gs) != (self.fs_base, self.gs_base):
             self.fs_base, self.gs_base = ctx.fs, ctx.gs
             self._seg_dirty = True
-        self._xsave_set(ctx.xs)
+        if self.m.loaded is self:
+            if ctx.xs:
+                self._xsave_set(ctx.xs)
+        elif ctx.xs:
+            self._xs_saved = ctx.xs               # applied by Machine.acquire at the next run
 
     # ------------------------------------------------------------------ guest memory
     def _find(self, addr):
@@ -343,7 +429,7 @@ class WhpUc:
         i = bisect.bisect_right(self._starts, addr) - 1
         if i >= 0:
             s = self._starts[i]
-            e, host = self._rec[s]
+            e, host, _g = self._rec[s]
             if addr < e:
                 c = self._last = (s, e, host)
                 return c
@@ -392,10 +478,10 @@ class WhpUc:
             a += k
             off += k
 
-    def _add_region(self, addr, size, host):
+    def _add_region(self, addr, size, host, gpa):
         self._cut(addr, addr + size)
         bisect.insort(self._starts, addr)
-        self._rec[addr] = [addr + size, host]
+        self._rec[addr] = [addr + size, host, gpa]
         self._last = None
 
     def _cut(self, lo, hi):
@@ -404,36 +490,58 @@ class WhpUc:
         out = []
         while i < len(self._starts) and self._starts[i] < hi:
             s = self._starts[i]
-            e, host = self._rec[s]
+            e, host, gpa = self._rec[s]
             if e <= lo:
                 i += 1
                 continue
             del self._rec[s]
             self._starts.pop(i)
             if s < lo:
-                out.append((s, lo, host))
+                out.append((s, lo, host, gpa))
             if hi < e:
-                out.append((hi, e, host + (hi - s)))
-        for s, e, host in out:
+                out.append((hi, e, host + (hi - s), gpa + (hi - s)))
+        for s, e, host, gpa in out:
             bisect.insort(self._starts, s)
-            self._rec[s] = [e, host]
+            self._rec[s] = [e, host, gpa]
         self._last = None
 
+    def _runs(self, lo, hi):
+        """(va, length, gpa) pieces of the mapped regions inside [lo, hi)."""
+        out = []
+        i = max(bisect.bisect_right(self._starts, lo) - 1, 0)
+        while i < len(self._starts) and self._starts[i] < hi:
+            s = self._starts[i]
+            e, _host, gpa = self._rec[s]
+            a, b = max(s, lo), min(e, hi)
+            if a < b:
+                out.append((a, b - a, gpa + (a - s)))
+            i += 1
+        return out
+
+    def _gpa_for(self, addr, size):
+        return addr if self.identity else self.m.alloc_gpa(size)
+
     def mem_map_ptr(self, addr, size, prot, ptr):
-        self.p.map_gpa(ptr, addr, size)
-        self._add_region(addr, size, ptr)
+        gpa = self._gpa_for(addr, size)
+        self.p.map_gpa(ptr, gpa, size)
+        self._add_region(addr, size, ptr, gpa)
         self._pt_fill(addr, size, prot)
 
     def mem_map(self, addr, size, prot=7):
         host = _valloc(size)
         self._keep.append(host)
-        self.p.map_gpa(host, addr, size)
-        self._add_region(addr, size, host)
+        gpa = self._gpa_for(addr, size)
+        self.p.map_gpa(host, gpa, size)
+        self._add_region(addr, size, host, gpa)
         self._pt_fill(addr, size, prot)
 
     def mem_unmap(self, addr, size):
         self._pt_fill(addr, size, 0)
-        self.p.unmap_gpa(addr, size)
+        if self.identity:
+            self.p.unmap_gpa(addr, size)
+        else:
+            for _a, n, gpa in self._runs(addr, addr + size):
+                self.p.unmap_gpa(gpa, n)
         self._cut(addr, addr + size)
 
     def mem_protect(self, addr, size, prot):
@@ -441,10 +549,10 @@ class WhpUc:
 
     # ------------------------------------------------------------------ page tables
     def _alloc_table(self):
-        i = self._pool_next
+        i = self.m.pool_next
         if i >= POOL_PAGES:
             raise MemoryError("WHP page-table pool exhausted")
-        self._pool_next += 1
+        self.m.pool_next += 1
         return POOL_GPA + i * PAGE, self._pool_page(i)
 
     def _get_pt(self, va):
@@ -480,7 +588,12 @@ class WhpUc:
             pt = self._get_pt(a)
             i0 = (a >> 12) & 0x1FF
             n = (nxt - a) >> 12
-            if flags:
+            if flags and not self.identity:
+                for ra, rn, rg in self._runs(a, nxt):
+                    j = (ra >> 12) & 0x1FF
+                    k = rn >> 12
+                    pt[j:j + k] = np.arange(rg, rg + k * PAGE, PAGE, dtype=np.uint64) | flags
+            elif flags:
                 pt[i0:i0 + n] = np.arange(a, a + n * PAGE, PAGE, dtype=np.uint64) | flags
             else:
                 pt[i0:i0 + n] = 0
@@ -638,6 +751,7 @@ class WhpUc:
 
     def emu_start(self, begin, until, timeout=0, count=0):
         self._stop = False
+        self.m.acquire(self)
         self._r[I_RIP] = begin
         self._dirty = True
         self._start_timer()
@@ -812,10 +926,13 @@ class WhpUc:
         if self._closed:
             return
         self._closed = True
-        try:
-            self.p.close()
-        except Exception:
-            pass
+        if self.identity:
+            self.m.identity_taken = False
+        self.m.refs -= 1
+        if self.m.loaded is self:
+            self.m.loaded = None
+        if self.m.refs <= 0:
+            self.m.close()
 
     def __del__(self):
         try:

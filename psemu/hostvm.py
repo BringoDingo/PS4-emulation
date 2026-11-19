@@ -36,8 +36,9 @@ _RESERVED = set()
 
 
 class HostVM:
-    def __init__(self, uc, log=None):
+    def __init__(self, uc, log=None, identity=True):
         self.uc = uc
+        self.identity = identity   # False: a secondary address space (host memory anywhere, CPU-only)
         self.log = log or (lambda *a: None)
         self.reserved = _RESERVED  # 64 KiB granules reserved by us (persist for the process)
         self.backed = []           # (start, end) ranges mapped host-backed
@@ -79,6 +80,10 @@ class HostVM:
     # -------------------------------------------------------------- API
     def map(self, addr, size, prot=UC_PROT_ALL):
         """Map [addr, addr+size) (page-aligned). Host-backed when possible."""
+        if not self.identity:
+            self.uc.mem_map(addr, size, prot)
+            self.private.append((addr, addr + size))
+            return False
         if self._reserve(addr, size) and self._commit(addr, size):
             C.memset(addr, 0, size)
             self.uc.mem_map_ptr(addr, size, prot, addr)

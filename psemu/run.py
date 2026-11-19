@@ -28,7 +28,7 @@ def main():
     ap.add_argument("--spawn-mode", default=None,
                     help="process-spawn policy for execve() from an rfork'd child: "
                          "'follow' (default, chain-load/replace the image), 'stay' "
-                         "(keep running the parent, retire spawned children), or a "
+                         "(keep running the parent, retire spawned children), 'spawn' (whp: run them as real concurrent processes), or a "
                          "path substring to follow only matching children (e.g. NPXS20001)")
     ap.add_argument("--no-gpu", action="store_true",
                     help="accept /dev/gc submits without running them on the host GPU")
@@ -64,7 +64,15 @@ def main():
     if args.frames:
         emu.frame_dir = args.frames
         emu.frame_every = max(1, args.frame_every)
-    emu.run(start=start)
+    if args.spawn_mode == "spawn":
+        # real multi-process: an execve from an rfork'd child starts a new process (own address space)
+        # next to the parent; they share one WHP machine/vCPU and the kernel's named objects
+        from .process import ProcessManager
+        pm = ProcessManager()
+        pm.add(emu, start)
+        pm.run()
+    else:
+        emu.run(start=start)
 
 
 if __name__ == "__main__":

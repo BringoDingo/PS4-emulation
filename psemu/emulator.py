@@ -56,9 +56,12 @@ def _align_down(x, a=PAGE4K):
     return x & ~(a - 1)
 
 
+IDLE = -1          # _run_segment result: every thread is waiting for another process
+
+
 class Emulator:
     def __init__(self, path, trace=False, max_insns=2_000_000, verbose=True,
-                 fw_root=None, backend=None):
+                 fw_root=None, backend=None, shared_machine=None, host_identity=True):
         import collections
         import time
         # CPU backend: "unicorn" (default: deterministic reference, instruction-counted clock)
@@ -78,6 +81,10 @@ class Emulator:
         self._then_seen = None
         self.path = path
         self.trace = trace
+        # several processes on one WHP machine (see process.py / whp_uc.Machine): the partition they
+        # share, and whether this process's guest memory is host memory at the same address (GPU-visible)
+        self.shared_machine = shared_machine
+        self.host_identity = host_identity
         self.max_insns = max_insns
         self.verbose = verbose
         # Firmware root used to resolve execve() paths like "/SceSysAvControl.elf".
@@ -138,7 +145,7 @@ class Emulator:
             return
         self._dynamic_block = False
         self.uc = self._new_cpu()
-        self.vm = HostVM(self.uc, log=self.log)
+        self.vm = HostVM(self.uc, log=self.log, identity=getattr(self.uc, 'identity', True))
         self._enable_avx()
         # re-point the helpers at the new CPU
         self.avx.uc = self.uc
@@ -165,7 +172,7 @@ class Emulator:
         from .dynproc import DynamicProcess
         self._dynamic_block = False
         self.uc = self._new_cpu()
-        self.vm = HostVM(self.uc, log=self.log)
+        self.vm = HostVM(self.uc, log=self.log, identity=getattr(self.uc, 'identity', True))
         self._enable_avx()
         self.avx.uc = self.uc
         self.hle.uc = self.uc
@@ -207,7 +214,7 @@ class Emulator:
             from .whp_uc import WhpUc
             if old is not None and hasattr(old, "close"):
                 old.close()                     # execve: the previous partition is gone
-            return WhpUc()
+            return WhpUc(machine=self.shared_machine, identity=self.host_identity)
         return Uc(UC_ARCH_X86, UC_MODE_64)
 
     # ---- cpu features ---------------------------------------------------
@@ -997,6 +1004,17 @@ class Emulator:
         self.log(self.sched.summary())
         return self._stop_reason
 
+    def try_resume(self):
+        """Retry a switch for a process that went idle waiting on another one: the RIP to run
+        next, IDLE if still nothing is runnable, None when it has finished."""
+        nxt = self.sched.switch()
+        if nxt is not None:
+            return nxt
+        if all(t.state == "exited" for t in self.sched.threads.values()):
+            self._stop_reason = "all threads exited"
+            return None
+        return IDLE
+
     def _run_segment(self, cur):
         """One scheduling segment: run the CPU from `cur` until the native/HLE
         hook, a thread switch, an execve, or a stop interrupts it, then do the
@@ -1045,6 +1063,10 @@ class Emulator:
             nxt = self.sched.switch()
             if nxt is None:
                 ts = self.sched.threads.values()
+                mgr = getattr(self, "manager", None)
+                if (mgr is not None and mgr.others_alive(self)
+                        and not all(t.state == "exited" for t in ts)):
+                    return IDLE          # waiting for another process to wake a thread
                 if all(t.state == "exited" for t in ts):
                     self._stop_reason = "all threads exited"
                 elif any(isinstance(t.wait, dict) and t.wait.get("kind") == "kevent"

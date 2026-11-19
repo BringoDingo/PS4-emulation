@@ -855,3 +855,37 @@ could not be played here, so what follows is from the firmware, not from watchin
   5. After the logo a real console may show the user-selection screen ("Who is using this controller?") when
      several users exist; psemu has one placeholder user, so it goes straight to the home screen (the correct
      single-user behaviour).
+
+## Update 2026-11-18 (night, end): multi-process execution (`--spawn-mode spawn`)
+
+* **Constraint found first.** A process can back only one WHP partition with host memory: the second
+  `WHvMapGpaRange` in the same process fails with `0x8007054f` (probed with a bare partition; it is the second
+  partition, not the pool size). So concurrent processes cannot be separate partitions. Guest-physical space
+  is 48 bits (`< 2**48` maps, `2**48` is rejected).
+* **Design (the "shared area" is the machine itself).** `whp_uc.Machine` = the one partition, one vCPU and the
+  page-table pool. Each process is a `WhpUc` *address space* on it: own PML4 and region table; the vCPU switches
+  CR3 + registers + XSAVE between processes at slice boundaries (`Machine.acquire`, called from `emu_start`;
+  `context_save/restore` of a not-loaded space keep the extended state in `_xs_saved`). The first space maps
+  GPA == VA and keeps "guest memory is host memory at the same address" (the GPU path needs it: it should be the
+  ShellUI); every other space gets guest-physical pages from a bump allocator at `2**47..2**48` and CPU-only host
+  memory (`hostvm.HostVM(identity=False)`). The same guest address therefore holds different memory per process
+  (`python -m psemu.tools_mptest`: two programs on one vCPU, separate data pages).
+* **Shared kernel state** (`process.System`): one kernel-handle space and by-name event flags / semaphores - the
+  same Python object in every process, so `SceBootStatusFlags` created by mini-syscore is the one AvControl opens
+  and sets (logged `[evf] open ... shared with another process`). Shared guest *memory* (shm) and cross-process
+  IPMI are not routed yet (`ipmibus.py` is still the scaffold); IPMI keeps the HLE answers.
+* **Scheduling.** `ProcessManager` round-robins `_run_segment`; a process whose threads all wait returns `IDLE`
+  and is retried (`try_resume`) after the others ran, instead of stopping as "idle in event loop"; the machine
+  has one wall-clock budget and a deadlock detector (every process idle for 5000 rounds).
+* **Spawning.** `--spawn-mode spawn`: `execve` from an rfork'd child starts the image as a new process
+  (`ProcessManager.spawn`), retires the child thread, and tells the parent's `EVFILT_PROC` watch (NOTE_EXEC).
+  `python -m psemu.run mini-syscore.elf --backend whp --spawn-mode spawn --max-seconds 40`.
+* **Result.** mini-syscore and SceSysAvControl now run concurrently (AvControl draws its logo while the parent
+  continues). The parent then runs the part of the boot nobody had executed before - and stops at the storage
+  bring-up: `filecheck /dev/da0x8...` (fixed: `stat` of the console's storage/sensor device nodes succeeds),
+  `nmount` of `/system` and `/system_ex` (accepted), then `sceFsUfsCheckCleanFlag` on `/dev/da0x9.crypt` fails
+  (the sector-size ioctl `0x40046480` and the UFS superblock are not modelled), so it reboots into fsck/rescue
+  mode. **Next blocker for a full boot: emulated block devices for the partitions** (sector size, a superblock with
+  the clean flag; the rest of the tree is the host firmware directory), then the `SceSysCore` launch.
+* Regressions: all suites, the SceSysCore -> ShellUI chain (10500 DCBs / 60 s) and the single-process splash
+  run are unchanged.

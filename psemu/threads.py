@@ -201,7 +201,7 @@ class Scheduler:
         uc = self.emu.uc
         self.switch_pending = False
         cur = self.current
-        if cur is not None and cur.state != EXITED:
+        if cur is not None and cur.state != EXITED and cur.ctx is None:
             cur.ctx = uc.context_save()
             if cur.state == RUNNING:
                 cur.state = READY
