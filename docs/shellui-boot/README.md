@@ -810,3 +810,48 @@ the audio-less boot. Pacing/results for AJM jobs are the next audio item; the au
   `libSceIpmi+0x49c0`: run the modelled/empty method at once, store the out buffers, and signal the slot bit that
   the client's `0x490` wait names); then model `SceLncService`'s launch method so a tile press at least produces
   an app-status/launch event; separate app processes are still not run.
+
+## Update 2026-11-18 (night, end): the PlayStation startup - what draws it and what keeps it from showing
+
+Reference: a 21 s clip, "The REAL PS4 Startup" (power-on: PlayStation logo, then the system). The clip itself
+could not be played here, so what follows is from the firmware, not from watching it.
+
+* **Who draws the logo.** Not the ShellUI. `SceSysAvControl.elf` (the AV-control daemon that `mini-syscore.elf`
+  forks and execs first) contains the splash: `SceBootSplash` / `prepareSplashImage` /
+  `sceBootSplashUpdate`, the logo bitmaps embedded in the ELF, software alpha fade-in/out into four 1920x1080
+  display buffers, `sceVideoOutSubmitFlip` per frame, `waitFlipArg` to keep three flips in flight. It runs until
+  somebody sets `SCE_BOOT_STAT_STOP_SPLASH` in `SceBootStatusFlags`; the ShellUI does that through
+  `PowerOnSplash.Hide()` -> `NativeCall.StopSplash` (`sceShellCoreUtilSetSplashScreenState`, 500 ms later it
+  reports the splash gone). The sound is a separate piece (not found yet; `orbis_audiod.elf` is in
+  `system/sys`). No logo/animation asset exists in the dump; the splash is code + embedded bitmaps.
+* **What we do today.** Every ShellUI run starts at `SceSysCore.elf` (`--then NPXS20001`), i.e. after the
+  stage that shows the logo: the splash code is never executed, and the first thing on screen is the home
+  screen (preceded by black frames while the shell loads).
+* **Running that stage found three bugs, fixed here** (`mini-syscore.elf` -> `SceSysAvControl.elf`):
+  1. `sceVideoOutRegisterBuffers` failed (`0x80290015`): libSceVideoOut checks that every display buffer's virtual
+     address is congruent to its direct-memory offset modulo 64 KiB (`virtual_query` start vs offset). psemu mapped
+     the 2 MiB-aligned (`MAP_ALIGNED`, flags bits 24..28) direct-memory allocation at an arbitrary address;
+     `emulator.map_anon(..., align)` + `sys_mmap` now honour the alignment (at least 64 KiB for direct memory).
+  2. `waitFlipArg` timed out: `sceVideoOutGetFlipStatus` (DCE cmd `0xa`, 0x48 bytes) was an all-zero answer, so
+     flipArg never caught up. `DceDevice` now reports `{count, time, tsc, flipArg, submitTsc, gcQueue 0,
+     flipPending 0, currentBuffer}` from the newest submitted flip (flips complete at once).
+  3. Flip events collapsed: three flips before the first wait produced one event with count 1; uncollected display
+     events now accumulate in data bits 12..15 like the kernel's.
+  Result: `python -m psemu.run mini-syscore.elf --backend whp --frames DIR` renders the PlayStation logo fading in
+  and holding (681 frames in 40 s of wall time; checked on a montage of frames). `python -m psemu.tools_dcetest`.
+* **What still prevents the full sequence** (in order):
+  1. **One process at a time.** On a console `mini-syscore` forks `SceSysAvControl` (splash, keeps running as a
+     daemon) and carries on to start `SceSysCore` -> `SceShellCore` -> the ShellUI while the logo is up. psemu's
+     `execve` chain-loads (`--spawn-mode follow`: the parent is replaced, so the boot stops inside AvControl's HDMI
+     event loop) or retires the child (`stay`: no splash). Running the splash *and* the boot needs real
+     multi-process execution (separate address spaces, shared kernel objects/IPMI between them); today only
+     SceSysCore + ShellUI-in-one-image works.
+  2. **The splash is never taken down.** `SCE_BOOT_STAT_STOP_SPLASH` / `PowerOnSplash.Hide` only matter once (1)
+     exists; the ShellUI's call is currently a stub.
+  3. **No sound.** The startup chime is not produced (audio output is accepted but nothing is mixed/played;
+     the chime's source is not identified).
+  4. **No kernel/loader stage.** Everything before `mini-syscore` (secure loader, kernel boot, the first
+     kernel-drawn frame, the power LED/EMC) is not emulated; psemu supplies a kernel interface, not a kernel.
+  5. After the logo a real console may show the user-selection screen ("Who is using this controller?") when
+     several users exist; psemu has one placeholder user, so it goes straight to the home screen (the correct
+     single-user behaviour).

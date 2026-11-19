@@ -191,6 +191,7 @@ class GcDevice(Device):
 # ---------------------------------------------------------------- /dev/dce
 
 DCE_IOCTL = 0xc0308203
+DCE_CMD_FLIP_STATUS = 0xA
 DCE_CMD_RESOLUTION_STATUS = 0x13   # sub-command: out = raw 0x2c-byte display record
 DISPLAY_W, DISPLAY_H = 1920, 1080  # the display the stand-in HDMI sink reports
 DISPLAY_REFRESH_HZ = 59.94         # raw record carries the rate as a float32 in Hz
@@ -221,6 +222,8 @@ class DceDevice(Device):
         self.handles = {}            # handle -> port index
         self.status_page = None      # guest address of the mmapped status page
         self.flips = 0
+        self.last_arg = 0            # flip argument of the newest submitted flip
+        self.last_index = 0          # buffer index of the newest submitted flip
         self.vblanks = 0
         self.cmds = {}               # cmd -> count (for the run summary)
         self.buffers = {}            # buffer index -> guest address
@@ -232,6 +235,16 @@ class DceDevice(Device):
         idents = [i for kq in self.sc.knotes.values() for (i, f) in kq
                   if f == EVFILT_DISPLAY and (i >> 48) & 0xFFFF in types]
         for ident in set(idents):
+            # An event the waiter has not collected yet is not replaced by the next one: the kernel
+            # counts them (data bits 12..15 = how many have fired, sceVideoOutGetEventCount). A boot
+            # splash that submits three flips and then waits for them saw one event with count 1 and
+            # waited for the other two until its 1 s timeout.
+            for kq, notes in self.sc.knotes.items():
+                kn = notes.get((ident, EVFILT_DISPLAY))
+                if kn is not None and (ident, EVFILT_DISPLAY) in self.sc.kq_pending.get(kq, []):
+                    old = (kn.get("data", 0) >> 12) & 0xF
+                    data = (data & ~0xF000) | (min(old + 1, 0xF) << 12)
+                    break
             self.sc.trigger(EVFILT_DISPLAY, ident, data)
         return len(idents)
 
@@ -293,6 +306,7 @@ class DceDevice(Device):
             if res:
                 self.w64(uc, res, 0)
             self.flips += 1
+            self.last_arg, self.last_index = arg, index
             addr = self.buffers.get(index)
             if self.flips <= 3 or self.flips % 60 == 0:
                 self.log(f"flip #{self.flips}: buffer {index} ({addr or 0:#x}) mode {mode} "
@@ -341,6 +355,18 @@ class DceDevice(Device):
                 self.emu.uc.mem_write(a2, status[:a3] if a3 else status)
             if self.cmds[cmd] == 1:
                 self.log(f"resolution status -> {DISPLAY_W}x{DISPLAY_H} @ 59.94Hz")
+            return 0
+        if cmd == DCE_CMD_FLIP_STATUS:
+            # sceVideoOutGetFlipStatus: a2 = out, a3 = size (0x48). SceVideoOutFlipStatus: u64 count,
+            # u64 processTime, u64 tsc, i64 flipArg, u64 submitTsc, i32 gcQueueNum, i32 flipPendingNum,
+            # i32 currentBuffer. Flips complete at once here (no queue), so the newest flip's
+            # argument is already the status. The boot splash (SceSysAvControl waitFlipArg) polls
+            # this until flipArg catches up with what it submitted and timed out on a zero status.
+            if a2:
+                now = int(self.emu._time() * 1e9) if hasattr(self.emu, "_time") else 0
+                st = struct.pack("<QQQqQiii", self.flips, now, now, self.last_arg, now, 0, 0,
+                                 self.last_index).ljust(max(a3, 0x48), bytes(1))
+                self.emu.uc.mem_write(a2, st[:a3 or 0x48])
             return 0
         if self.cmds[cmd] == 1:
             self.log(f"cmd {cmd:#x} handle={handle:#x} a2={a2:#x} a3={a3:#x} "

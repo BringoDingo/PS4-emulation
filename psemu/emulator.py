@@ -255,9 +255,10 @@ class Emulator:
                 return True
         return False
 
-    def map_anon(self, size, addr_hint=0, prot=None):
+    def map_anon(self, size, addr_hint=0, prot=None, align=0):
         """Map `size` bytes of anonymous RWX memory, honouring addr_hint when
-        it is free and page-aligned, otherwise bump-allocating. Returns the
+        it is free and page-aligned, otherwise bump-allocating. `align` (a power of two)
+        forces the address to that alignment (an unaligned hint is ignored). Returns the
         guest address, or 0xFFFFFFFFFFFFFFFF (MAP_FAILED) on failure."""
         from unicorn import UC_PROT_ALL
         if prot is None:
@@ -269,7 +270,7 @@ class Emulator:
         addr = 0
         if addr_hint:
             h = _align_down(addr_hint)
-            if not self._is_mapped(h, size):
+            if not self._is_mapped(h, size) and not (align and h % align):
                 addr = h
         if addr == 0:
             # Natural alignment: allocators (notably Mono SGen's lock-free
@@ -278,9 +279,11 @@ class Emulator:
             # comes back aligned to its size - the usual OS behaviour. Our bump
             # allocator only 4K-aligns, so honour size alignment for power-of-2
             # requests (capped so a huge request can't waste the whole region).
+            req_align = align
             align = PAGE4K
             if size and (size & (size - 1)) == 0 and size <= 0x0100_0000:
                 align = size
+            align = max(align, req_align)
             a = (self._mmap_next + align - 1) & ~(align - 1)
             while self._is_mapped(a, size):
                 a += align

@@ -1978,7 +1978,14 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if flags & MAP_FIXED and addr:
             got = self.emu.map_fixed(addr, length, prot=uprot)
         else:
-            got = self.emu.map_anon(length, addr_hint=addr, prot=uprot)
+            # MAP_ALIGNED(n) (flags bits 24..28 = log2 alignment). The kernel gives a direct-memory
+            # mapping an address congruent to its physical offset modulo 64 KiB, and libSceVideoOut
+            # checks exactly that for every display buffer (sceVideoOutRegisterBuffers fails with
+            # 0x80290015 otherwise: the boot splash in SceSysAvControl never got a buffer).
+            want = 1 << ((flags >> 24) & 0x1F) if (flags >> 24) & 0x1F else 0
+            if isinstance(dev, DmemDevice):
+                want = max(want, 0x10000)
+            got = self.emu.map_anon(length, addr_hint=addr, prot=uprot, align=want)
         if got == 0xFFFFFFFFFFFFFFFF:
             self.emu.log(f"  [mmap] FAILED len={length:#x}")
             self._ret(uc, ENOMEM, error=True)
