@@ -127,6 +127,10 @@ NAMED_SYSCTLS = {
     # logging; a missing sysctl made PsmNativeException(-1) end AppMain.Main.
     # A fixed dummy value (not any real console's id).
     "machdep.openpsid_for_sys": bytes(range(0xA0, 0xB0)),
+    # SceSysCore (mini and full) and ShellCore's sceDataTransferInitialize read it at start-up; a missing
+    # name made ShellCore abort its init ("*CRITICAL ERROR* Failed to initialize DataTransfer") and shut down.
+    # 0 = the console is not in backup/restore mode.
+    "kern.backup_restore_mode": _struct.pack("<i", 0),
 }
 
 SYSCALLS.update(DYNLIB_SYSCALLS)

@@ -208,6 +208,18 @@ class IpmiKernel:
         th = emu.sched.current
         sess.pending[token] = {"thread": th, "emu": emu, "method": method, "outs": outs, "p_res": p_res, "rp": result_ptr}
         self._enqueue(sess.server, PKT_INVOKE, sess.sid, body)
+        if os.environ.get("PSEMU_IPMI_TRACE") == "3":
+            try:
+                from unicorn.x86_const import UC_X86_REG_RSP
+                rsp = uc.reg_read(UC_X86_REG_RSP)
+                words = struct.unpack("<256Q", bytes(uc.mem_read(rsp, 2048)))
+                ch = []
+                for w in words:
+                    m = emu.dyn.module_at(w) if getattr(emu, "dyn", None) else None
+                    if m: ch.append(f"{m.name}+{w - m.base:#x}")
+                self.log("  [ipmi-k]   client stack: " + " ".join(ch[:40]))
+            except Exception as e:
+                self.log(f"  [ipmi-k]   no stack: {e}")
         self.log(f"  [ipmi-k] sync {name}.{method:#x} in={[len(x) for x in ins]} out={[o[1] for o in outs]} flags {a[0x28:0x30].hex()} token {token}")
         emu.sched.block({"kind": "ipmi_invoke", "name": name, "method": method})
         return False

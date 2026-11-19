@@ -760,6 +760,20 @@ class HidDevice(Device):
         return 1
 
 
+class DevActDevice(Device):
+    """/dev/devact: the console's developer-activation state. libSceSblDevAct (compiled into ShellCore as
+    sceSblDevActIsExpired2) asks with 0x40105303 {u32 activated; ...; u32 status @+12}; when the console is not
+    activated it then opens the executable and calls it "expired" if it is a plain ELF. The firmware psemu
+    runs is decrypted, i.e. plain ELFs everywhere, so LncService refused to launch the ShellUI
+    (LNC_CHECK::0x8094000b). Report an activated unit (status 0), as a dev kit would."""
+
+    def ioctl(self, uc, req, argp):
+        if req == 0x40105303:
+            uc.mem_write(argp, struct.pack("<IIII", 1, 0, 0, 0))
+            return 0
+        return super().ioctl(uc, req, argp)
+
+
 DEVICES = {
     "/dev/hid": HidDevice,
     "/dev/urandom": RandomDevice,
@@ -772,6 +786,7 @@ DEVICES = {
     "/dev/hdmi": HdmiDevice,
     "/dev/mbus_av": MbusAvDevice,
     "/dev/av_control": AvControlDevice,
+    "/dev/devact": DevActDevice,
 }
 
 

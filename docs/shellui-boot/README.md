@@ -1006,3 +1006,18 @@ checks `slot[0] == object` and the per-client permission flags it computed at co
 Result: `SceAvSettingIpc` methods 0, 2, 0xd return 0. Still open: SceSysCoreApp2 `0xaa120016` (ShellCore main
 waits for it), VdecProxy (`/dev/uvd`).
 Disk note: a 200 s spawn run logs several GB; filter with grep instead of saving the whole log.
+
+### 2026-11-19 (end): the unanswered `0xaa120016` was ShellCore shutting itself down - and the launch now reaches `spawnApp`
+SceSysCoreApp2 method `0xaa120016` is **SystemReboot** (`[Syscore App] Start SystemReboot`, suspends NPXS20000 ...);
+ShellCore's main thread sent it because one of its init tasks failed and it ran its normal teardown
+(`ShellCoreMain::OnShutdown(true)` -> `sceApplicationSystemReboot`). The failed task was
+`*CRITICAL ERROR* Failed to initialize DataTransfer (0x80020002)`: **`sysctl kern.backup_restore_mode`**
+did not exist (now 0 = not in backup/restore mode; mini-syscore printed the same ENOENT).
+Next gate: `launchApp(NPXS20001)` -> `initializeMountRoot: LNC_CHECK::0x8094000b (0 == sceSblDevActIsExpired2(...))`.
+The check (compiled into ShellCore) asks `/dev/devact` `0x40105303` {u32 activated; ...; u32 status @+12} and, when
+the unit is not activated, calls any plain-ELF executable "expired" - and the firmware psemu runs is decrypted. A
+new `DevActDevice` reports an activated unit. Now LncService goes on: `Num. of logged-in users is 0`, `spawnApp`,
+`execve /app0/eboot.bin` -> **a new process (the ShellUI) starts** and immediately faults at `rip=0` (unmapped, the
+loader does not handle it yet) while ShellCore reports `Main thread has frozen in
+sceApplicationSignalShellCoreHeartBeat()`. Also: `/app0` must map to `/system_ex/app/NPXS20001`, the process
+needs the same module set as the single-process ShellUI run (app.exe.sprx, the mono runtime, ...).
