@@ -24,6 +24,7 @@ class System:
         self._next_handle = 0x100
         self.evfs = {}            # name -> sys_sync.EventFlag
         self.sems = {}            # name -> sys_sync.Semaphore
+        self.clock_ns = 0         # virtual time skipped while everything slept (shared: one clock per machine)
         from .ipmikernel import IpmiKernel
         self.ipmi = IpmiKernel(log=lambda m: print(m, flush=True))
 
@@ -108,6 +109,19 @@ class ProcessManager:
                         q[1] = None
                 return False
         if alive and not progressed:
+            # every process is idle: skip the machine's clock to the earliest sleeper's deadline
+            dl = [(p[0].sched.next_deadline(), p[0]) for p in self.procs if p[1] is not None and p[0].sched is not None]
+            dl = [(d, e) for d, e in dl if d is not None]
+            if dl:
+                d, e = min(dl, key=lambda x: x[0])
+                delta = d - e.sched.now_ns()
+                if delta > 0:
+                    self.system.clock_ns += delta
+                for q in self.procs:
+                    if q[1] is not None and q[0].sched is not None:
+                        q[0].sched.expire_timeouts()
+                self._stalled = 0
+                return alive
             self._stalled = getattr(self, "_stalled", 0) + 1
             time.sleep(0.001)
             if self._stalled > 5000:

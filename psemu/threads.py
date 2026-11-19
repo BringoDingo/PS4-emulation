@@ -66,11 +66,16 @@ class Scheduler:
 
     @property
     def clock_ns(self):
-        return self._clock_ns
+        # one machine, one clock: with several processes the skipped idle time is shared through System
+        sysm = getattr(self.emu, 'system', None)
+        return sysm.clock_ns if sysm is not None else self._clock_ns
 
     @clock_ns.setter
     def clock_ns(self, v):
         self._clock_ns = v
+        sysm = getattr(self.emu, 'system', None)
+        if sysm is not None:
+            sysm.clock_ns = v
         native = getattr(self.emu, "native", None)
         if native is not None:
             native.s.clock_ns = v         # the native rdtsc hook reads it
@@ -247,10 +252,17 @@ class Scheduler:
                 ret = t.timeout_ret or (0, False)
                 self.wake(t, *ret)
 
+    def next_deadline(self):
+        d = [t.deadline for t in self.threads.values() if t.state == BLOCKED and t.deadline is not None]
+        return min(d) if d else None
+
     def _advance_clock(self):
         # Skip idle time to the next deadline. A thread that wakes up but is
         # suspended cannot run, so keep skipping until something runnable wakes
         # (or nothing is left with a deadline -> real deadlock).
+        mgr = getattr(self.emu, 'manager', None)
+        if mgr is not None and mgr.others_alive(self.emu):
+            return None            # the machine's idle time is skipped by the manager once EVERY process is idle
         for _ in range(64):
             timed = [t for t in self.threads.values()
                      if t.state == BLOCKED and t.deadline is not None]

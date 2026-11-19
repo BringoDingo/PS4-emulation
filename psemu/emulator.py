@@ -470,10 +470,14 @@ class Emulator:
                 v = struct.unpack_from("<Q", raw, i)[0]
                 if lo <= v < hi:
                     found.append(v)
+                elif getattr(self, "dyn", None) is not None and self.dyn.module_at(v) is not None:
+                    lm = self.dyn.module_at(v)
+                    found.append(v)
         except Exception:
             pass
         self.log("  stack code-ptrs (return addrs): " +
-                 "  ".join(f"0x{a:x}" for a in found[:12]))
+                 "  ".join((lambda m: f"{m.name}+{a - m.base:#x}" if m else f"0x{a:x}")(
+                     self.dyn.module_at(a) if getattr(self, "dyn", None) else None) for a in found[:16]))
 
     # ---- instruction clock -----------------------------------------------
     @property

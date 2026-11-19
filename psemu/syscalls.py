@@ -330,7 +330,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if num not in WAIT_SYSCALLS:  # real progress (not another wait) resets idle detection
             self._idle_waits = 0
         handler = getattr(self, f"sys_{name}", None)
-        if _TRACE_TID and _TRACE_PROC in self.emu.path and self.emu.sched is not None and self.emu.sched.current is not None and self.emu.sched.current.tid == _TRACE_TID:
+        if _TRACE_TID and _TRACE_PROC in self.emu.path and self.emu.sched is not None and self.emu.sched.current is not None and (self.emu.sched.current.tid == _TRACE_TID or _TRACE_TID < 0):
             a = self._args(uc)
             self.emu.log(f'  [tt {num} {name}] ' + ' '.join(f'{x:#x}' for x in a[:6]))
 
@@ -1032,6 +1032,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if cmd == 0x4 and (kid & 0xFFFFFFFF) == 0xFFFFFFFF and k.create_session_handle(emu, uc, in_ptr, result_ptr):
             self._ret(uc, 0)
             return True
+        if cmd == 0x302 and k.client_info(emu, uc, kid, in_ptr):
+            if result_ptr:
+                uc.mem_write(result_ptr, struct.pack('<I', 0))
+            self._ret(uc, 0)
+            return True
         if cmd == 0x232 and k.reply(emu, uc, kid, in_ptr, size, result_ptr):
             self._ret(uc, 0)
             return True
@@ -1263,6 +1268,10 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
 
     PID = 1000
     APP_ID = 0x3E8          # this process's application id (kernel AppInfo / SysCore)
+
+    def pid_of_process(self):
+        """This process's pid: the one its parent got from rfork (spawned processes), else PID."""
+        return getattr(self.emu, 'child_pid', 0) or self.PID
 
     def sys_getpid(self, uc):
         self._ret(uc, self.PID)
@@ -1530,6 +1539,8 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             except Exception:
                 return self._ret(uc, EFAULT, error=True)
             key = (ident, filt)
+            if filt == -5 and self.emu.sched is not None:
+                self.emu.log(f"  [kevent] EVFILT_PROC change ident={ident:#x} flags={flags:#x} fflags={fflags:#x}")
             if flags & self.EV_DELETE:
                 notes.pop(key, None)
                 continue
@@ -1609,9 +1620,13 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         # sequence restarts at 3 whenever the child re-points stdio (dup2 onto 0..2) and never
         # overwrites a descriptor the parent still holds.
         fd = getattr(self, "_rdup_next", 3)
+        if fd >= 64:
+            # a caller that keeps duplicating until the source runs out of descriptors (SceSysCore's spawn
+            # helper): the source process has only a few, so the call fails with EBADF
+            return self._ret(uc, EBADF, error=True)
         self._rdup_next = fd + 1
         self.fds.setdefault(fd, "rdup")
-        self.emu.log(f"  [rdup] -> fd {fd}")
+        self.emu.log(f"  [rdup] args {[hex(x) for x in self._args(uc)[:3]]} -> fd {fd}")
         self._ret(uc, fd)
 
     # ---- writable file layer (see self.vfs) ----------------------------
@@ -2132,7 +2147,13 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         _pid, buf, *_ = self._args(uc)
         if not buf:
             return self._ret(uc, EINVAL, error=True)
-        name = os.path.splitext(os.path.basename(getattr(self.emu, "path", "") or ""))[0].lower()
+        target = self.emu
+        mgr = getattr(self.emu, 'manager', None)
+        if mgr is not None and (_pid & 0xFFFFFFFF) not in (0, self.pid_of_process()):
+            for q in mgr.procs:
+                if getattr(q[0], 'child_pid', 0) == (_pid & 0xFFFFFFFF):
+                    target = q[0]
+        name = os.path.splitext(os.path.basename(getattr(target, "path", "") or ""))[0].lower()
         paid = self.AUTHORITY_IDS.get(name, self.DEFAULT_AUTHORITY_ID)
         caps = [0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0, 0]
         info = struct.pack("<Q4Q4Q", paid, *caps, 0, 0, 0, 0) + b"\x00" * 0x40

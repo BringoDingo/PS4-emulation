@@ -972,3 +972,21 @@ SceSysCore handler, `sceApplicationInitializeForShellCore` succeeds, AppMgr star
 (SceUserService, regmgr keys). The ShellUI launch (NPXS20001 as a spawned process) is the next step.
 Debugging aids: `PSEMU_IPMI_TRACE=1|2` (kernel-side log; 2 = every ipmimgr call), `PSEMU_TRACE_TID`/`PSEMU_TRACE_PROC`
 (log every syscall of one thread).
+
+### 2026-11-19 (later): ShellCore past its own start-up
+More of the kernel side of IPMI, found by running the real firmware:
+* `0x302 {u32 *out}` on a session handle, while the server serves a request, returns the **client's pid**
+  (the process monitor registers it: `0xaa120012` adds the ShellCore pid, `0xaa120009` then checks it with
+  `get_authinfo(pid)` and the registry; before, `0x80aa000b` came back and ShellCore dereferenced the
+  missing result). It is a 4-byte out: writing 8 clobbered the caller's stack.
+* The server's reply `0x232` is `{u32 method result; u32; u64 descriptor; u32 count}` with `{ptr, len}` per
+  output; the kernel copies each into the client's output buffer and writes the method result. A reply is
+  matched to its request by the serving thread (several requests are in flight per session).
+* A **non-negative connect answer** accepts the client (AvSetting answers with the slot index); the value is
+  the client's status. A negative one refuses.
+* One machine, one clock: the idle time a process skips (`clock_ns`) is shared through `System`, and it is
+  only skipped when EVERY process is idle (the manager does it); `get_authinfo(pid)` looks the process up
+  by its spawn pid; `rdup` fails with EBADF past 64 (a "dup until it fails" loop ran 380k times).
+State: ShellCore runs its whole start-up (about 240 threads, the SceXxx servers), calls SceSysCoreApp2
+`0xaa120016`, which SceSysCore does not answer yet (the next thing to chase), and SceAvSettingIpc methods
+come back `0x809a00ff` from AvControl.

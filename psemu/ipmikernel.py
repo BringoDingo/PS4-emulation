@@ -68,6 +68,7 @@ class IpmiKernel:
         self.unknown = set()
         self.handling = {}              # (id(emu), tid) -> Session whose connect packet that server thread is running
         self.next_skid = 0x2000
+        self.inflight = {}              # (id(emu), id(thread)) -> (Session, token) of the request that thread is serving
         self.skid_sess = {}             # session handle (cmd 0x4) -> Session
 
     # ------------------------------------------------------------ helpers
@@ -113,6 +114,8 @@ class IpmiKernel:
         data = data[:size] if size else data
         if buf and data:
             uc.mem_write(buf, data)
+        if ptype == PKT_INVOKE and sid in self.sessions:
+            self.inflight[(id(emu), id(thread if thread is not None else emu.sched.current))] = (self.sessions[sid], struct.unpack_from('<I', data, 8)[0])
         if ptype == PKT_CONNECT and sid in self.sessions:
             self.sessions[sid].conn_buf = buf
             self.handling[(id(emu), id(thread if thread is not None else emu.sched.current))] = self.sessions[sid]
@@ -228,25 +231,49 @@ class IpmiKernel:
         result pointer) are both 0, then the thread resumes."""
         mem = pend["emu"].uc
         if pend["p_res"]:
-            mem.mem_write(pend["p_res"], struct.pack("<I", 0))
+            mem.mem_write(pend["p_res"], struct.pack("<I", pend.get("res", 0) & 0xFFFFFFFF))
         if pend.get("rp"):
             mem.mem_write(pend["rp"], struct.pack("<I", 0))
         pend["emu"].sched.wake(pend["thread"], 0, False)
 
-    def reply(self, emu, uc, kid, in_ptr, size, result_ptr):
-        """cmd 0x232 on a session handle {u32; u32; u64 reply descriptor; u32 1; u32 2}: the server's
-        answer to the request it is handling. The reply's contents are not decoded yet (logged)."""
+    def client_info(self, emu, uc, kid, in_ptr):
+        """cmd 0x302 {u64 *out} on a session handle: who is calling - the client's pid (u32)."""
         sess = self.skid_sess.get(kid)
-        if sess is None or not sess.pending:
+        if sess is None or (id(emu), id(emu.sched.current)) not in self.inflight:
             return False
-        token = next(iter(sess.pending))
-        pend = sess.pending.pop(token)
+        p = struct.unpack("<Q", bytes(uc.mem_read(in_ptr, 8)))[0]
+        if p:
+            uc.mem_write(p, struct.pack("<I", sess.client_emu.syscalls.pid_of_process()))
+        return True
+
+    def reply(self, emu, uc, kid, in_ptr, size, result_ptr):
+        """cmd 0x232 on a session handle {u32 method result; u32 ?; u64 out descriptor; u32 count; ..}: the
+        answer to the request this thread is serving. The descriptor lists {u64 ptr; u64 len} per output;
+        each is copied into the client's output buffer (in the client's address space)."""
+        sess = self.skid_sess.get(kid)
+        if sess is None:
+            return False
+        key = (id(emu), id(emu.sched.current))
+        got = self.inflight.pop(key, None)
+        token = got[1] if got and got[0] is sess else (next(iter(sess.pending), None))
+        pend = sess.pending.pop(token, None)
+        if pend is None:
+            return False
+        res = 0
         try:
             raw = bytes(uc.mem_read(in_ptr, 0x18))
-            p = struct.unpack_from("<Q", raw, 8)[0]
-            self.log(f"  [ipmi-k] reply to {sess.server.name}.{pend['method']:#x}: {raw.hex()} -> {bytes(uc.mem_read(p, 0x30)).hex() if p else ''}")
+            res, _a, p, cnt = struct.unpack_from("<IIQI", raw, 0)
+            for i in range(min(cnt, len(pend["outs"]))):
+                sp, ln = struct.unpack("<QQ", bytes(uc.mem_read(p + 16 * i, 16)))
+                d, cap, info = pend["outs"][i]
+                if sp and d and 0 < ln <= cap:
+                    pend["emu"].uc.mem_write(d, bytes(uc.mem_read(sp, ln)))
+                    pend["emu"].uc.mem_write(info + 16, struct.pack("<Q", ln))
+                    self.log(f"  [ipmi-k]   output {i}: {ln} bytes {bytes(uc.mem_read(sp, ln)).hex()}")
+            self.log(f"  [ipmi-k] reply to {sess.server.name}.{pend['method']:#x}: result {res:#x}, {cnt} output(s)")
         except Exception as e:
             self.log(f"  [ipmi-k] reply (unreadable: {e})")
+        pend["res"] = res
         self._finish(pend)
         if result_ptr:
             uc.mem_write(result_ptr, struct.pack("<I", 0))
@@ -266,12 +293,12 @@ class IpmiKernel:
             cb = getattr(sess, 'conn_buf', 0)
             if cb:
                 self.log(f"  [ipmi-k]   connect buffer after the callback: {bytes(uc.mem_read(cb + 0x140, 0x30)).hex()}")
-            sess.state = "connected" if res == 0 else "refused"
+            sess.state = "connected" if res < 0x80000000 else "refused"      # a non-negative answer (e.g. a slot index) accepts; it is also the client's status
             self.handling.pop((id(emu), id(emu.sched.current)), None)
             w, sess.waiting = sess.waiting, None
             if w is not None:
                 if w["result_ptr"]:
-                    w["emu"].uc.mem_write(w["result_ptr"], struct.pack("<I", 0 if res == 0 else 1))
+                    w["emu"].uc.mem_write(w["result_ptr"], struct.pack("<I", 0 if res < 0x80000000 else 1))
                 if getattr(sess, 'status_ptr', 0):
                     w["emu"].uc.mem_write(sess.status_ptr, struct.pack("<I", res))
                 w["emu"].sched.wake(w["thread"], 0, False)
