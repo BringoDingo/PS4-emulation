@@ -914,6 +914,40 @@ class Emulator:
                               name="mutex_lock_fixup", mode="fixup")
         self.log(f"  libthr hooks: fatal={'0x%x' % fatal if fatal else '?'}, "
                  f"mutex-lock entries={[hex(a) for a in lock_entries]}")
+        self._install_trace_funcs()
+
+
+    def _install_trace_funcs(self):
+        """Debug aid: PSEMU_TRACE_FUNCS="Module.elf+0x1234,Other.prx+0xabc" logs every call of those functions
+        (process, thread, the six argument registers and the first stack words); the function then runs normally.
+        PSEMU_TRACE_PROC limits it to processes whose path contains the text."""
+        spec = os.environ.get("PSEMU_TRACE_FUNCS")
+        if not spec or getattr(self, "dyn", None) is None:
+            return
+        if os.environ.get("PSEMU_TRACE_PROC", "") not in self.path:
+            return
+        for item in spec.split(","):
+            try:
+                mod, off = item.strip().rsplit("+", 1)
+                addr = int(off, 0)
+            except ValueError:
+                continue
+            lm = next((m for m in self.dyn.modules if m.name == mod or m.name.startswith(mod)), None)
+            if lm is None:
+                continue
+
+            def trace(emu, uc, label=item.strip()):
+                import struct as _s
+                from unicorn.x86_const import UC_X86_REG_RSP
+                a = emu.hle.args(uc)
+                rsp = uc.reg_read(UC_X86_REG_RSP)
+                st = _s.unpack("<4Q", bytes(uc.mem_read(rsp + 8, 32)))
+                tid = emu.sched.current.tid if emu.sched and emu.sched.current else 0
+                emu.log(f"  [trace {label}] tid {tid:#x} args " + " ".join(f"{x:#x}" for x in a)
+                        + " stack " + " ".join(f"{x:#x}" for x in st))
+
+            self.hle.register(lm.base + addr, trace, name="trace:" + item.strip(), mode="fixup")
+            self.log(f"  [trace] hooked {item.strip()} at {lm.base + addr:#x}")
 
     def load(self):
         # image is built in __init__/_build_image; kept for API compatibility

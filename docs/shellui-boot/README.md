@@ -1084,3 +1084,22 @@ the handler (`SceSysCore+0x7dfe0`) checks the session handle == the pid field, t
 itself set) and switches on a type derived from it (accepts types 0..9, bitmasks `0x2000000`/`0xf`...). The lookup
 (`0xce11000d {kind, 0x107, 0, pid}`) wants index 7 of that process. Next: log what `0x48a30` stores (key) against what
 `setStateIndex` compares (an instruction-level trace of those two functions in SceSysCore).
+
+### 2026-11-19 (end 6): tracing the Mbus registration vs lookup (function tracer `PSEMU_TRACE_FUNCS`)
+New debug aid: `PSEMU_TRACE_FUNCS="SceSysCore.elf+0x48a30,..."` (with `PSEMU_TRACE_PROC=<path substring>`) logs every
+entry of those functions (process, thread, six argument registers, first stack words) and lets them run.
+Regression check first: all 11 unit-test tools pass; the SceSysCore -> ShellUI chain (`--spawn-mode stay --then
+.../NPXS20001/eboot.bin`, 60 s, `--frames`) writes 4607 frame files at HEAD against 4622 for the sources of e820560
+over the same tree (a plain `git worktree` of an old commit cannot be compared: it lacks the untracked assets), 0 failed draws.
+What the trace of the failing `SceMbusIpc 0xce11000d` shows (SceSysCore offsets):
+* Process creation (`0xce11002a`) builds one entry per module group with `0x79640(obj, ..., mask, ..., pid)`; the
+  groups are `0x1,0x2,0x4,0x8,0x10,(5),0x100,0x200,0x400,0x800,0x4000,(0xb),0x1000,0x2000,0x10000,0x100000,(0x10),(0x11)`.
+* The ShellUI registers two modules (`0xce110007` -> `0x7dfe0` -> `0x48a30` -> `0x79c90`): `{1, 0x20000007, ...}` lands in
+  the object of group `0x1` (`0x20001248a0`), `{1, 0x20010008, ..., 1, ...}` in group `0x2` (`0x2000125380`).
+* The failing call `0xce11000d {2, 0x107, 0, pid}` (`0x7e320` -> `0x54c80` -> `0x79890`) searches the entries (stride
+  0x38, compared by `0x8d1a0`) of a **different** object, group `0x800` (`0x200012aa80`), for (pid `0x3ef`, index 7):
+  none matches -> `not registered`. So registration and lookup disagree on the object (module group), not on the key.
+Open: how `0x54c80` maps (kind 2, module `0x107`) to group `0x800`, and which registration the real client sends to
+that group (the ShellUI sends none; either its registration depends on an answer psemu gave differently - e.g. the
+48-byte `0xce110029` / `0xce110028` outputs, all zero - or group `0x800` entries are created by SceSysCore itself when
+it spawns the app). Next step: trace `0x54c80`, `0x565a0`, `0x55fc0`, `0x558e0` and the `0x48a30` switch.
