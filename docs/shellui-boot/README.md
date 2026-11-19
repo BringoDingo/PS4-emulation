@@ -13,9 +13,11 @@ problems that later sections solved: do not read an intermediate section as the 
   compositor ~5x faster (direct sampling, parallel tiler, lazy write-back behind a WHP page watch);
   network-listener CPU spin fixed; SceMbusIpc device list + `/dev/hid` model (a DualShock 4 registers and
   `scePadReadState` is polled).
-* **Open, in order:** (1) with a pad attached (`PSEMU_PAD` != off, default off) the main thread parks on a
-  libScePsm Mono semaphore nobody posts (`addr_sync.py` / `mod_hooks.py` are the tools; do not fake the
-  post); (2) compositor frame spikes of 400-600 ms (shader translation misses, texture uploads) cause the
+* **Open, in order:** (1) with a pad attached (`PSEMU_PAD` != off, default off) the UI dies on an unhandled
+  `DllNotFoundException: BgmPlayStatusCheck`; root cause = no audio: libScePsm's sound start-up fails, so it
+  never registers its built-in Bgm library (full chain in the 2026-11-18 "pad-attached stall: root cause"
+  section; next step: model the audio server `SceSysAudioSystemIpc` / libSceAudioOut init, then enable
+  `/dev/ajm` by default); (2) compositor frame spikes of 400-600 ms (shader translation misses, texture uploads) cause the
   `LOST PAD DATA` lines; (3) the username shows "Unknown" (ProfileCache `_GetLocalUserInfoNative`); (4) app
   launch via SceLncService / separate app processes; remaining stub IPC services.
 * **Constraints:** only GPL-2.0-or-later code may be reused; no firmware is committed.
@@ -633,3 +635,46 @@ of PLT thunks), `plt_targets.py` / `plt_callers.py` / `elfsyms.py` / `xref_mod.p
 string xrefs in any module), `kev_filters.py`, `thread_syscalls.py` (per-thread syscall histogram),
 `spin_who.py`, `addr_sync.py` (who waits/wakes an address), `rip_sample.py`, `pad_calls.py`.
 `python -m psemu.tools_hidtest` covers the Mbus list, filters, open/close/info/capability and the buffer sizes.
+
+## Update 2026-11-18 (late night): the pad-attached stall - root cause chain
+
+The main thread's Mono semaphore wait was a symptom. Following it down (tools: `sem_trace.py`,
+`stw_trace.py`, `main_tail.py`, `all_stacks.py`, `wait_stack.py`, `mdbg_trace.py`, `exc_catch.py`,
+`open_who.py`, `data_watch.py`, `mod_hooks.py`, `plt_targets.py`):
+
+1. **What the wait is.** The main thread (`tid 0x10001`) is inside the managed `Exception.ToString` called from
+   the UI task framework's `FilterTasksFromWorkItems`; building the exception text allocates a string, the GC
+   runs and the thread parks on a Mono `libmonosgen` global semaphore (`+0x4e78d0`, a thread-state job
+   handshake nobody completes: the UI is dying, not deadlocking in the GC). Before that it printed the
+   "FrameTask Entry 'DefaultTasks' ..." dump of every registered UI task and called
+   `mdbg_service(3, 0xa0028401)`: the **PSM runtime's unhandled-exception report** (the same runtime that
+   creates `ScePsmExceptionInfo` at boot). The rest of the shell then stops rendering.
+2. **The exception.** `exc_catch.py` (hooks `System.Exception::ToString` in the mscorlib AOT image and reads
+   the object's string fields): **`System.DllNotFoundException: BgmPlayStatusCheck`**, thrown by
+   `Sce.PlayStation.HighLevel.UI2 ... BgmPlayerWrapper.PortUsablePollingHandler` (a UI timer) through
+   `Sce.PlayStation.Core.dll`'s `[DllImport("BgmPlayStatusCheck")] sceGetBgmPlayStatusNative`. The timer only
+   starts once the user is associated with a pad, which is why the pad-off runs never see it.
+3. **Why the library is missing.** Sony's Mono asks registered dl-fallbacks (`mono_dl_fallback_register`) before
+   touching the file system. `libScePsm` registers one whose user data is a one-entry table
+   `{"BgmPlayStatusCheck", {"sceGetBgmPlayStatusNative" -> libScePsm+0x128e60}}`
+   (`libScePsm+0x1d68c6`), but only on the path taken when its audio start-up succeeds
+   (`libScePsm+0x1d66a9: call 0x7c6a0` must return 0). It returns `0x80b3f001` (in pad-on **and** pad-off
+   runs), so the table is never registered and the lookup falls through to `lt_dlopen`
+   (`libBgmPlayStatusCheck.la` ENOENT, four probes) and the exception.
+4. **Why audio start-up fails.** `libScePsm+0x6b400` creates the audio engine and its first device call is
+   `ioctl(/dev/ajm, 0xc0288903)` (`sceAjmModuleRegister`): the AJM decoder device is unmodelled, so the generic
+   stub returns 0 **without writing the status dword the wrapper then returns**, i.e. stack garbage.
+   (`dynproc._audioout_null_client` already noted "PSM's sound init ... fails first on the unmodelled
+   /dev/ajm".)
+5. **`/dev/ajm` is now modelled** (`devices.AjmDevice`, opt-in `PSEMU_AJM=1`): twelve `0xc0288900+n` requests
+   of 0x28 bytes, status u32 at +0 (0 = OK), instance create returns an id at +0x14 (layouts from libSceAjm's
+   wrappers; unit-tested). With it, PSM's audio init gets further: `sceAudioOutOpen` (the BGM/system port,
+   `ch=7`) reaches the **audio server** (`SceSysAudioSystemIpc`, methods `0x12340000..0x1234002c`, shm
+   `/shm_<pid>_<port>_A`), which is unmodelled ("empty success"), and `libSceAudioOut+0x3f05` writes through its
+   port-state table into unmapped memory (SIGSEGV, boot dies at ~5.6 s). That is a regression for the default
+   boot, so **AJM is opt-in until the audio server exists**.
+
+Next step: model the audio server enough for `sceAudioOutInit` / `sceAudioOutOpen` to succeed (client create,
+the 45 IPMI methods' replies, the shared port table and event queue), then enable `/dev/ajm` by default; the
+Bgm table registers, `BgmPlayStatusCheck` resolves to `libScePsm+0x128e60`, and the pad-attached run should keep
+rendering. (Not tried: registering the Bgm table from the host, which would hide that audio is down.)

@@ -17,6 +17,7 @@ Sony's user-mode libraries talk to two kernel drivers to draw and present:
 Requests nobody models yet are logged once per code and answered with success
 and zeroed outputs, which is what kept boot moving before devices existed.
 """
+import os
 import struct
 
 IOCPARM_SHIFT = 16
@@ -532,6 +533,42 @@ class RandomDevice(Device):
         return n
 
 
+# ---------------------------------------------------------------- /dev/ajm
+#
+# libSceAjm (the audio decoder accelerator: ATRAC9, AAC, MP3 ...) talks to /dev/ajm with twelve ioctls
+# 0xc0288900 + n, all `RW size 0x28`. Layout from libSceAjm's wrappers (docs/shellui-boot/README.md):
+#   +0x00 u32  status written by the kernel (0 = OK; the wrapper returns it as the SCE result)
+#   +0x08..    inputs (MemoryRegister: ptr, size; ModuleRegister: codec; InstanceCreate: flags, codec)
+#   InstanceCreate (n = 5) also returns the new instance id as a u32 at +0x14.
+# n: 0 finalize, 1 memory register, 2 memory unregister, 3 module register, 4 module unregister,
+#    5 instance create, 6 instance destroy, 7 batch start, 8 batch wait, 9 batch cancel,
+#    0xa instance extend, 0xb instance switch.
+# The generic "return 0, write nothing" left the status dword as stack garbage, so libScePsm's audio
+# start-up (sceAjmModuleRegister) failed with 0x80b3f001 and never registered its built-in
+# `BgmPlayStatusCheck` native library; the Bgm player's P/Invoke then threw DllNotFoundException.
+# Decoding itself is not implemented: batches report "done, nothing decoded".
+# Enabled with PSEMU_AJM=1 only (see open_device): on its own it moves the failure into AudioOut.
+
+AJM_REQ_BASE = 0xC0288900
+AJM_INSTANCE_CREATE = 5
+
+
+class AjmDevice(Device):
+    """/dev/ajm: accepts every request with status OK (no decoding)."""
+
+    _instances = 0
+
+    def ioctl(self, uc, req, argp):
+        n = req - AJM_REQ_BASE
+        if not 0 <= n <= 0xB:
+            return self.unknown(uc, req, argp)
+        self.w32(uc, argp, 0)                               # status: SCE_OK
+        if n == AJM_INSTANCE_CREATE:
+            AjmDevice._instances += 1
+            self.w32(uc, argp + 0x14, AjmDevice._instances)
+        return 0
+
+
 # ---------------------------------------------------------------- /dev/hid
 #
 # libScePad (and the copy linked into the ShellUI) drive the controllers through ioctls on /dev/hid,
@@ -646,5 +683,11 @@ DEVICES = {
 
 
 def open_device(sc, path):
+    if path == "/dev/ajm" and os.environ.get("PSEMU_AJM"):
+        # Opt-in. With the decoder answering, libScePsm's audio start-up gets as far as
+        # sceAudioOutOpen and then crashes in libSceAudioOut: the audio server
+        # (SceSysAudioSystemIpc) is not modelled yet. Without it the AJM failure keeps PSM's sound
+        # init failing cleanly (and the Bgm library unregistered, see the README).
+        return AjmDevice(sc, path)
     cls = DEVICES.get(path)
     return cls(sc, path) if cls else None

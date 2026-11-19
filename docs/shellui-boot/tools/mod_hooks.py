@@ -14,6 +14,7 @@ EXE = r"D:\Ps4Tools\ps4kernel\firmware\system_ex\app\NPXS20001\eboot.bin"
 FW = r"D:\Ps4Tools\ps4kernel\firmware"
 secs, modname = float(sys.argv[1]), sys.argv[2]
 import os
+STRARG = bool(os.environ.get("STRARG"))
 GOT = int(os.environ.get("GOT", "0"), 0)       # optional: GOT slot (module-relative) of a PLT thunk hook
 offs = [int(a, 0) for a in sys.argv[3:]]
 emu = Emulator(EXE, fw_root=FW, backend="whp")
@@ -51,8 +52,17 @@ def make(off):
         if counts[off] <= 4:
             a = [uc.reg_read(r) for r in (X.UC_X86_REG_RDI, X.UC_X86_REG_RSI, X.UC_X86_REG_RDX,
                                           X.UC_X86_REG_RCX)]
-            print(f"[{e._time() - e._t0:7.2f}s] {off:#x}({a[0]:#x}, {a[1]:#x}, {a[2]:#x}, {a[3]:#x}) "
+            print(f"[{e._time() - e._t0:7.2f}s] {off:#x}(rax={uc.reg_read(X.UC_X86_REG_RAX):#x} "
+                  f"rcx={uc.reg_read(X.UC_X86_REG_RCX):#x}; {a[0]:#x}, {a[1]:#x}, {a[2]:#x}, {a[3]:#x}) "
                   f"<- {stack(uc)}", flush=True)
+            if STRARG:                                # print the C string in rdi/rsi when it is one
+                for nm, rg in (("rdi", X.UC_X86_REG_RDI), ("rsi", X.UC_X86_REG_RSI)):
+                    try:
+                        raw = bytes(uc.mem_read(uc.reg_read(rg), 80)).split(bytes([0]))[0]
+                        if len(raw) >= 2 and all(32 <= c < 127 for c in raw):
+                            print(f"        {nm} = {raw.decode()!r}", flush=True)
+                    except Exception:
+                        pass
             if GOT:                                   # PLT thunk: show where its GOT slot points
                 lm = emu.dyn.by_name(modname)
                 tgt = struct.unpack("<Q", bytes(uc.mem_read(lm.base + GOT, 8)))[0]

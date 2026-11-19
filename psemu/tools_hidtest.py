@@ -152,6 +152,28 @@ def main():
     check("capability (0x80104801) returns 0 and writes <= 0x30 bytes",
           dev.ioctl(uc, devices.HID_PAD_CAPABILITY, 0x7200) == 0
           and bytes(uc.mem_read(0x7330, 0x20)) == b"\xee" * 0x20)
+    # ---- /dev/ajm (opt-in: PSEMU_AJM=1)
+    import os as _os
+    saved = _os.environ.pop("PSEMU_AJM", None)
+    check("/dev/ajm stays the generic stub unless PSEMU_AJM is set", devices.open_device(sc, "/dev/ajm") is None)
+    _os.environ["PSEMU_AJM"] = "1"
+    aj = devices.open_device(sc, "/dev/ajm")
+    check("with PSEMU_AJM=1 /dev/ajm is the AjmDevice", isinstance(aj, devices.AjmDevice))
+    uc.mem_write(0x8000, b"\xee" * 0x28)
+    check("module register (0xc0288903) writes status 0 at +0 and returns 0",
+          aj.ioctl(uc, 0xC0288903, 0x8000) == 0 and struct.unpack("<I", bytes(uc.mem_read(0x8000, 4)))[0] == 0)
+    uc.mem_write(0x8100, b"\xee" * 0x28)
+    aj.ioctl(uc, 0xC0288905, 0x8100)
+    i1 = struct.unpack("<I", bytes(uc.mem_read(0x8114, 4)))[0]
+    aj.ioctl(uc, 0xC0288905, 0x8100)
+    i2 = struct.unpack("<I", bytes(uc.mem_read(0x8114, 4)))[0]
+    check("instance create (0xc0288905) returns distinct ids at +0x14", i1 >= 1 and i2 == i1 + 1, "(%d, %d)" % (i1, i2))
+    check("an AJM request outside 0..0xb is logged, not answered", aj.ioctl(uc, 0xC028890C, 0x8000) == 0
+          and any("not modelled" in m for m in sc.emu.msgs))
+    if saved is None:
+        del _os.environ["PSEMU_AJM"]
+    else:
+        _os.environ["PSEMU_AJM"] = saved
     print("hid model:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
