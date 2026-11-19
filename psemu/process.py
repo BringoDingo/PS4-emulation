@@ -24,6 +24,7 @@ class System:
         self._next_handle = 0x100
         self.evfs = {}            # name -> sys_sync.EventFlag
         self.sems = {}            # name -> sys_sync.Semaphore
+        self.mounts = {}          # nmount fspath -> its name/value pairs
         self.clock_ns = 0         # virtual time skipped while everything slept (shared: one clock per machine)
         from .ipmikernel import IpmiKernel
         self.ipmi = IpmiKernel(log=lambda m: print(m, flush=True))
@@ -55,13 +56,15 @@ class ProcessManager:
         self.procs.append([emu, cur])
         return emu
 
-    def spawn(self, parent, path, argv):
+    def spawn(self, parent, path, argv, app_root=None):
         """Start `path` as a new process next to `parent` (sys_execve with --spawn-mode spawn)."""
         from .emulator import Emulator
         emu = Emulator(path, trace=parent.trace, max_insns=parent.max_insns, fw_root=parent.fw_root,
                        backend="whp" if parent.whp else "unicorn", shared_machine=parent.shared_machine,
                        host_identity=False)
         emu.parent = parent
+        if app_root:
+            emu.app_root = app_root              # this app's own /app0
         emu.max_seconds = parent.max_seconds
         emu._t0 = parent._t0
         emu.max_modules = parent.max_modules

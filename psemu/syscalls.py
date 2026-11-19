@@ -106,6 +106,7 @@ from .sys_dynlib import DYNLIB_SYSCALLS, DynlibSyscalls
 from .devices import BLOCKED, DceDevice, DmemDevice, open_device
 from .sys_sync import SYNC_SYSCALLS, SyncSyscalls
 
+import os
 import struct as _struct
 
 # sysctls looked up by name (sysctl.name2oid). Values as the PS4 kernel
@@ -1286,6 +1287,28 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         """This process's pid: the one its parent got from rfork (spawned processes), else PID."""
         return getattr(self.emu, 'child_pid', 0) or self.PID
 
+    def sys_nmount(self, uc):
+        """nmount(struct iovec *iov, u_int iovcnt, int flags): name/value pairs ("fstype", "fspath", "from" ...).
+        Nothing is mounted (psemu serves the host firmware tree); the mounts are recorded, machine-wide, so the
+        ones that matter (an application's /app0) can be resolved, and logged."""
+        iov, cnt, flags = self._args(uc)[:3]
+        cnt &= 0xFFFFFFFF
+        kv = {}
+        try:
+            vals = []
+            for i in range(min(cnt, 40)):
+                ptr, ln = _struct.unpack("<QQ", bytes(uc.mem_read(iov + 16 * i, 16)))
+                vals.append(bytes(uc.mem_read(ptr, min(ln, 256))).split(bytes(1))[0].decode("latin1") if ptr and ln else "")
+            kv = {vals[i]: vals[i + 1] for i in range(0, len(vals) - 1, 2)}
+        except Exception:
+            pass
+        sysm = getattr(self.emu, "system", None)
+        if sysm is not None and kv.get("fspath"):
+            sysm.mounts[kv["fspath"]] = kv
+        if kv.get("fspath", "").find("app0") >= 0 or "sandbox" in kv.get("fspath", "") or "NPXS" in str(kv):
+            self.emu.log(f"  [nmount] {kv}")
+        self._ret(uc, 0)
+
     def sys_getpid(self, uc):
         self._ret(uc, self.pid_of_process())
 
@@ -1403,6 +1426,22 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                     kn["fflags"] = fflags
         self.trigger(-5, None, data)
 
+    def _app0_root(self, path):
+        """The host directory behind '/app0' for a spawned app: the application's own directory, from the
+        newest nullfs mount of '.../app0' (its target, e.g. /system/vsh/app/NPXS20001, looked up in the
+        firmware tree under system/vsh/app and system_ex/app). None for any other path."""
+        if not path.replace(chr(92), "/").lstrip("/").startswith("app0/"):
+            return None
+        sysm = getattr(self.emu, "system", None)
+        for fp, kv in reversed(list((sysm.mounts if sysm is not None else {}).items())):
+            if fp.endswith("/app0") and kv.get("target"):
+                name = kv["target"].rstrip("/").rsplit("/", 1)[-1]
+                for sub in ("system/vsh/app", "system_ex/app", "system/vsh", "system_ex"):
+                    d = os.path.join(self.emu.fw_root, *sub.split("/"), name)
+                    if os.path.isdir(d):
+                        return d
+        return None
+
     def sys_execve(self, uc):
         # mini-syscore's job is early boot, then hand off to the next stage.
         # We can't chain-load that separate firmware module, so report the
@@ -1434,7 +1473,10 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if cur is not None and getattr(cur, "spawn_child", False) and mode == "spawn" and mgr is not None:
             # a real second process: the child image runs concurrently (own address space) under the
             # ProcessManager while this process carries on
-            resolved = self.emu.resolve_path(path)
+            app_root = self._app0_root(path)
+            resolved = os.path.join(app_root, *path.replace(chr(92), "/").lstrip("/")[5:].split("/")) if app_root else self.emu.resolve_path(path)
+            if app_root and not os.path.isfile(resolved):
+                resolved = None
             if resolved is None:
                 # execve fails (ENOENT) in the child, which then exits: the parent sees NOTE_EXIT
                 self.emu.log(f"  [execve] spawn '{path}': not found under {self.emu.fw_root} "
@@ -1443,7 +1485,8 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 self.child_done(getattr(cur, "child_pid", 0), 1 << 8)
             else:
                 self.emu.log(f"  [execve] spawn '{path}' -> new process")
-                child = mgr.spawn(self.emu, resolved, argv or [path])
+                child = mgr.spawn(self.emu, resolved, argv or [path], app_root=app_root)
+                self.emu.log(f"  [execve]   -> {resolved}")
                 child.child_pid = getattr(cur, "child_pid", 0)
                 self.proc_event(self.NOTE_EXEC, 0)
             sched.exit_current()

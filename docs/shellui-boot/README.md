@@ -1021,3 +1021,17 @@ new `DevActDevice` reports an activated unit. Now LncService goes on: `Num. of l
 loader does not handle it yet) while ShellCore reports `Main thread has frozen in
 sceApplicationSignalShellCoreHeartBeat()`. Also: `/app0` must map to `/system_ex/app/NPXS20001`, the process
 needs the same module set as the single-process ShellUI run (app.exe.sprx, the mono runtime, ...).
+
+### 2026-11-19 (end 2): the spawned ShellUI ran the wrong app - `/app0` comes from the nmount
+`execve('/app0/eboot.bin')` was resolved by a basename search to another app's `system/vsh/app/ITEM00002/eboot.bin`
+(the one that faulted at `rip=0`). The real way: LncService first `nmount`s a sandbox with a nullfs for the app,
+`{fstype: nullfs, fspath: /mnt/sandbox/NPXS20001_000/app0, target: /system/vsh/app/NPXS20001}` (then dev,
+system_tmp, user, system_ex ...). `sys_nmount` now records the name/value pairs machine-wide (`System.mounts`) and
+the spawn takes the newest `.../app0` mount, looks its target's last component up under `system/vsh/app` and
+`system_ex/app` (the dump keeps NPXS20001 in `system_ex/app`) and gives the child that directory as its own
+`app_root`. The right 12 MB `eboot.bin` now loads (96 modules) and runs: it opens its clients to SceLncService
+(hosted by ShellCore - routed), SceShellCoreUtil, SceAppMessaging ...
+What it hits next (open): `SceLncService.0x30010` (getAppStatus) -> `0x80940004`, and SceSysCoreApp methods
+`0xaa110012`/`0xaa110002` -> `0x80aa000c` (the app is not a registered application in SceSysCore/LncService: the
+real launch registers the spawned pid with SceSysCoreApp2 and LncService before the app asks), then the process
+ends with `exit(0)`. ShellCore itself reports `Main thread has frozen in sceApplicationSignalShellCoreHeartBeat()`.
