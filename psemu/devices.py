@@ -671,6 +671,8 @@ class HidDevice(Device):
         state = self.source.poll(now / 1e6 - getattr(self.emu, '_t0', 0.0))
         last = HidDevice._last
         if last is None or last[0] != state or now - last[1] >= 250_000:
+            if last is None or last[0] != state:
+                self.log(f"pad state -> buttons {state.buttons:#x}")       # one line per change
             HidDevice._last = last = (state, now)
         return last
 

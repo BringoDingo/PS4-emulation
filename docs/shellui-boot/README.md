@@ -21,12 +21,17 @@ problems that later sections solved: do not read an intermediate section as the 
   one cause: nothing answered `SceUserService` 0x30004 (the per-user string call), so the shell had no
   logged-in user name; with "Player1" (placeholder, `PSEMU_USER_NAME` overrides) the top bar and hint bar
   show it and scripted RIGHT/DOWN pulses move the content row. See "the user name" below.
-* **Open, in order:** (1) pad navigation is only checked by scripted pulses and frame montages (no assertion
-  yet; focus tile / launch on CROSS untested); (2) compositor frame spikes of 400-600 ms (shader translation
-  misses, texture uploads) cause the `LOST PAD DATA` lines and doubled text/icons in captured frames; (3) the
-  name is a placeholder - a real account store (user settings, avatar, theme, NP ids) is not modelled;
-  (4) app launch via SceLncService / separate app processes; remaining stub IPC services; no AJM decoding /
-  no audio output.
+* **CROSS on a tile reaches the launch call and stops in IPMI**: `AppLauncher.Start` -> `LncUtil.LaunchApp` ->
+  `libSceSystemService` waits for a free slot of `SceLncAsyncCallSema` (2 slots) and the two async calls
+  issued at boot (`SceLncService`, IPMI `cmd 0x241`) never complete, so the slot never frees. With the slot
+  forced free (diagnostic only) the call proceeds and waits on the `SceLncService` event flag instead
+  (`cmd 0x490`). See "CROSS on a tile" below.
+* **Open, in order:** (1) IPMI **async** invoke (`cmd 0x241`) needs real completion (result delivery + the
+  per-slot event-flag bit) - then the launch can continue to `SceLncService` launch handling, which
+  does not exist yet (no app process is started anywhere); (2) compositor frame spikes of 400-600 ms
+  (shader translation misses, texture uploads) cause the `LOST PAD DATA` lines and doubled text/icons in
+  captured frames; (3) the name is a placeholder - no real account store (avatar, theme, NP ids);
+  (4) no AJM decoding / no audio output; remaining stub IPC services.
 * **Constraints:** only GPL-2.0-or-later code may be reused; no firmware is committed.
 
 
@@ -775,3 +780,33 @@ the audio-less boot. Pacing/results for AJM jobs are the next audio item; the au
   (`PSEMU_PAD=script PSEMU_PAD_BUTTONS="14+0.5=RIGHT,20+0.5=RIGHT,26+0.5=DOWN"`) now move the content row -
   the UI had been dropping input because it had no logged-in user. Verified on frame montages; chain run
   with a pad: 9000 DCBs/60 s, exit 0, no managed fatal. `python -m psemu.tools_usertest` covers the method.
+
+## Update 2026-11-18 (night, last): CROSS on a tile - where the launch stops
+
+* **New tools.** `tools/cil.py` reads the IL embedded in the managed `.dll.sprx` files (all of the ShellUI's
+  logic is managed): `python cil.py app.exe.sprx list AppLauncher`, `... dis "DisplayClass26::<Start>b__24"`.
+  It resolves tokens to names and strings; the first run per assembly extracts the PE (30 s), later runs use a
+  cache. `tools/icall.py <secs> <after> GetBootEvent ...` finds eboot internal-call implementations (name
+  string -> `{name, fn}` entry) and logs their calls. Both replaced guessing: the launch path below was read,
+  not inferred. (`pip install` of a .NET reader was refused by the sandbox, so `cil.py` is hand-written.)
+* **The press, step by step** (`PSEMU_PAD=script PSEMU_PAD_BUTTONS="22+0.4=CROSS"`; the log now prints
+  `pad state -> buttons 0x4000` once per change): the UI thread runs the `AppLauncher.RegisterLaunchMessage`
+  handler -> `InvitationManager.OnNewSessionStarted` -> eboot native `ClearAutoAcceptInvitation(user)`; a worker runs
+  the `AppLauncher.Start` job (`<Start>b__24`): CheckInitDaemons (waits for boot flag `0x8000000`, which
+  `BackgroundInitDaemons` sets at ~14.7 s - fine), `LaunchTargetInfo..ctor` (the `tbl_appbrowse ... where
+  titleId = ?` query; found), IsRunning/IsAppKilling/PowerManager/LaunchPSCloudSubs checks (all passed), and
+  finally `LncUtil.LaunchApp` -> `sceLncUtilLaunchApp` in libSceSystemService.
+* **Where it blocks.** `libSceSystemService+0x5e22` does `sceKernelWaitSema(SceLncAsyncCallSema, 1)` (the sema
+  is created with 2 slots; each async Lnc call takes one and its completion gives it back). Both slots are
+  gone (async calls made at boot never complete: `ipmimgr_call cmd 0x241` is an "empty success" with no
+  completion), so `LaunchApp` never gets to send anything: no IPMI after the press, no error, no dialog, the
+  UI just keeps running. Diagnostic (not committed): forcing that sema wait to succeed lets it issue the call,
+  and the thread then parks in `cmd 0x490` (wait event flag) on `SceLncService`.
+* **A tried shortcut that failed**: adding `SceLncService` to `IPMI_EVF_SATISFY` (the stand-in that completes
+  the compositor / AvSetting / ShellCoreUtil event-flag waits) made the whole shell crawl (5495 context switches,
+  no frames): the Lnc client also has event-wait loops that must keep blocking, so completion has to be tied to
+  the async call's own slot bit (`1 << (counter % 64)`, passed with the 0x241 request), not to the service name.
+* **Next**: implement `cmd 0x241` properly (request struct `{ptr method, numIn, numOut, ... }` at
+  `libSceIpmi+0x49c0`: run the modelled/empty method at once, store the out buffers, and signal the slot bit that
+  the client's `0x490` wait names); then model `SceLncService`'s launch method so a tile press at least produces
+  an app-status/launch event; separate app processes are still not run.
