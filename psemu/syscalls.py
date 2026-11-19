@@ -2219,7 +2219,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             return self._ret(uc, EINVAL, error=True)
         target = self.emu
         mgr = getattr(self.emu, 'manager', None)
-        _pid &= 0xFFFF            # IPMI session handles carry the pid in their low 16 bits
+        # IPMI session handles are the client's pid
         if mgr is not None and _pid not in (0, self.pid_of_process()):
             for q in mgr.procs:
                 if getattr(q[0], 'child_pid', 0) == _pid:

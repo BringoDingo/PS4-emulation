@@ -252,7 +252,7 @@ class IpmiKernel:
                 self.log("  [ipmi-k]   client stack: " + " ".join(ch[:40]))
             except Exception as e:
                 self.log(f"  [ipmi-k]   no stack: {e}")
-        self.log(f"  [ipmi-k] sync {name}.{method:#x} in={[x[:12].hex() if len(x) <= 12 else len(x) for x in ins]} out={[o[1] for o in outs]} flags {a[0x28:0x30].hex()} token {token}")
+        self.log(f"  [ipmi-k] sync {name}.{method:#x} in={[x[:40].hex() if len(x) <= 40 else len(x) for x in ins]} out={[o[1] for o in outs]} flags {a[0x28:0x30].hex()} token {token}")
         emu.sched.block({"kind": "ipmi_invoke", "name": name, "method": method})
         return False
 
@@ -267,7 +267,7 @@ class IpmiKernel:
             return False
         obj, aux = struct.unpack("<QQ", bytes(uc.mem_read(in_ptr, 16)))
         self.next_skid += 1
-        kid = (sess.client_emu.syscalls.pid_of_process() & 0xFFFF) | ((self.next_skid & 0x7FFF) << 16)
+        kid = sess.client_emu.syscalls.pid_of_process()      # the handle IS the client's pid (servers compare it with the pid in a request)
         try:                                    # the second operand points at {u64 0x10; ...; u64 slot record @+8}
             slot = struct.unpack('<Q', bytes(uc.mem_read(aux + 8, 8)))[0]
         except Exception:
@@ -284,9 +284,16 @@ class IpmiKernel:
             uc.mem_write(result_ptr, struct.pack("<I", kid))
         return True
 
+    def _sess_for(self, emu, kid):
+        """The session a server thread means by handle `kid`: the one it is serving or connecting (several of one
+        client's sessions share its pid as handle), else the last registered with that handle."""
+        key = (id(emu), id(emu.sched.current))
+        got = self.inflight.get(key)
+        return got[0] if got else (self.handling.get(key) or self.skid_sess.get(kid))
+
     def client_pid(self, emu, uc, kid, in_ptr):
         """cmd 0x302 {u32 *out} on a session handle: the client's pid."""
-        sess = self.skid_sess.get(kid)
+        sess = self._sess_for(emu, kid)
         if sess is None:
             return False
         p = struct.unpack("<Q", bytes(uc.mem_read(in_ptr, 8)))[0]
@@ -296,7 +303,7 @@ class IpmiKernel:
 
     def client_info(self, emu, uc, kid, in_ptr):
         """cmd 0x468 {u64 *out} on a session handle: the slot record registered with cmd 4."""
-        sess = self.skid_sess.get(kid)
+        sess = self._sess_for(emu, kid)
         if sess is None:
             return False
         p = struct.unpack("<Q", bytes(uc.mem_read(in_ptr, 8)))[0]

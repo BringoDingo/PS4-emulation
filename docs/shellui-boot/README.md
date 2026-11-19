@@ -1052,3 +1052,19 @@ with `init_system.cpp(715) initializeSystemAfterPsm: LX_ISOK2::0x80f61308` -> `A
 initializeSystemAfterPsm())`. The failing call (`eboot+0x87860` -> `0x87fb0`) is two libSceAudioIn/Out exports (NIDs
 `IQtWgnrw6v8`, `O3FM2WXIJaI`, both called with `(0x107, 0)`, the restricted-port type) that must return 0; one
 does not. Next: find what they check (state kept in libSceAudioIn/Out, filled by the SceSysAudioSystemIpc answers).
+
+### 2026-11-19 (end 4): what `initializeSystemAfterPsm` is really calling - SceMbusIpc `0xce11000d`
+The two functions that must return 0 (NIDs `IQtWgnrw6v8` = libSceAudioIn, `O3FM2WXIJaI` = libSceAudioOut, called with
+`(0x107, 0)`) are one-line wrappers around **libSceMbus `eTpWp430DA4`**, an IPMI call to **SceMbusIpc method
+`0xce11000d`** with `{u32 kind (1 out / 2 in); u32 0x107; u32 0; u32 pid}`. The real server (SceMbusIpc, inside SceSysCore)
+answers `0x809b00ff`, printing `**setStateIndex:L93 not registered pid(0x000003ef:0x00000007)` /
+`ProcessMediaInfo::setMuduleStateIndex failed (0xFFFFFFFD)`: the process is not registered for module 7 in its
+ProcessMediaInfo table, although the same client registered it a moment before (`0xce110007` with module records
+`{1, 0x20000007, 0xff, ..., pid}` and `{1, 0x20010008, ...}` -> 0; `0xce11002a`/`0xce110029` create the process entry).
+Also changed: the session handle cmd 4 returns is exactly the client's pid (the Mbus/AvSetting handlers compare it with
+the pid in the request); a server thread resolves "its" session by what it is serving, not by the handle (several
+sessions of one client share the pid).
+Open: why the lookup of (pid, 7) fails after the registration succeeded - either the registration stores under
+another key (module id `0x20000007` vs index 7), or the 48-byte/4096-byte outputs of `0xce110029`/`0xce110028` (the
+reply descriptor of those has an unexpected length field and psemu does not copy them yet) carry state the client
+library needs.
