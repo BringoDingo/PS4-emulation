@@ -889,3 +889,39 @@ could not be played here, so what follows is from the firmware, not from watchin
   the clean flag; the rest of the tree is the host firmware directory), then the `SceSysCore` launch.
 * Regressions: all suites, the SceSysCore -> ShellUI chain (10500 DCBs / 60 s) and the single-process splash
   run are unchanged.
+
+## Update 2026-11-18 (night, end 2): the real boot chain runs as concurrent processes
+
+`python -m psemu.run mini-syscore.elf --fw-root FW --backend whp --spawn-mode spawn --max-seconds 90`
+(`--max-modules 80` is implied by the manager) now boots like the console up to the shell launch:
+
+    mini-syscore -> SceSysAvControl (logo splash, runs on)
+                 -> SceSysCore -> orbis_audiod, GnmCompositor, SceShellCore, coredump
+                                  SceShellCore: "RESTART Shell UI" -> SceLncService launchApp(NPXS20001)
+
+What had to be added (all unit-light, verified by the log of the real firmware's own checks):
+* `/dev/da*` block devices (`devices.BlockDevice`): DIOCGSECTORSIZE/MEDIASIZE etc., seekable `pread`/`lseek`,
+  a UFS2 superblock marked clean at 64 KiB (sceFsUfsCheckCleanFlag); `stat` of the console's storage nodes.
+  With that every `nmount` of mini-syscore (/system, /system_ex, /system_data, /preinst ...) passes and it prints
+  `Entering normal mode...` / `BEGIN NORMAL BOOT`.
+* `wait4` (reap a zombie, block while children run, ECHILD otherwise; it spun before), per-process child
+  bookkeeping (`children`, `child_done`), a failed spawn `execve` ends the child (NOTE_EXIT + zombie).
+* A process yields after an 8 ms wall slice (`PROC_SLICE`, in `_whp_preempt`): a segment used to run until a
+  thread switch, so a spinning process starved the others.
+* A closed kqueue drops its registrations (fd reuse brought stale EVFILT_PROC knotes back: the parent saw a
+  child exec that had not happened); `rdup` restarts at fd 3 for every rfork child (the child checks 3, 4, 5...);
+  `/dev/notification*` reads block (EOF made SceSysCore's button thread spin).
+* Result in 45-90 s of wall time: 8-9 processes alive at once, splash frames rendering (logo fades in and holds),
+  audiod's "SceSysAudioSystemIpc" server, GnmCompositor, SceShellCore up to AppMgr; regressions unchanged
+  (ShellUI chain 10000 DCBs / 60 s).
+
+**What stops the ShellUI from starting this way (the next blocker): cross-process IPMI.** ShellCore's
+`launchApp(NPXS20001)` fails (`LNC_ISOK::0x8094000b`): it talks to `SceSysCoreApp` (hosted by SceSysCore, a
+different process now) over IPMI, but IPMI is still the per-process HLE stub (every invoke gets an empty
+success, `create server` in one process is invisible to a client in another). The routing needs the design in
+`psemu/ipmibus.py` (servers by name -> owning process, requests queued to the server's `receive`, the client
+parked until the reply, out buffers copied between address spaces: all host-side reads/writes through each
+process's own `uc`). Other leftovers seen: one process dies with a stack-guard style fault at
+`0x4300203a40f5` (a 48-bit pointer with the high bits set: a pointer that crossed address spaces), a
+`GnmCompositor` that only prints its banner, `sceKernelIccGetThermalAlert` (unmodelled ICC syscall, polled in a loop),
+`machdep.*`/`kern.*` sysctls (`idps`, `rcmgr_intdev`, `curr_manumode`, `backup_restore_mode`, `dmem.init_swap`).
