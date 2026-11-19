@@ -121,6 +121,11 @@ class IpmiKernel:
             self.handling[(id(emu), id(thread if thread is not None else emu.sched.current))] = self.sessions[sid]
         if ptype in (PKT_SYNC, PKT_INVOKE) and os.environ.get("PSEMU_IPMI_TRACE"):
             try:
+                cx = struct.unpack_from('<Q', data, 0)[0]
+                if cx:
+                    ob = struct.unpack('<4Q', bytes(uc.mem_read(cx, 32)))
+                    vt = struct.unpack('<8Q', bytes(uc.mem_read(ob[0], 64))) if ob[0] else ()
+                    self.log(f'  [ipmi-k] ctx {cx:#x}: {[hex(x) for x in ob]} vt {[hex(x) for x in vt]}')
                 def q(a, n=8): return [hex(x) for x in struct.unpack(f"<{n}Q", bytes(uc.mem_read(a, 8 * n)))]
                 o8 = struct.unpack("<Q", bytes(uc.mem_read(srv.obj + 8, 8)))[0]
                 self.log(f"  [ipmi-k] userobj {srv.obj:#x}: {q(srv.obj, 4)}; [obj+8]={o8:#x}; vt(obj)={q(struct.unpack('<Q', bytes(uc.mem_read(srv.obj, 8)))[0], 6)}")
@@ -208,27 +213,52 @@ class IpmiKernel:
         return False
 
     def create_session_handle(self, emu, uc, in_ptr, result_ptr):
-        """cmd 0x4 (kid -1) {u64 object; u64 ?}: a server's connect callback registers the per-session
-        object it just built; the kernel hands back a handle (written to *result, libSceIpmi keeps it in
-        object+8) and echoes the object pointer as the context of every later request on the session."""
+        """cmd 0x4 (kid -1) {u64 object; u64 slot}: a server's connect callback registers the per-session
+        object it just built and its slot record. The kernel returns a handle, written to *result (libSceIpmi
+        keeps it in object+8; the app also feeds it to get_authinfo as the client's pid, so the low 16 bits are
+        the pid and the rest tells one client's sessions apart). cmd 0x302 later gives the slot back, and the
+        object is the context of every request on the session."""
         sess = self.handling.get((id(emu), id(emu.sched.current)))
         if sess is None:
             return False
         obj, aux = struct.unpack("<QQ", bytes(uc.mem_read(in_ptr, 16)))
-        kid = self.next_skid
         self.next_skid += 1
-        sess.ctx = obj
-        sess.skid = kid
+        kid = (sess.client_emu.syscalls.pid_of_process() & 0xFFFF) | ((self.next_skid & 0x7FFF) << 16)
+        try:                                    # the second operand points at {u64 0x10; ...; u64 slot record @+8}
+            slot = struct.unpack('<Q', bytes(uc.mem_read(aux + 8, 8)))[0]
+        except Exception:
+            slot = 0
+        sess.ctx, sess.skid, sess.slot = obj, kid, slot
         self.skid_sess[kid] = sess
-        self.log(f"  [ipmi-k] session {sess.sid:#x}: server object {obj:#x} registered as handle {kid:#x}")
+        self.log(f"  [ipmi-k] session {sess.sid:#x}: object {obj:#x}, slot {slot:#x} registered as handle {kid:#x}")
         if result_ptr:
             uc.mem_write(result_ptr, struct.pack("<I", kid))
+        return True
+
+    def client_pid(self, emu, uc, kid, in_ptr):
+        """cmd 0x302 {u32 *out} on a session handle: the client's pid."""
+        sess = self.skid_sess.get(kid)
+        if sess is None:
+            return False
+        p = struct.unpack("<Q", bytes(uc.mem_read(in_ptr, 8)))[0]
+        if p:
+            uc.mem_write(p, struct.pack("<I", sess.client_emu.syscalls.pid_of_process()))
+        return True
+
+    def client_info(self, emu, uc, kid, in_ptr):
+        """cmd 0x468 {u64 *out} on a session handle: the slot record registered with cmd 4."""
+        sess = self.skid_sess.get(kid)
+        if sess is None:
+            return False
+        p = struct.unpack("<Q", bytes(uc.mem_read(in_ptr, 8)))[0]
+        if p:
+            uc.mem_write(p, struct.pack("<Q", sess.slot))
         return True
 
     @staticmethod
     def _finish(pend):
         """Complete a client's sync invoke: the method result and the transport status (the syscall's
-        result pointer) are both 0, then the thread resumes."""
+        result pointer) are written, then the thread resumes."""
         mem = pend["emu"].uc
         if pend["p_res"]:
             mem.mem_write(pend["p_res"], struct.pack("<I", pend.get("res", 0) & 0xFFFFFFFF))
@@ -236,25 +266,15 @@ class IpmiKernel:
             mem.mem_write(pend["rp"], struct.pack("<I", 0))
         pend["emu"].sched.wake(pend["thread"], 0, False)
 
-    def client_info(self, emu, uc, kid, in_ptr):
-        """cmd 0x302 {u64 *out} on a session handle: who is calling - the client's pid (u32)."""
-        sess = self.skid_sess.get(kid)
-        if sess is None or (id(emu), id(emu.sched.current)) not in self.inflight:
-            return False
-        p = struct.unpack("<Q", bytes(uc.mem_read(in_ptr, 8)))[0]
-        if p:
-            uc.mem_write(p, struct.pack("<I", sess.client_emu.syscalls.pid_of_process()))
-        return True
-
     def reply(self, emu, uc, kid, in_ptr, size, result_ptr):
         """cmd 0x232 on a session handle {u32 method result; u32 ?; u64 out descriptor; u32 count; ..}: the
         answer to the request this thread is serving. The descriptor lists {u64 ptr; u64 len} per output;
         each is copied into the client's output buffer (in the client's address space)."""
-        sess = self.skid_sess.get(kid)
-        if sess is None:
-            return False
         key = (id(emu), id(emu.sched.current))
         got = self.inflight.pop(key, None)
+        sess = got[0] if got else self.skid_sess.get(kid)
+        if sess is None:
+            return False
         token = got[1] if got and got[0] is sess else (next(iter(sess.pending), None))
         pend = sess.pending.pop(token, None)
         if pend is None:

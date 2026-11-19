@@ -990,3 +990,19 @@ More of the kernel side of IPMI, found by running the real firmware:
 State: ShellCore runs its whole start-up (about 240 threads, the SceXxx servers), calls SceSysCoreApp2
 `0xaa120016`, which SceSysCore does not answer yet (the next thing to chase), and SceAvSettingIpc methods
 come back `0x809a00ff` from AvControl.
+
+### 2026-11-19 (later still): AvSetting answers - cmd 0x468 and what the session handle is
+`SceAvSettingIpc` methods came back `0x809a00ff` from AvControl. Its gate (every method handler) asks the
+session object for its slot record: `object->vtable[4]` = `ipmimgr_call(0x468, handle, {u64 *out})`, then
+checks `slot[0] == object` and the per-client permission flags it computed at connect time from
+`get_authinfo(handle)`. So:
+* the **handle** cmd 4 returns is fed to `get_authinfo` as the client's pid: low 16 bits = the client's pid
+  (the upper bits keep one client's sessions apart); `get_authinfo(pid)` resolves it to that process and its
+  authority id (ShellCore `0x3800000000000010`, ...), which AvControl compares with its allow-list;
+* cmd 4's second operand points at `{u64 0x10; u64 slot record; ...}`; the kernel remembers the slot and
+  returns it for `0x468(handle)`. Cmd `0x302` is the client's pid (u32 out).
+* one pid space for the whole machine (`System.alloc_pid`, `getpid` = the rfork pid); before, every parent
+  numbered its children from 1001 and two processes shared a pid.
+Result: `SceAvSettingIpc` methods 0, 2, 0xd return 0. Still open: SceSysCoreApp2 `0xaa120016` (ShellCore main
+waits for it), VdecProxy (`/dev/uvd`).
+Disk note: a 200 s spawn run logs several GB; filter with grep instead of saving the whole log.

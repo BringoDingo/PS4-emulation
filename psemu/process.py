@@ -28,6 +28,11 @@ class System:
         from .ipmikernel import IpmiKernel
         self.ipmi = IpmiKernel(log=lambda m: print(m, flush=True))
 
+    def alloc_pid(self):
+        self._next_pid = getattr(self, '_next_pid', 1001)
+        self._next_pid += 1
+        return self._next_pid - 1
+
     def alloc_handle(self):
         h = self._next_handle
         self._next_handle += 1

@@ -42,6 +42,7 @@ class Sched:
 class Emu:
     def __init__(self, path):
         self.path, self.uc, self.sched = path, Mem(), Sched()
+        self.syscalls = type('S', (), {'pid_of_process': lambda self: 1006})()
 
 
 def main():
@@ -80,7 +81,7 @@ def main():
     k.handling[(id(srv_emu), id(srv_emu.sched.current))] = k.sessions[0x4000]
     srv_emu.uc.mem_write(0x1200, struct.pack("<QQ", 0x7777, 0))
     check("cmd 4 hands back a session handle", k.create_session_handle(srv_emu, srv_emu.uc, 0x1200, 0x1300)
-          and struct.unpack("<I", bytes(srv_emu.uc.mem_read(0x1300, 4)))[0] == 0x2000)
+          and struct.unpack("<I", bytes(srv_emu.uc.mem_read(0x1300, 4)))[0] & 0xFFFF == 1006)
     srv_emu.uc.mem_write(0x1400, struct.pack("<I", 0))
     k.server_call(srv_emu, srv_emu.uc, srv, 0x212, 0x4000, 0x1400, 4, 0x1500, 0)
     check("the connect answer releases the client, status 0 written to its pointers",
@@ -106,7 +107,7 @@ def main():
     cli_emu.sched.woken.clear()
     srv_emu.uc.mem_write(0x1600, struct.pack("<IIQII", 0, 0, 0, 1, 2))
     check("the reply completes the invoke: thread woken, method result and transport status written",
-          k.reply(srv_emu, srv_emu.uc, 0x2000, 0x1600, 0x18, 0x1700) and cli_emu.sched.woken == [1]
+          k.reply(srv_emu, srv_emu.uc, 0, 0x1600, 0x18, 0x1700) and cli_emu.sched.woken == [1]
           and bytes(cli_emu.uc.mem_read(0x800, 4)) == bytes(4) and bytes(cli_emu.uc.mem_read(0x850, 4)) == bytes(4))
     print("ipmi kernel:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

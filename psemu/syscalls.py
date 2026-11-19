@@ -473,8 +473,12 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             self.emu.log(f"  [rfork] flags={flags:#x}: no RFMEM - continuing as the child")
             uc.reg_write(UC_X86_REG_RDX, 1)
             return self._ret(uc, self.PID)
-        pid = self._next_pid
-        self._next_pid += 1
+        sysm = getattr(self.emu, 'system', None)
+        if sysm is not None:                           # one pid space for the whole machine
+            pid = sysm.alloc_pid()
+        else:
+            pid = self._next_pid
+            self._next_pid += 1
         rip = uc.reg_read(UC_X86_REG_RIP) + 2          # past the syscall instruction
         fl = uc.reg_read(UC_X86_REG_RFLAGS) & ~1
         t = sched.fork_current(rip, {UC_X86_REG_RAX: self.PID, UC_X86_REG_RDX: 1,
@@ -1032,7 +1036,12 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if cmd == 0x4 and (kid & 0xFFFFFFFF) == 0xFFFFFFFF and k.create_session_handle(emu, uc, in_ptr, result_ptr):
             self._ret(uc, 0)
             return True
-        if cmd == 0x302 and k.client_info(emu, uc, kid, in_ptr):
+        if cmd == 0x468 and k.client_info(emu, uc, kid, in_ptr):
+            if result_ptr:
+                uc.mem_write(result_ptr, struct.pack('<I', 0))
+            self._ret(uc, 0)
+            return True
+        if cmd == 0x302 and k.client_pid(emu, uc, kid, in_ptr):
             if result_ptr:
                 uc.mem_write(result_ptr, struct.pack('<I', 0))
             self._ret(uc, 0)
@@ -1274,7 +1283,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         return getattr(self.emu, 'child_pid', 0) or self.PID
 
     def sys_getpid(self, uc):
-        self._ret(uc, self.PID)
+        self._ret(uc, self.pid_of_process())
 
     def sys_getuid(self, uc):
         self._ret(uc, 0)
@@ -2149,12 +2158,15 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             return self._ret(uc, EINVAL, error=True)
         target = self.emu
         mgr = getattr(self.emu, 'manager', None)
-        if mgr is not None and (_pid & 0xFFFFFFFF) not in (0, self.pid_of_process()):
+        _pid &= 0xFFFF            # IPMI session handles carry the pid in their low 16 bits
+        if mgr is not None and _pid not in (0, self.pid_of_process()):
             for q in mgr.procs:
-                if getattr(q[0], 'child_pid', 0) == (_pid & 0xFFFFFFFF):
+                if getattr(q[0], 'child_pid', 0) == _pid:
                     target = q[0]
         name = os.path.splitext(os.path.basename(getattr(target, "path", "") or ""))[0].lower()
         paid = self.AUTHORITY_IDS.get(name, self.DEFAULT_AUTHORITY_ID)
+        if __import__('os').environ.get('PSEMU_IPMI_TRACE'):
+            self.emu.log(f'  [authinfo] pid {_pid & 0xFFFFFFFF} -> {name} paid {paid:#x}')
         caps = [0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0, 0]
         info = struct.pack("<Q4Q4Q", paid, *caps, 0, 0, 0, 0) + b"\x00" * 0x40
         try:
