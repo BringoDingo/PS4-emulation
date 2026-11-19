@@ -1,0 +1,298 @@
+"""The kernel side of IPMI between real processes (multi-process mode, see process.py).
+
+libSceIpmi in each process talks to the kernel with `ipmimgr_call(cmd, kid, &result, &args, size)`.
+Until now every client was answered by an HLE stub in syscalls.py because the service's process did not
+exist. With a real server process (e.g. SceSysCore hosting SceSysCoreApp) the kernel's job is to carry
+requests from the client's process to the server's receive pump and the answers back, copying buffers
+between the two address spaces.
+
+What is known (all from libSceIpmi.sprx; see docs/shellui-boot/README.md "IPMI between processes"):
+
+  server   cmd 0x0    create server {u64 server_obj; u64 *name; u64 params} -> kid (per process)
+           cmd 0x201  receive: args = {u64 data_buf; u64 size; u64 hdr_out; u64 *len_out}; blocks until a
+                      packet is queued; fills data_buf and the 0x28-byte header
+                         hdr +0x00 u64 data length   +0x08 u32 packet type   +0x0c u32 session id
+                         hdr +0x10 u64 server_obj (the pointer the server passed at create)
+           packet types: 0x01 a client connected (data = client info), 0x43 a sync method request, ...
+           sync request data: u64 context; u32 token; u32 method; u32 n_in; n_in x {u32 len; bytes}
+           cmd 0x444  dispatch finished: kid = session id, payload {u32 method}, 6th argument = the request token
+           cmd 0x222  {u32 result} with kid = session id: the answer to a connect
+           cmd 0x232  {u32 index; u32 flags; ptr data; u32 size}: reply data for a request
+  client   cmd 0x2    create client {u64; u64 *name; u64 params} -> kid
+           cmd 0x400  connect: the call blocks until the server accepted (cmd 0x222)
+           cmd 0x320  invoke a sync method {u32 method; u32 n_in; u32 n_out; in info; out info; *result; flags}
+                      and blocks until the server answered
+
+Everything the real server does that is not in this list is logged once per (cmd) so the protocol can be
+filled in from the running firmware, which is the only specification there is.
+"""
+import os
+import struct
+from collections import deque
+
+PKT_CONNECT = 0x01
+PKT_SYNC = 0x43
+PKT_INVOKE = 0x41
+
+HDR_SIZE = 0x28
+
+
+class Server:
+    def __init__(self, name, emu, kid, obj):
+        self.name, self.emu, self.kid, self.obj = name, emu, kid, obj
+        self.queue = deque()            # packets waiting for a receive
+        self.waiters = deque()          # blocked receive calls: dict(thread, emu, ptrs, result_ptr)
+
+
+class Session:
+    def __init__(self, sid, client_emu, client_kid, server):
+        self.sid, self.client_emu, self.client_kid, self.server = sid, client_emu, client_kid, server
+        self.state = "connecting"
+        self.waiting = None             # {thread, result_ptr, ...} of the client call blocked on this session
+        self.pending = {}               # token -> dict(method, out info, result ptr, thread)
+        self.next_token = 1
+
+
+class IpmiKernel:
+    # orbis_audiod's request handler waits for SceSysAudioSystemEvfTick, a tick the audio hardware
+    # model does not produce yet; routing it parks AvControl's main thread, so the HLE answers it.
+    NOT_ROUTED = frozenset({"SceSysAudioSystemIpc"})
+
+    def __init__(self, log=print, routed=None):
+        self.log = log
+        self.servers = {}               # name -> Server
+        self.sessions = {}              # sid -> Session
+        self.by_client = {}             # (emu id, client kid) -> Session
+        self.next_sid = 0x4000
+        self.routed = routed            # None = every hosted service; else a set of names
+        self.unknown = set()
+        self.handling = {}              # (id(emu), tid) -> Session whose connect packet that server thread is running
+        self.next_skid = 0x2000
+        self.skid_sess = {}             # session handle (cmd 0x4) -> Session
+
+    # ------------------------------------------------------------ helpers
+    def is_routed(self, name):
+        if name in self.NOT_ROUTED and not os.environ.get("PSEMU_IPMI_ROUTE_AUDIO"):
+            return False
+        return name in self.servers and (self.routed is None or name in self.routed)
+
+    def _once(self, key, msg):
+        if key not in self.unknown:
+            self.unknown.add(key)
+            self.log(msg)
+
+    # ------------------------------------------------------------ server side
+    def create_server(self, emu, name, kid, obj):
+        self.servers[name] = Server(name, emu, kid, obj)
+        self.log(f"  [ipmi-k] server '{name}' registered (process {emu.path.rsplit(chr(92), 1)[-1]}, "
+                 f"kid {kid:#x}, obj {obj:#x})")
+
+    def server_of(self, emu, kid):
+        for s in self.servers.values():
+            if s.emu is emu and s.kid == kid:
+                return s
+        return None
+
+    def receive(self, emu, uc, srv, in_ptr, result_ptr):
+        """cmd 0x201 on a server kid. Returns True when the call completed now, False when it blocked."""
+        if os.environ.get("PSEMU_IPMI_TRACE"):
+            self.log(f"  [ipmi-k] {srv.name}: receive called by {getattr(emu.sched.current, 'tid', 0):#x}, queued {len(srv.queue)}")
+        if srv.queue:
+            self._deliver(emu, uc, srv, in_ptr, result_ptr, srv.queue.popleft())
+            return True
+        sched = emu.sched
+        th = sched.current
+        self._once(("rx", srv.name, id(th)), f"  [ipmi-k] {srv.name}: receive parked (thread {getattr(th, 'tid', th)})")
+        srv.waiters.append({"thread": th, "emu": emu, "in_ptr": in_ptr, "result_ptr": result_ptr})
+        sched.block({"kind": "ipmi_receive", "kid": srv.kid, "name": srv.name})
+        return False
+
+    def _deliver(self, emu, uc, srv, in_ptr, result_ptr, pkt, thread=None):
+        ptype, sid, data = pkt
+        buf, size, hdr, p_len = struct.unpack("<QQQQ", bytes(uc.mem_read(in_ptr, 0x20)))
+        data = data[:size] if size else data
+        if buf and data:
+            uc.mem_write(buf, data)
+        if ptype == PKT_CONNECT and sid in self.sessions:
+            self.sessions[sid].conn_buf = buf
+            self.handling[(id(emu), id(thread if thread is not None else emu.sched.current))] = self.sessions[sid]
+        if ptype in (PKT_SYNC, PKT_INVOKE) and os.environ.get("PSEMU_IPMI_TRACE"):
+            try:
+                def q(a, n=8): return [hex(x) for x in struct.unpack(f"<{n}Q", bytes(uc.mem_read(a, 8 * n)))]
+                o8 = struct.unpack("<Q", bytes(uc.mem_read(srv.obj + 8, 8)))[0]
+                self.log(f"  [ipmi-k] userobj {srv.obj:#x}: {q(srv.obj, 4)}; [obj+8]={o8:#x}; vt(obj)={q(struct.unpack('<Q', bytes(uc.mem_read(srv.obj, 8)))[0], 6)}")
+                try:
+                    self.log(f"  [ipmi-k] vt([obj+8])={q(struct.unpack('<Q', bytes(uc.mem_read(o8, 8)))[0], 6)}")
+                except Exception as e2:
+                    self.log(f"  [ipmi-k] [obj+8] not an object: {e2}")
+            except Exception as e:
+                self.log(f"  [ipmi-k] deliver trace failed {e}")
+        h = bytearray(HDR_SIZE)
+        struct.pack_into("<QIIQ", h, 0, len(data), ptype, sid, srv.obj)
+        if hdr:
+            uc.mem_write(hdr, bytes(h))
+        if p_len:
+            uc.mem_write(p_len, struct.pack("<I", len(data)))
+        if result_ptr:
+            uc.mem_write(result_ptr, struct.pack("<I", 0))
+
+    def _enqueue(self, srv, ptype, sid, data):
+        pkt = (ptype, sid, data)
+        if srv.waiters:
+            w = srv.waiters.popleft()
+            self._deliver(w["emu"], w["emu"].uc, srv, w["in_ptr"], w["result_ptr"], pkt, w["thread"])
+            w["emu"].sched.wake(w["thread"], 0, False)
+        else:
+            srv.queue.append(pkt)
+
+    # ------------------------------------------------------------ client side
+    def connect(self, emu, uc, kid, name, result_ptr, in_ptr=0):
+        """cmd 0x400: create a session and tell the server; the client blocks until it answers.
+        Client struct: {u64 connect data; u64 its length; u64 *status out; u64 ?}."""
+        srv = self.servers[name]
+        sid = self.next_sid
+        self.next_sid += 1
+        sess = Session(sid, emu, kid, srv)
+        self.sessions[sid] = sess
+        self.by_client[(id(emu), kid)] = sess
+        p_data = p_len = p_status = 0
+        cdata = b""
+        try:
+            p_data, p_len, p_status, _x = struct.unpack("<QQQQ", bytes(uc.mem_read(in_ptr, 0x20)))
+            if p_data and 0 < p_len <= 0x400:
+                cdata = bytes(uc.mem_read(p_data, p_len))
+        except Exception:
+            pass
+        sess.status_ptr = p_status
+        self.log(f"  [ipmi-k]   client connect struct: {[hex(x) for x in struct.unpack('<4Q', bytes(uc.mem_read(in_ptr, 0x20)))]}")
+        # server-side packet data: ..., u64 @0x148 (0 on arrival), u32 @0x150 connect data length, bytes @0x154
+        info = bytearray(0x154) + cdata
+        struct.pack_into("<I", info, 0x150, len(cdata))
+        th = emu.sched.current
+        sess.waiting = {"thread": th, "emu": emu, "result_ptr": result_ptr, "what": "connect"}
+        self._enqueue(srv, PKT_CONNECT, sid, bytes(info))
+        self.log(f"  [ipmi-k] connect '{name}' (client kid {kid:#x}) -> session {sid:#x}, connect data {cdata.hex()}")
+        emu.sched.block({"kind": "ipmi_connect", "name": name, "sid": sid})
+
+    def invoke_sync(self, emu, uc, kid, name, in_ptr, result_ptr=0):
+        """cmd 0x320. Returns False when the caller was parked (the reply completes it)."""
+        sess = self.by_client.get((id(emu), kid))
+        if sess is None or sess.state != "connected":
+            return None                                 # not routed: let the HLE answer
+        a = bytes(uc.mem_read(in_ptr, 0x30))
+        method, n_in, n_out = struct.unpack_from("<III", a, 0)
+        p_in, p_out, p_res = struct.unpack_from("<QQQ", a, 0x10)
+        ins = []
+        for i in range(min(n_in, 10)):
+            d, sz = struct.unpack("<QQ", bytes(uc.mem_read(p_in + i * 16, 16)))
+            ins.append(bytes(uc.mem_read(d, sz)) if sz else b"")
+        token = sess.next_token
+        sess.next_token += 1
+        outs = []
+        for i in range(min(n_out, 16)):
+            info = p_out + i * 24
+            d, sz = struct.unpack("<QQ", bytes(uc.mem_read(info, 16)))
+            outs.append((d, sz, info))
+        # packet type 0x41 (what a client sync invoke becomes on the server): u64 context, u32 token,
+        # u32 method, u32 n_in, u32 n_out, then the inputs as {u32 len; bytes}, then each output's capacity
+        body = struct.pack("<QIIII", getattr(sess, "ctx", 0), token, method, len(ins), len(outs)) + b"".join(
+            struct.pack("<I", len(x)) + x for x in ins) + b"".join(struct.pack("<I", o[1]) for o in outs)
+        th = emu.sched.current
+        sess.pending[token] = {"thread": th, "emu": emu, "method": method, "outs": outs, "p_res": p_res, "rp": result_ptr}
+        self._enqueue(sess.server, PKT_INVOKE, sess.sid, body)
+        self.log(f"  [ipmi-k] sync {name}.{method:#x} in={[len(x) for x in ins]} out={[o[1] for o in outs]} flags {a[0x28:0x30].hex()} token {token}")
+        emu.sched.block({"kind": "ipmi_invoke", "name": name, "method": method})
+        return False
+
+    def create_session_handle(self, emu, uc, in_ptr, result_ptr):
+        """cmd 0x4 (kid -1) {u64 object; u64 ?}: a server's connect callback registers the per-session
+        object it just built; the kernel hands back a handle (written to *result, libSceIpmi keeps it in
+        object+8) and echoes the object pointer as the context of every later request on the session."""
+        sess = self.handling.get((id(emu), id(emu.sched.current)))
+        if sess is None:
+            return False
+        obj, aux = struct.unpack("<QQ", bytes(uc.mem_read(in_ptr, 16)))
+        kid = self.next_skid
+        self.next_skid += 1
+        sess.ctx = obj
+        sess.skid = kid
+        self.skid_sess[kid] = sess
+        self.log(f"  [ipmi-k] session {sess.sid:#x}: server object {obj:#x} registered as handle {kid:#x}")
+        if result_ptr:
+            uc.mem_write(result_ptr, struct.pack("<I", kid))
+        return True
+
+    @staticmethod
+    def _finish(pend):
+        """Complete a client's sync invoke: the method result and the transport status (the syscall's
+        result pointer) are both 0, then the thread resumes."""
+        mem = pend["emu"].uc
+        if pend["p_res"]:
+            mem.mem_write(pend["p_res"], struct.pack("<I", 0))
+        if pend.get("rp"):
+            mem.mem_write(pend["rp"], struct.pack("<I", 0))
+        pend["emu"].sched.wake(pend["thread"], 0, False)
+
+    def reply(self, emu, uc, kid, in_ptr, size, result_ptr):
+        """cmd 0x232 on a session handle {u32; u32; u64 reply descriptor; u32 1; u32 2}: the server's
+        answer to the request it is handling. The reply's contents are not decoded yet (logged)."""
+        sess = self.skid_sess.get(kid)
+        if sess is None or not sess.pending:
+            return False
+        token = next(iter(sess.pending))
+        pend = sess.pending.pop(token)
+        try:
+            raw = bytes(uc.mem_read(in_ptr, 0x18))
+            p = struct.unpack_from("<Q", raw, 8)[0]
+            self.log(f"  [ipmi-k] reply to {sess.server.name}.{pend['method']:#x}: {raw.hex()} -> {bytes(uc.mem_read(p, 0x30)).hex() if p else ''}")
+        except Exception as e:
+            self.log(f"  [ipmi-k] reply (unreadable: {e})")
+        self._finish(pend)
+        if result_ptr:
+            uc.mem_write(result_ptr, struct.pack("<I", 0))
+        return True
+
+    # ------------------------------------------------------------ server replies
+    def server_call(self, emu, uc, srv, cmd, kid, in_ptr, size, result_ptr, arg6):
+        """A server-side command other than create/receive. Returns True if handled."""
+        self._once(("sc", srv.name, cmd), f"  [ipmi-k] {srv.name} server cmd {cmd:#x} kid {kid:#x} size {size:#x}: "
+                   + (bytes(uc.mem_read(in_ptr, min(size, 0x40))).hex() if in_ptr and size else ""))
+        if cmd in (0x222, 0x212):                                # connect answer; kid = session id
+            sess = self.sessions.get(kid)
+            res = struct.unpack("<I", bytes(uc.mem_read(in_ptr, 4)))[0] if in_ptr else 0
+            if sess is None:
+                return False
+            self.log(f"  [ipmi-k] connect answer for session {kid:#x}: {res:#x}")
+            cb = getattr(sess, 'conn_buf', 0)
+            if cb:
+                self.log(f"  [ipmi-k]   connect buffer after the callback: {bytes(uc.mem_read(cb + 0x140, 0x30)).hex()}")
+            sess.state = "connected" if res == 0 else "refused"
+            self.handling.pop((id(emu), id(emu.sched.current)), None)
+            w, sess.waiting = sess.waiting, None
+            if w is not None:
+                if w["result_ptr"]:
+                    w["emu"].uc.mem_write(w["result_ptr"], struct.pack("<I", 0 if res == 0 else 1))
+                if getattr(sess, 'status_ptr', 0):
+                    w["emu"].uc.mem_write(sess.status_ptr, struct.pack("<I", res))
+                w["emu"].sched.wake(w["thread"], 0, False)
+            if result_ptr:
+                uc.mem_write(result_ptr, struct.pack("<I", 0))
+            return True
+        if cmd in (0x469, 0x46a, 0x46b):                  # {char *buf}: the service name, used in log lines
+            p = struct.unpack("<Q", bytes(uc.mem_read(in_ptr, 8)))[0]
+            if p:
+                uc.mem_write(p, srv.name.encode()[:0x3f] + bytes(1))
+            if result_ptr:
+                uc.mem_write(result_ptr, struct.pack("<I", 0))
+            return True
+        if cmd == 0x444:                                  # async dispatch finished: {u32 token}, kid = session id
+            sess = self.sessions.get(kid)
+            token = arg6 & 0xFFFFFFFF            # the request serial rides in the 6th argument; the payload is the method
+            pend = sess.pending.pop(token, None) if sess else None
+            if pend is not None:
+                self._finish(pend)
+                self.log(f"  [ipmi-k] sync {srv.name}.{pend['method']:#x} done (token {token})")
+            if result_ptr:
+                uc.mem_write(result_ptr, struct.pack("<I", 0))
+            return True
+        return False

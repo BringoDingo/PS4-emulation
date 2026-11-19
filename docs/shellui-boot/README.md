@@ -925,3 +925,50 @@ process's own `uc`). Other leftovers seen: one process dies with a stack-guard s
 `0x4300203a40f5` (a 48-bit pointer with the high bits set: a pointer that crossed address spaces), a
 `GnmCompositor` that only prints its banner, `sceKernelIccGetThermalAlert` (unmodelled ICC syscall, polled in a loop),
 `machdep.*`/`kern.*` sysctls (`idps`, `rcmgr_intdev`, `curr_manumode`, `backup_restore_mode`, `dmem.init_swap`).
+
+## Update 2026-11-19: cross-process IPMI routing (`psemu/ipmikernel.py`)
+
+`System.ipmi` (an `IpmiKernel`) now carries IPMI between real processes: a server created in one process
+(`ipmimgr_call` cmd 0 registers it by name) is reached by a client in another (connect cmd 0x400, sync invoke
+0x320), buffers are copied through each side's own `uc`, and the client parks until the server answers. Servers
+that no process hosts (and `SceSysAudioSystemIpc`, see below) still go through the old per-process HLE.
+`python -m psemu.tools_ipmitest` covers the protocol with fake processes; the real firmware verifies the rest.
+
+What the firmware itself showed about the kernel interface (read from libSceIpmi/SceSysCore, then confirmed
+by running): 
+* **Create server** `{u64 libIpmi server object; u64 name; u64 *param}`; the 0x38-byte param struct holds the
+  server's *user object* at +0x30, and **that** (not the first qword) is what the kernel echoes in every packet
+  header (`hdr+0x10`): libIpmi calls `userobj->vtable[...]` with it. Echoing the libIpmi object instead made the
+  receive thread call its own destructor and exit after the first connect.
+* **Receive** (0x201) `{data buf, size, hdr out (0x28), *len}` blocks until a packet is queued. Header:
+  `+0 len, +8 type, +0xc session id, +0x10 user object`. Types: 1 connect (data: `+0x148` u64 = 0 on arrival,
+  `+0x150` connect-data length, `+0x154` bytes), `0x41` a client sync invoke, `0x43` the *other* kind of
+  method call (it reaches `synchMethodDispatch`, which SceSysCoreApp/2 leave as a stub returning
+  `0x800205c1`). Invoke data: `u64 ctx, u32 token, u32 method, u32 n_in, u32 n_out`, inputs as `{u32 len;
+  bytes}`, then each output's capacity.
+* **Connect**: the server answers with cmd `0x212` (kid = session id, `{u32 result}`); the client's connect
+  struct is `{data, len, *status, ...}` and *status gets the answer (the syscall result stays 0).
+* **Session object**: while handling a connect the server builds a per-session object and registers it with
+  cmd `0x4` (kid -1, `{u64 object, ...}`); the kernel returns a handle (libIpmi keeps it in `object+8`) and
+  puts that object pointer into `ctx` of every later request on the session. Replies are cmd `0x232` on the
+  handle; `0x444` ends an async dispatch (6th argument = the token). Cmd `0x46a` writes the service name.
+* The client's invoke needs the transport status written through its syscall result pointer as well as the
+  method result: an unwritten `0xffffffff` there was `sceApplicationInitializeForShellCore: 0xffffffff`.
+
+Other findings on the way (all fixed):
+* The executable's static TLS offset was rounded up to 16 although the linker had baked the `p_align` (8)
+  offset into its code (`%fs:-0x78`), so the block sat 8 bytes off; and new threads' executable block was
+  never initialised (the guest allocates it from its heap), so SceSysCore's lock-order checker (TLS)
+  asserted. `thr_new` now writes the executable's .tdata/.tbss for the new thread.
+* System processes need `libkernel_sys.sprx` instead of `libkernel` (SceSysCore's `sceKernelIcc*`, the
+  process monitor ... come from it; they were stubs returning 0, and one of them was polled in a hot loop).
+  `--spawn-mode spawn` links it (`PSEMU_LIBKERNEL_SYS=0` keeps `libkernel`).
+* `SceSysAudioSystemIpc` stays on the HLE: orbis_audiod's request handler waits for the audio tick event
+  (`SceSysAudioSystemEvfTick`), which the audio model does not produce, and AvControl's main thread blocks
+  on that call. `PSEMU_IPMI_ROUTE_AUDIO=1` routes it anyway.
+
+State after this: SceShellCore connects to SceSysCoreApp/SceSysCoreApp2, the invoke is answered by the real
+SceSysCore handler, `sceApplicationInitializeForShellCore` succeeds, AppMgr starts and ShellCore goes on
+(SceUserService, regmgr keys). The ShellUI launch (NPXS20001 as a spawned process) is the next step.
+Debugging aids: `PSEMU_IPMI_TRACE=1|2` (kernel-side log; 2 = every ipmimgr call), `PSEMU_TRACE_TID`/`PSEMU_TRACE_PROC`
+(log every syscall of one thread).

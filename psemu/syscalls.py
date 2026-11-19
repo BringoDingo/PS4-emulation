@@ -195,6 +195,9 @@ def _load_syscall_names():
 _load_syscall_names()
 
 
+_TRACE_TID = int(__import__('os').environ.get('PSEMU_TRACE_TID', '0'), 0)
+_TRACE_PROC = __import__('os').environ.get('PSEMU_TRACE_PROC', '')
+
 class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     def __init__(self, emu):
         self.emu = emu            # back-reference for memory + stdout + stop
@@ -327,6 +330,9 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         if num not in WAIT_SYSCALLS:  # real progress (not another wait) resets idle detection
             self._idle_waits = 0
         handler = getattr(self, f"sys_{name}", None)
+        if _TRACE_TID and _TRACE_PROC in self.emu.path and self.emu.sched is not None and self.emu.sched.current is not None and self.emu.sched.current.tid == _TRACE_TID:
+            a = self._args(uc)
+            self.emu.log(f'  [tt {num} {name}] ' + ' '.join(f'{x:#x}' for x in a[:6]))
 
         if handler is None:
             handler = getattr(self, "sys_" + SYSCALLS.get(num, ""), None)
@@ -424,6 +430,19 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         sched = self.emu.sched
         dyn = getattr(self.emu, "dyn", None)
         lm = dyn.module_at(start) if dyn else None
+        if dyn is not None:
+            # The new thread's static TLS block of the main executable (module 1, the one closest to
+            # %fs, whose offset the linker fixed in its code): .tdata image, zeroed .tbss. The guest
+            # allocates the block from its heap and only fills in libkernel's own, so without this
+            # the executable sees whatever the heap held (SceSysCore's lock-order checker lives in
+            # .tbss and aborts on it).
+            for m in dyn.modules:
+                if m.tls_index == 1 and m.tls_offset and m.tls_offset <= tls_base:
+                    img = m.mod.elf.data[m.tls.offset:m.tls.offset + m.tls.filesz]
+                    try:
+                        uc.mem_write(tls_base - m.tls_offset, img + bytes(max(m.tls.memsz - len(img), 0)))
+                    except Exception:
+                        pass
         t = sched.spawn(start, arg, stack_base + stack_size, tls_base,
                         name=f"{lm.name}+{start - lm.base:#x}" if lm else "")
         for p in (ctid, ptid):
@@ -433,7 +452,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 except Exception:
                     pass
         self.emu.log(f"  [thr_new] thread {t.tid:#x} at {start:#x} ({t.name}) "
-                     f"stack {stack_base:#x}+{stack_size:#x} tls {tls_base:#x}")
+                     f"stack {stack_base:#x}+{stack_size:#x} tls {tls_base:#x} size {_tls_size:#x}")
         self._ret(uc, 0)
 
     def sys_rfork(self, uc):
@@ -981,6 +1000,70 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             cache[key] = bool(name) and self._has_cstring(img[1], name.encode())
         return cache[key]
 
+    def _ipmi_route(self, uc, cmd, kid, result_ptr, in_ptr, size):
+        """Cross-process IPMI (ipmikernel.py). Returns True when the call was handled (or parked)."""
+        import struct
+        system = getattr(self.emu, "system", None)
+        k = getattr(system, "ipmi", None) if system is not None else None
+        if k is None:
+            return False
+        emu = self.emu
+        if __import__('os').environ.get('PSEMU_IPMI_TRACE') == '2' and cmd not in (0x10,):
+            try:
+                hx = bytes(uc.mem_read(in_ptr, min(size, 0x30))).hex() if in_ptr and size else ''
+            except Exception:
+                hx = '?'
+            k.log(f'  [ipmi-t] {emu.path.rsplit(chr(92), 1)[-1]} tid {emu.sched.current.tid:#x} cmd {cmd:#x} kid {kid:#x} size {size:#x} {hx}')
+        if cmd == 0x10 and in_ptr:
+            k._once(("c10", id(emu), kid), f"  [ipmi-k] {emu.path.rsplit(chr(92), 1)[-1]} cmd 0x10 kid {kid:#x}: " + bytes(uc.mem_read(in_ptr, 0x40)).hex())
+        if cmd == 0x202 and __import__("os").environ.get("PSEMU_IPMI_TRACE"):
+            import struct as _s
+            rsp = uc.reg_read(__import__('unicorn.x86_const', fromlist=['x']).UC_X86_REG_RSP)
+            q = _s.unpack('<24Q', bytes(uc.mem_read(rsp, 192)))
+            lm = lambda a: (lambda m: f'{m.name}+{a-m.base:#x}' if m else '')(emu.dyn.module_at(a) if emu.dyn else None)
+            from unicorn.x86_const import UC_X86_REG_RBP as _RBP
+            bp = uc.reg_read(_RBP); chain = []
+            for _ in range(10):
+                try: nb, ra = _s.unpack('<QQ', bytes(uc.mem_read(bp, 16)))
+                except Exception: break
+                chain.append(lm(ra) or hex(ra)); bp = nb
+            k.log('  [ipmi-k] 0x202 rbp chain: ' + ' <- '.join(chain))
+            k.log(f'  [ipmi-k] 0x202 by thread {emu.sched.current.tid:#x} kid {kid:#x} stack: ' + ' '.join(x for x in (lm(a) for a in q) if x))
+        if cmd == 0x4 and (kid & 0xFFFFFFFF) == 0xFFFFFFFF and k.create_session_handle(emu, uc, in_ptr, result_ptr):
+            self._ret(uc, 0)
+            return True
+        if cmd == 0x232 and k.reply(emu, uc, kid, in_ptr, size, result_ptr):
+            self._ret(uc, 0)
+            return True
+        # server side: a kid that belongs to a registered server in this process
+        srv = k.server_of(emu, kid)
+        if srv is not None and cmd != self.IPMI_CREATE_SERVER:
+            if cmd == self.IPMI_RECEIVE:
+                if k.receive(emu, uc, srv, in_ptr, result_ptr):
+                    self._ret(uc, 0)
+                return True
+            if k.server_call(emu, uc, srv, cmd, kid, in_ptr, size, result_ptr, self._args(uc)[5]):
+                self._ret(uc, 0)
+                return True
+        # server answers carry the session id as kid
+        if cmd in (0x222, 0x212, 0x444, 0x232) and kid in k.sessions and k.sessions[kid].server.emu is emu:
+            k.server_call(emu, uc, k.sessions[kid].server, cmd, kid, in_ptr, size, result_ptr, self._args(uc)[5])
+            self._ret(uc, 0)
+            return True
+        name = getattr(self, "_ipmi_names", {}).get(kid)
+        if cmd == self.IPMI_CONNECT and name and k.is_routed(name) and k.servers[name].emu is not emu:
+            k.connect(emu, uc, kid, name, result_ptr, in_ptr)
+            return True
+        if cmd == self.IPMI_INVOKE_SYNC and name:
+            r = k.invoke_sync(emu, uc, kid, name, in_ptr, result_ptr)
+            if r is False:
+                return True
+        if srv is not None:
+            k._once(("srvcmd", srv.name, cmd),
+                    f"  [ipmi-k] server '{srv.name}' cmd {cmd:#x} kid {kid:#x} size {size:#x}: "
+                    + bytes(uc.mem_read(in_ptr, min(size, 0x40)) if in_ptr and size else b"").hex())
+        return False
+
     def sys_ipmimgr_call(self, uc):
         # IPMI (Sony IPC): SceShellCore creates a client per system service and
         # then invokes methods on it. The services are separate processes we do
@@ -990,6 +1073,8 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         cmd, kid, result_ptr, in_ptr, size = self._args(uc)[:5]
         if not hasattr(self, "_ipmi_names"):
             self._ipmi_names = {}
+        if self._ipmi_route(uc, cmd, kid, result_ptr, in_ptr, size):
+            return
         counts = self.__dict__.setdefault("_ipmi_counts", {})
         ckey = (cmd, self._ipmi_names.get(kid, "") if cmd != self.IPMI_CREATE_CLIENT else "")
         counts[ckey] = counts.get(ckey, 0) + 1
@@ -1015,6 +1100,35 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             self._ipmi_names[h] = name
             self._ipmi_servers = getattr(self, "_ipmi_servers", {})
             self._ipmi_servers[name] = h
+            k = getattr(getattr(self.emu, "system", None), "ipmi", None)
+            if k is not None:
+                try:
+                    obj = struct.unpack("<Q", bytes(uc.mem_read(in_ptr, 8)))[0]
+                except Exception:
+                    obj = 0
+                if __import__('os').environ.get('PSEMU_IPMI_TRACE'):
+                    q = struct.unpack('<6Q', bytes(uc.mem_read(in_ptr, 48)))
+                    def vt(a):
+                        try:
+                            v = struct.unpack('<Q', bytes(uc.mem_read(a, 8)))[0]
+                            return [hex(x) for x in struct.unpack('<8Q', bytes(uc.mem_read(v, 64)))]
+                        except Exception:
+                            return None
+                    try:
+                        cfg = struct.unpack('<12Q', bytes(uc.mem_read(q[2], 96)))
+                        k.log('  [ipmi-k] cfg ' + ' '.join(hex(x) for x in cfg))
+                        for x in cfg:
+                            v = vt(x) if 0x10000 < x < 0x7fffffffffff else None
+                            if v: k.log(f'  [ipmi-k]   cfg ptr {x:#x} vt {v}')
+                    except Exception as e:
+                        k.log(f'  [ipmi-k] cfg read failed {e}')
+                    k.log(f'  [ipmi-k] create-server struct {[hex(x) for x in q]} size {size:#x}; [q0] vt {vt(q[0])}; [q2] vt {vt(q[2])}')
+                try:
+                    cfgp = struct.unpack('<Q', bytes(uc.mem_read(in_ptr + 0x10, 8)))[0]
+                    obj = struct.unpack('<Q', bytes(uc.mem_read(cfgp + 0x30, 8)))[0] or obj
+                except Exception:
+                    pass
+                k.create_server(self.emu, name, h, obj)
             if result_ptr:
                 try:
                     uc.mem_write(result_ptr, struct.pack("<i", h))

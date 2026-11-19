@@ -206,7 +206,7 @@ class DynamicProcess:
                 continue
             idx += 1
             lm.tls_index = idx
-            align = max(lm.tls.align or 1, 16)
+            align = lm.tls.align or 1     # the linker computed the executable's fixed %fs offsets from p_align
             off = _up(off + lm.tls.memsz, align)
             lm.tls_offset = off
         self.tls_static_size = _up(off, 64)
@@ -419,7 +419,20 @@ class DynamicProcess:
                 self.emu.hle.register(a, handler, name="import:" + name)
             else:
                 def unresolved_import(emu, uc, nid=nid):
-                    emu.log(f"  [import] unresolved NID {nid} called -> returning 0")
+                    import struct as _s
+                    try:
+                        from unicorn.x86_const import UC_X86_REG_RSP as _RSP
+                        ra = _s.unpack("<Q", bytes(uc.mem_read(uc.reg_read(_RSP), 8)))[0]
+                        tid = emu.sched.current.tid if emu.sched and emu.sched.current else 0
+                    except Exception:
+                        ra, tid = 0, 0
+                    seen = emu.__dict__.setdefault("_unres_seen", {})
+                    k = (nid, tid, ra)
+                    seen[k] = seen.get(k, 0) + 1
+                    if seen[k] <= 1:
+                        lm = emu.dyn.module_at(ra) if emu.dyn else None
+                        where = f"{lm.name}+{ra - lm.base:#x}" if lm else hex(ra)
+                        emu.log(f"  [import] unresolved NID {nid} called by thread {tid:#x} from {where} -> returning 0")
                     return 0
                 self.emu.hle.register(a, unresolved_import, name="import:" + nid)
         return a

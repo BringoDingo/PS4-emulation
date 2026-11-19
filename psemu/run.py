@@ -52,6 +52,11 @@ def main():
     args = ap.parse_args()
 
     start = int(args.start, 0) if args.start else None
+    if args.spawn_mode == 'spawn':
+        # system processes link libkernel_sys (SceSysCore imports its sceKernelIcc*/process-monitor
+        # functions from it); PSEMU_LIBKERNEL_SYS=0 keeps the plain libkernel
+        import os
+        os.environ.setdefault('PSEMU_LIBKERNEL_SYS', '1')
     emu = Emulator(args.file, trace=args.trace, max_insns=args.max,
                    fw_root=args.fw_root, backend=args.backend)
     emu.max_seconds = args.max_seconds

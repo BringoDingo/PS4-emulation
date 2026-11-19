@@ -24,6 +24,8 @@ class System:
         self._next_handle = 0x100
         self.evfs = {}            # name -> sys_sync.EventFlag
         self.sems = {}            # name -> sys_sync.Semaphore
+        from .ipmikernel import IpmiKernel
+        self.ipmi = IpmiKernel(log=lambda m: print(m, flush=True))
 
     def alloc_handle(self):
         h = self._next_handle
@@ -84,7 +86,10 @@ class ProcessManager:
                 if p[1] != IDLE:
                     progressed = True
             else:
+                _t = time.perf_counter()
                 p[1] = p[0]._run_segment(p[1])
+                p[0]._seg_wall = getattr(p[0], '_seg_wall', 0.0) + time.perf_counter() - _t
+                p[0]._seg_n = getattr(p[0], '_seg_n', 0) + 1
                 if p[1] != IDLE:
                     progressed = True
             if p[1] is not None:
@@ -120,6 +125,8 @@ class ProcessManager:
         per-process stop reasons."""
         while self.step_all():
             pass
+        for emu, _ in self.procs:
+            print(f"  [sched] {emu.path.rsplit(chr(92),1)[-1]}: {getattr(emu,'_seg_wall',0):.1f} s in {getattr(emu,'_seg_n',0)} segments", flush=True)
         for emu, _ in self.procs:
             emu.end_run()
         return [emu._stop_reason for emu, _ in self.procs]

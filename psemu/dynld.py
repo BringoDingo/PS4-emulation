@@ -158,6 +158,9 @@ class DynamicLinker:
         return idx
 
     def _resolve_lib_file(self, need):
+        if os.environ.get('PSEMU_LIBKERNEL_SYS', '0') != '0' and need in ('libkernel.prx', 'libkernel.sprx') \
+                and 'libkernel_sys.sprx' in self._index:
+            return self._index['libkernel_sys.sprx']
         for cand in (need, need.replace(".prx", ".sprx"),
                      need.replace(".sprx", ".prx")):
             if cand in self._index:
