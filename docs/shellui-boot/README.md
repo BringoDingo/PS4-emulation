@@ -17,12 +17,16 @@ problems that later sections solved: do not read an intermediate section as the 
   (`PSEMU_PAD=none|auto`) the UI keeps rendering (9000 DCBs / 60 s through the SceSysCore -> ShellUI chain,
   exit 0). Audio start-up now completes, libScePsm registers its Bgm library, `/dev/ajm` is on by default.
   `PSEMU_PAD` itself still defaults to off.
-* **Open, in order:** (1) the audio mixer thread decodes in a tight loop (`libSceAudiodec` -> AJM batch
-  start/wait, ~2500 ioctls/s) because the AJM model reports "done, nothing decoded" and nothing paces it; real
-  AJM job results / pacing are not modelled, and nothing is played; (2) compositor frame spikes of 400-600 ms
-  (shader translation misses, texture uploads) cause the `LOST PAD DATA` lines; (3) the username shows
-  "Unknown" (ProfileCache `_GetLocalUserInfoNative`); (4) app launch via SceLncService / separate app
-  processes; remaining stub IPC services.
+* **Pad input reaches the UI, the UI does not react yet.** `/dev/hid` now models the read libScePad
+  really uses (`0x8030482e`, 0xa8-byte records; the old `0x80204829` was a different path), and a timed
+  button script (`PSEMU_PAD=script PSEMU_PAD_BUTTONS="14+0.5=RIGHT"`) drives it. Verified down to the
+  managed `GamePad.GetData` result (Right = 4, ButtonsDown on the edge), but focus does not move on
+  RIGHT/UP/DOWN/CROSS - see "pad input: how far it gets" below.
+* **Open, in order:** (1) find why the shell ignores pad edges that GetData delivers (modal/focus/login
+  state, or a second input path); (2) compositor frame spikes of 400-600 ms (shader translation misses,
+  texture uploads) cause the `LOST PAD DATA` lines and doubled text/icons in captured frames; (3) the
+  username shows "Unknown" (ProfileCache `_GetLocalUserInfoNative`); (4) app launch via SceLncService /
+  separate app processes; remaining stub IPC services; no AJM decoding / no audio output.
 * **Constraints:** only GPL-2.0-or-later code may be reused; no firmware is committed.
 
 
@@ -723,3 +727,32 @@ ShellUI chain with a pad: 9000 DCBs, exit 0. Unit tests: `python -m psemu.tools_
 Cost: with sound alive the decode loop runs flat out (~2500 AJM batch ioctls/s) - about 17% fewer frames than
 the audio-less boot. Pacing/results for AJM jobs are the next audio item; the audio *server* (mixing,
 `SceSysAudioSystemIpc` replies) is still "empty success" and not needed for start-up.
+
+## Update 2026-11-18 (late night): AJM pacing, the real pad read, how far input gets
+
+* **AJM decode spin fixed.** After audio start-up worked, thread 0x10097 (libScePsm mixer ->
+  `libSceAudiodec+0x1600` decode helper) ran Batch start/wait (`/dev/ajm` 0xc0288907 / 0xc0288908, ~2500 per
+  s) with no sleep: nothing in the model made a batch take time. `AjmDevice` now parks the caller on batch
+  wait until the next 256-frame period of virtual time (`devices.BLOCKED` sentinel: the device calls
+  `sched.block` itself, `sys_ioctl` then writes no return value). Result: 11500 DCBs/60 s with audio on, the
+  same as the audio-less boot (it was 9500).
+* **The pad read is `0x8030482e`**, not `0x80204829`. libScePad `+0xe00` (scePadRead/ReadState) calls it with
+  `{u32 handle; _; record *buf; u32 count; _; u32 *out_a; u32 *out_b; _}` (0x30 bytes). The kernel fills
+  0xa8-byte records (`+0` u64 timestamp us, `+0x0c` buttons, `+0x10` lx ly rx ry l2 r2, `+0x17` touch
+  count, ...) and returns how many; `out_a` is a generation id the library compares with its own (0 = skip),
+  `out_b` non-zero = touch data. Unmodelled it returned 0, i.e. "no reports": the controller never moved.
+  (The ShellUI's own `eboot` has a second copy of the reader, `0x80204814`, over 0x20-byte keyboard-style
+  records at `eboot+0x1888c0`; it only polls at ~10 Hz and is not the DualShock path.)
+* **Scripted input**: `PSEMU_PAD_BUTTONS` takes a timeline `start+duration=BTN[+BTN]` in virtual seconds
+  after start (`"14+0.5=RIGHT,20+0.5=CROSS+DOWN"`); plain names are held from the start.
+* **Pad input: how far it gets** (all verified by hooks; `tools/gamepad_out.py`): `scePadReadState` (libScePsm
+  `+0x80c3d`, InputCtrl thread, ~11/s) returns buttons=0x20 for RIGHT -> `+0x80ca0` -> `+0x82440` detects the
+  edge and calls the registered callback `+0x74b10`, which sets the bit in libScePsm's per-slot table (`+0x31e2a0`,
+  0x18 bytes/slot, state bits at +4) -> managed `GamePad::GetDataNative` (`+0x1cdf50`, called every frame by
+  the UI) copies the slot (`+0x74910`) and returns buttons=4 (Right) with ButtonsDown=4 on the edge, then
+  ButtonsUp. So the UI is handed correct pad events, yet UP/DOWN/RIGHT/CROSS pulses change nothing on the
+  home screen (frame diffs show only the idle hint-bar fade). Not yet known: whether the shell scene is
+  modal/unfocused (login or first-run state; user shows "Unknown"), waits for ShellCore input-focus events
+  (`SceShellCoreUtilCtrlFocus` is an always-set stand-in), or uses a second path. A pitfall found on the way:
+  `emu._time()` is an absolute perf counter, so a script timeline must subtract `emu._t0` (a timeline that
+  never fired looked exactly like "UI ignores input").

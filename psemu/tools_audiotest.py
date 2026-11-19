@@ -77,6 +77,30 @@ def main():
     look.sys_rtprio_thread(uc)
     check("rtprio set is remembered per thread",
           struct.unpack("<HH", bytes(uc.mem_read(0x9000, 4))) == (10, 520))
+    # AJM batch wait parks the thread until the next audio period
+    from . import devices
+
+    class Sched:
+        current = object()
+        got = None
+
+        def now_ns(self):
+            return 7_000_000
+
+        def block(self, what, deadline_ns=None, timeout_ret=None):
+            Sched.got = (what, deadline_ns, timeout_ret)
+
+    class Emu:
+        sched = Sched()
+
+        def log(self, m):
+            pass
+    sc = type("Sc", (), {"emu": Emu()})()
+    aj = devices.AjmDevice(sc, "/dev/ajm")
+    check("AJM batch start (0xc0288907) does not block", aj.ioctl(uc, 0xC0288907, 0xA000) == 0 and Sched.got is None)
+    rv = aj.ioctl(uc, 0xC0288908, 0xA000)
+    check("AJM batch wait (0xc0288908) parks the thread to the next period",
+          rv is devices.BLOCKED and Sched.got[1] == audioserver.next_period(7_000_000) and Sched.got[2] == (0, False))
     print("audio model:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

@@ -152,6 +152,31 @@ def main():
     check("capability (0x80104801) returns 0 and writes <= 0x30 bytes",
           dev.ioctl(uc, devices.HID_PAD_CAPABILITY, 0x7200) == 0
           and bytes(uc.mem_read(0x7330, 0x20)) == b"\xee" * 0x20)
+    # ---- 0x8030482e: the read libScePad (scePadRead/ReadState) uses in this firmware
+    REQ2, BUF2 = 0xB000, 0xC000
+    uc.mem_write(BUF2, b"\xee" * 0x200)
+    uc.mem_write(REQ2, struct.pack("<IIQIIQQQ", 1, 0, BUF2, 1, 0, 0xB100, 0xB104, 0))
+    uc.mem_write(0xB100, struct.pack("<II", 0x77, 0x77))
+    padsrc._source = padsrc.ScriptSource("CROSS,DOWN,R2")
+    dev2 = devices.open_device(sc, "/dev/hid")
+    rv = dev2.ioctl(uc, devices.HID_PAD_READ_EX, REQ2)
+    rec = bytes(uc.mem_read(BUF2, 0xA8))
+    check("read_ex returns 1 report", rv == 1, "(rv=%r)" % (rv,))
+    check("read_ex record: buttons at +0x0c, sticks/triggers at +0x10",
+          struct.unpack_from("<I", rec, 0x0C)[0] == want and list(rec[0x10:0x16]) == [128, 128, 128, 128, 0, 255])
+    check("read_ex fills a whole 0xa8-byte record and no more", rec[0x20:] == bytes(0xA8 - 0x20)
+          and bytes(uc.mem_read(BUF2 + 0xA8, 8)) == b"\xee" * 8)
+    check("read_ex clears both out words (generation id 0 = no check, no touch data)",
+          struct.unpack("<II", bytes(uc.mem_read(0xB100, 8))) == (0, 0))
+    uc.mem_write(REQ2, struct.pack("<IIQIIQQQ", 1, 0, BUF2, 0, 0, 0, 0, 0))
+    check("read_ex with count 0 returns 0", dev2.ioctl(uc, devices.HID_PAD_READ_EX, REQ2) == 0)
+    # script timeline: "start+duration=BUTTON[+BUTTON]" in virtual seconds
+    tl = padsrc.ScriptSource("CROSS,2+1=RIGHT,5+0.5=UP+L1")
+    check("script: always-held buttons plus timed presses",
+          tl.poll(0).buttons == padsrc.BUTTONS["CROSS"]
+          and tl.poll(2.5).buttons == padsrc.BUTTONS["CROSS"] | padsrc.BUTTONS["RIGHT"]
+          and tl.poll(3.0).buttons == padsrc.BUTTONS["CROSS"]
+          and tl.poll(5.2).buttons == padsrc.BUTTONS["CROSS"] | padsrc.BUTTONS["UP"] | padsrc.BUTTONS["L1"])
     # ---- /dev/ajm (on by default; PSEMU_AJM=0 -> generic stub)
     import os as _os
     saved = _os.environ.pop("PSEMU_AJM", None)

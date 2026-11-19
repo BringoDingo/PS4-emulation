@@ -45,26 +45,42 @@ class NullSource:
     """A connected controller nobody touches."""
     name = "idle"
 
-    def poll(self):
+    def poll(self, t=0.0):
         return PadState()
 
 
 class ScriptSource:
-    """Holds the buttons named in PSEMU_PAD_BUTTONS (comma separated) down."""
+    """Holds buttons down. PSEMU_PAD_BUTTONS="CROSS,DOWN" holds them from the start; a timeline
+    "40+2=RIGHT,50+0.3=CROSS+DOWN" presses RIGHT from t=40 s for 2 s and CROSS and DOWN from t=50 s for
+    0.3 s (t = the emulator's virtual seconds), so a headless run can navigate the UI."""
     name = "script"
 
     def __init__(self, spec=None):
         spec = os.environ.get("PSEMU_PAD_BUTTONS", "") if spec is None else spec
         self.buttons = 0
-        for n in spec.replace(" ", "").upper().split(","):
-            if n:
-                self.buttons |= BUTTONS[n]
+        self.timeline = []                   # (start, end, buttons)
+        for item in spec.replace(" ", "").upper().split(","):
+            if not item:
+                continue
+            if "=" in item:
+                when, names = item.split("=", 1)
+                start, _, dur = when.partition("+")
+                b = 0
+                for n in names.split("+"):
+                    b |= BUTTONS[n]
+                self.timeline.append((float(start), float(start) + float(dur or 0.2), b))
+            else:
+                self.buttons |= BUTTONS[item]
 
-    def poll(self):
-        st = PadState(self.buttons)
-        if self.buttons & BUTTONS["L2"]:
+    def poll(self, t=0.0):
+        b = self.buttons
+        for start, end, bits in self.timeline:
+            if start <= t < end:
+                b |= bits
+        st = PadState(b)
+        if b & BUTTONS["L2"]:
             st.l2 = 255
-        if self.buttons & BUTTONS["R2"]:
+        if b & BUTTONS["R2"]:
             st.r2 = 255
         return st
 
@@ -122,7 +138,7 @@ class XInputSource:
         self._slot = 0
         self.connected = False
 
-    def poll(self):
+    def poll(self, t=0.0):
         if self._dll is None:
             return PadState()
         st = _XState()

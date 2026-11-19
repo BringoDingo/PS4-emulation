@@ -103,7 +103,7 @@ SYSCALLS = {
 
 
 from .sys_dynlib import DYNLIB_SYSCALLS, DynlibSyscalls
-from .devices import DceDevice, DmemDevice, open_device
+from .devices import BLOCKED, DceDevice, DmemDevice, open_device
 from .sys_sync import SYNC_SYSCALLS, SyncSyscalls
 
 import struct as _struct
@@ -1829,6 +1829,8 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         except Exception as e:                   # bad guest pointer etc.
             self.emu.log(f"  [ioctl] {dev.path} req={req:#010x}: {e} -> EINVAL")
             return self._ret(uc, EINVAL, error=True)
+        if rv is BLOCKED:
+            return                      # the device parked the thread; its return value comes on wake
         if rv and rv < 0:
             return self._ret(uc, -rv, error=True)
         self._ret(uc, rv or 0)

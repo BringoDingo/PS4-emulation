@@ -552,6 +552,11 @@ class RandomDevice(Device):
 
 AJM_REQ_BASE = 0xC0288900
 AJM_INSTANCE_CREATE = 5
+AJM_BATCH_WAIT = 8
+
+# What Device.ioctl returns after parking the calling thread itself (sched.block): the syscall's
+# return value is delivered when the thread wakes, so sys_ioctl must not write one.
+BLOCKED = object()
 
 
 class AjmDevice(Device):
@@ -567,6 +572,16 @@ class AjmDevice(Device):
         if n == AJM_INSTANCE_CREATE:
             AjmDevice._instances += 1
             self.w32(uc, argp + 0x14, AjmDevice._instances)
+        if n == AJM_BATCH_WAIT:
+            # The hardware decoder takes time: a batch is not done until a period of audio has
+            # passed. Without this the guest's decode loop (libSceAudiodec -> Batch start/wait, no
+            # sleep of its own) spun at ~2500 ioctls/s on results that never advance.
+            sched = getattr(self.emu, "sched", None)
+            if sched is not None and getattr(sched, "current", None) is not None:
+                from . import audioserver
+                sched.block({"kind": "ajm_batch_wait"},
+                            deadline_ns=audioserver.next_period(sched.now_ns()), timeout_ret=(0, False))
+                return BLOCKED
         return 0
 
 
@@ -598,6 +613,8 @@ HID_SET_PROCESS_PRIVILEGE = 0x80084809
 HID_PAD_OPEN = 0x800C4802
 HID_PAD_CLOSE = 0x80084803
 HID_PAD_READ = 0x80204829
+HID_PAD_READ_EX = 0x8030482E
+HID_REPORT_SIZE = 0xA8          # stride of libScePad's report records for HID_PAD_READ_EX
 HID_QUERY_U64 = 0x8010480F
 HID_PAD_INFO = 0x8010480E
 HID_PAD_CAPABILITY = 0x80104801
@@ -624,6 +641,8 @@ class HidDevice(Device):
         from . import padsrc
         if req == HID_PAD_READ:
             return self._read(uc, argp)
+        if req == HID_PAD_READ_EX:
+            return self._read_ex(uc, argp)
         if req == HID_PAD_OPEN:
             HidDevice._handles = HidDevice._handles % 3 + 1
             self.log(f"pad open {self.rd(uc, argp, 12).hex()} -> handle {HidDevice._handles}")
@@ -644,6 +663,39 @@ class HidDevice(Device):
             return 0
         return self.unknown(uc, req, argp)
 
+    def _sample(self):
+        """(PadState, timestamp us) of the next report. An unchanged controller keeps its last
+        timestamp (refreshed every 250 ms): a fresh stamp on every poll made libScePsm treat each
+        poll as new input and flood the UI with events."""
+        now = self._now_us()
+        state = self.source.poll(now / 1e6 - getattr(self.emu, '_t0', 0.0))
+        last = HidDevice._last
+        if last is None or last[0] != state or now - last[1] >= 250_000:
+            HidDevice._last = last = (state, now)
+        return last
+
+    def _read_ex(self, uc, argp):
+        """0x8030482e, the read libScePad's scePadRead/ReadState use in this firmware (+0xe00):
+        {u32 handle; u32 _; record *buf; u32 count; _; u32 *out_a; u32 *out_b; _}. The kernel fills
+        `buf` with 0xa8-byte records (+0 u64 timestamp us, +0x0c u32 buttons, +0x10 lx ly rx ry l2 r2,
+        +0x17 u8 touch count), returns how many, and writes out_a (the pad's generation id the library
+        checks against its own; 0 skips the check) and out_b (non-zero = touch data follows)."""
+        from . import padsrc
+        buf = self.u64(uc, argp + 8)
+        count = self.u32(uc, argp + 0x10)
+        out_a = self.u64(uc, argp + 0x18)
+        out_b = self.u64(uc, argp + 0x20)
+        if out_a:
+            self.w32(uc, out_a, 0)
+        if out_b:
+            self.w32(uc, out_b, 0)
+        if count < 1 or not buf:
+            return 0
+        self.reads += 1
+        state, ts = self._sample()
+        uc.mem_write(buf, padsrc.encode_report(state, ts).ljust(HID_REPORT_SIZE, b"\0"))
+        return 1
+
     def _read(self, uc, argp):
         from . import padsrc
         port = self.u32(uc, argp)
@@ -655,8 +707,8 @@ class HidDevice(Device):
         if count < 1 or not buf:
             return 0
         self.reads += 1
-        state = self.source.poll()
         now = self._now_us()
+        state = self.source.poll(now / 1e6 - getattr(self.emu, '_t0', 0.0))
         # An unchanged controller keeps its last timestamp (refreshed every 250 ms): a fresh stamp on
         # every poll made libScePsm treat each poll as new input and flood the UI with events.
         last = HidDevice._last
