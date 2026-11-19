@@ -53,6 +53,7 @@ class ProcessManager:
         emu = Emulator(path, trace=parent.trace, max_insns=parent.max_insns, fw_root=parent.fw_root,
                        backend="whp" if parent.whp else "unicorn", shared_machine=parent.shared_machine,
                        host_identity=False)
+        emu.parent = parent
         emu.max_seconds = parent.max_seconds
         emu._t0 = parent._t0
         emu.max_modules = parent.max_modules
@@ -88,6 +89,11 @@ class ProcessManager:
                     progressed = True
             if p[1] is not None:
                 alive = True
+            elif getattr(p[0], "parent", None) is not None and not getattr(p[0], "_exit_told", False):
+                p[0]._exit_told = True           # a child process finished: its parent's proc watch fires
+                parent = p[0].parent
+                parent.syscalls.proc_event(parent.syscalls.NOTE_EXIT, 0)
+                parent.syscalls.child_done(getattr(p[0], "child_pid", 0), 0)
         for p in self.procs:                    # one wall-clock budget for the whole machine
             ms = p[0].max_seconds
             if p[1] is not None and ms is not None and p[0]._time() - p[0]._t0 >= ms:

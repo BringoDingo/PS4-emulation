@@ -80,6 +80,18 @@ class Device:
         """Return a guest address, or None for a plain anonymous mapping."""
         return None
 
+    # Seekable devices (block devices): the fd's file position and positioned I/O.
+    pos = 0
+    seekable_size = None          # None = not seekable (lseek/pread fall through to "no data")
+
+    def pread(self, uc, buf, n, off):
+        """Bytes read at `off` into `buf` (<= n), or a negative errno."""
+        return 0
+
+    def write(self, uc, buf, n):
+        """Bytes accepted (the default discards the data)."""
+        return n
+
 
 # ---------------------------------------------------------------- /dev/gc
 
@@ -763,7 +775,103 @@ DEVICES = {
 }
 
 
+# ---------------------------------------------------------------- block devices (/dev/da*)
+#
+# The console's disk partitions (da0x<N>[.crypt]): mini-syscore checks them (filecheck), asks the
+# sector size (DIOCGSECTORSIZE) and, before mounting, reads each UFS superblock to see whether the
+# filesystem was left clean (sceFsUfsCheckCleanFlag). The files themselves come from the host firmware
+# directory (psemu has no real filesystem), so a partition only has to look like a clean UFS2 volume.
+
+DIOCGSECTORSIZE = 0x40046480    # u32
+DIOCGMEDIASIZE = 0x40086481     # u64
+DIOCGFWSECTORS = 0x40046482     # u32
+DIOCGFWHEADS = 0x40046483       # u32
+DIOCGSTRIPESIZE = 0x40086484    # u64
+DIOCGSTRIPEOFFSET = 0x40086485  # u64
+UFS2_SBLOCK = 0x10000
+UFS2_MAGIC = 0x19540119
+BLOCK_SECTOR = 512
+BLOCK_MEDIA = 1 << 30           # 1 GiB: the size a partition reports
+
+
+def ufs2_superblock(media=BLOCK_MEDIA):
+    """A UFS2 superblock (FreeBSD struct fs) of a clean, empty volume."""
+    sb = bytearray(8192)
+    bsize, fsize = 32768, 4096
+    struct.pack_into("<i", sb, 48, bsize)             # fs_bsize
+    struct.pack_into("<i", sb, 52, fsize)             # fs_fsize
+    struct.pack_into("<i", sb, 56, bsize // fsize)    # fs_frag
+    struct.pack_into("<i", sb, 104, 4096)             # fs_sbsize
+    struct.pack_into("<i", sb, 44, 1)                 # fs_ncg
+    sb[208] = 0                                       # fs_fmod
+    sb[209] = 1                                       # fs_clean
+    sb[210] = 0                                       # fs_ronly
+    struct.pack_into("<q", sb, 1144, UFS2_SBLOCK)     # fs_sblockloc
+    struct.pack_into("<q", sb, 1224, media // fsize)  # fs_size (fragments)
+    struct.pack_into("<q", sb, 1232, media // fsize)  # fs_dsize
+    struct.pack_into("<i", sb, 1372, UFS2_MAGIC)      # fs_magic
+    return bytes(sb)
+
+
+class BlockDevice(Device):
+    seekable_size = BLOCK_MEDIA
+
+    def __init__(self, sc, path):
+        super().__init__(sc, path)
+        self.pos = 0
+        self.sb = ufs2_superblock()
+
+    def _data(self, off, n):
+        out = bytearray(n)
+        lo = UFS2_SBLOCK
+        a, b = max(off, lo), min(off + n, lo + len(self.sb))
+        if a < b:
+            out[a - off:b - off] = self.sb[a - lo:b - lo]
+        return bytes(out)
+
+    def ioctl(self, uc, req, argp):
+        if req == DIOCGSECTORSIZE:
+            self.w32(uc, argp, BLOCK_SECTOR)
+        elif req == DIOCGMEDIASIZE:
+            self.w64(uc, argp, BLOCK_MEDIA)
+        elif req in (DIOCGFWSECTORS, DIOCGFWHEADS):
+            self.w32(uc, argp, 63 if req == DIOCGFWSECTORS else 255)
+        elif req in (DIOCGSTRIPESIZE, DIOCGSTRIPEOFFSET):
+            self.w64(uc, argp, 0)
+        else:
+            return self.unknown(uc, req, argp)
+        return 0
+
+    def pread(self, uc, buf, n, off):
+        n = max(0, min(n, BLOCK_MEDIA - off))
+        if n:
+            uc.mem_write(buf, self._data(off, n))
+        return n
+
+    def read(self, uc, buf, n):
+        got = self.pread(uc, buf, n, self.pos)
+        self.pos += got
+        return got
+
+
+class EventDevice(Device):
+    """A device that delivers event records (/dev/notification*): nothing ever happens here, so a read
+    blocks for good, like an idle queue (returning EOF made SceSysCore's button thread spin, logging
+    "An illegal event rises" ~500 times a second)."""
+
+    def read(self, uc, buf, n):
+        sched = getattr(self.emu, "sched", None)
+        if sched is not None and getattr(sched, "current", None) is not None:
+            sched.block({"kind": "device_read", "dev": self.path})
+            return BLOCKED
+        return 0
+
+
 def open_device(sc, path):
+    if path.startswith("/dev/notification"):
+        return EventDevice(sc, path)
+    if path.startswith("/dev/da") and path[7:8].isdigit():
+        return BlockDevice(sc, path)
     if path == "/dev/ajm" and os.environ.get("PSEMU_AJM", "1") not in ("0", "off", ""):
         # The decoder answers "done, nothing decoded"; without it PSM's sound start-up fails and the
         # Bgm native library is never registered (see the README).

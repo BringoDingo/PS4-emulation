@@ -56,10 +56,15 @@ def _align_down(x, a=PAGE4K):
     return x & ~(a - 1)
 
 
+PROC_SLICE_S = 0.008
 IDLE = -1          # _run_segment result: every thread is waiting for another process
 
 
 class Emulator:
+    PROC_SLICE = PROC_SLICE_S      # wall seconds a process runs before the next one gets the CPU
+    _yield_proc = False
+    _seg_t0 = 0.0
+
     def __init__(self, path, trace=False, max_insns=2_000_000, verbose=True,
                  fw_root=None, backend=None, shared_machine=None, host_identity=True):
         import collections
@@ -576,6 +581,10 @@ class Emulator:
     def _whp_preempt(self, uc, rip):
         """End of a wall-clock time slice: True when another thread is runnable and a switch is
         now pending (the vCPU is stopped before `rip`)."""
+        mgr = getattr(self, "manager", None)
+        if mgr is not None and self._time() - self._seg_t0 >= self.PROC_SLICE and mgr.others_alive(self):
+            self._yield_proc = True          # another process is due: end this segment, resume at rip
+            return True
         sched = self.sched
         if sched is None or len(sched.order) < 2:
             return False
@@ -1026,6 +1035,7 @@ class Emulator:
         from .threads import Scheduler
         native = self.native
         self._hle_pending = False
+        self._seg_t0 = self._time()
         if native is not None:
             ns = native.s
             ns.reason = 0
@@ -1095,4 +1105,8 @@ class Emulator:
             return self.entry_point
         if self._hle_pending and self._stop_reason is None:
             return self.uc.reg_read(UC_X86_REG_RIP)
+        if self._yield_proc:
+            self._yield_proc = False
+            if self._stop_reason is None:
+                return self.uc.reg_read(UC_X86_REG_RIP)
         return None

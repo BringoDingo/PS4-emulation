@@ -201,6 +201,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         self.counts = {}          # number -> times called
         self.trace = emu.trace
         # Sony kernel-object model: hand out unique ids for created objects.
+        self.children = {}          # child pid -> None (running) or its exit status (waiting to be reaped)
         self._next_handle = 0x100
         self._next_pid = 1001                 # children of rfork(RFPROC|RFMEM)
         self.objects = {}         # handle -> dict(kind, name, ...)
@@ -460,6 +461,9 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         t = sched.fork_current(rip, {UC_X86_REG_RAX: self.PID, UC_X86_REG_RDX: 1,
                                      UC_X86_REG_RFLAGS: fl}, name=f"pid{pid}")
         t.spawn_child = True                           # an execve() here spawns a process
+        t.child_pid = pid
+        self._rdup_next = 3                            # the child's own fd table starts after stdio
+        self.children[pid] = None                      # alive (None) until it exits: status
         self.emu.log(f"  [rfork] flags={flags:#x} -> child pid {pid} (thread {t.tid:#x}, "
                      f"shares memory)")
         uc.reg_write(UC_X86_REG_RDX, 0)
@@ -510,6 +514,8 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             except Exception as e:
                 self.emu.log(f"  [read] {dev.path}: {e} -> EINVAL")
                 return self._ret(uc, EINVAL, error=True)
+            if rv is BLOCKED:
+                return                                  # parked; the wake delivers the return value
             if rv is not None and rv < 0:
                 return self._ret(uc, -rv, error=True)   # e.g. EAGAIN: no data pending
             return self._ret(uc, rv or 0)
@@ -1210,6 +1216,57 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             sched.block({"kind": "sleep", "ns": ns}, deadline_ns=sched.now_ns() + ns,
                         timeout_ret=(0, False))
 
+    NOTE_EXIT, NOTE_EXEC = 0x80000000, 0x20000000
+
+    # ---- wait4 / child bookkeeping ---------------------------------------
+    ECHILD = 10
+    WNOHANG = 1
+
+    def child_done(self, pid, status=0):
+        """A child (a spawned process, or a vfork child whose execve failed) is gone: wake a wait4()."""
+        import struct
+        self.children[pid] = status
+        waiters = self.__dict__.setdefault("_wait4_waiters", [])
+        sched = self.emu.sched
+        if waiters and sched is not None:
+            t, status_ptr = waiters.pop(0)
+            self.children.pop(pid, None)
+            if status_ptr:
+                try:
+                    self.emu.uc.mem_write(status_ptr, struct.pack("<i", status))
+                except Exception:
+                    pass
+            sched.wake(t, pid, False)
+
+    def sys_wait4(self, uc):
+        # wait4(pid, int *status, options, rusage): reap an exited child, block while children run, ECHILD
+        # when there are none. (Unmodelled it returned 0 at once: mini-syscore's reaper loop spun on it.)
+        import struct
+        pid, status_ptr, options = self._args(uc)[:3]
+        options &= 0xFFFFFFFF
+        zombie = next((p for p, st in self.children.items() if st is not None), None)
+        if zombie is not None:
+            st = self.children.pop(zombie)
+            if status_ptr:
+                uc.mem_write(status_ptr, struct.pack("<i", st))
+            return self._ret(uc, zombie)
+        if not self.children:
+            return self._ret(uc, self.ECHILD, error=True)
+        if options & self.WNOHANG:
+            return self._ret(uc, 0)
+        sched = self.emu.sched
+        waiters = self.__dict__.setdefault("_wait4_waiters", [])
+        waiters.append((sched.current, status_ptr))
+        sched.block({"kind": "wait4"})
+
+    def proc_event(self, fflags, data=0):
+        """Raise an EVFILT_PROC event (a child exec'd / exited) on every proc watch of this process."""
+        for notes in self.knotes.values():
+            for (_ident, filt), kn in notes.items():
+                if filt == -5:
+                    kn["fflags"] = fflags
+        self.trigger(-5, None, data)
+
     def sys_execve(self, uc):
         # mini-syscore's job is early boot, then hand off to the next stage.
         # We can't chain-load that separate firmware module, so report the
@@ -1243,17 +1300,16 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             # ProcessManager while this process carries on
             resolved = self.emu.resolve_path(path)
             if resolved is None:
-                self.emu.log(f"  [execve] spawn '{path}': not found under {self.emu.fw_root}")
+                # execve fails (ENOENT) in the child, which then exits: the parent sees NOTE_EXIT
+                self.emu.log(f"  [execve] spawn '{path}': not found under {self.emu.fw_root} "
+                             f"-> the child exits")
+                self.proc_event(self.NOTE_EXIT, 1 << 8)
+                self.child_done(getattr(cur, "child_pid", 0), 1 << 8)
             else:
                 self.emu.log(f"  [execve] spawn '{path}' -> new process")
-                mgr.spawn(self.emu, resolved, argv or [path])
-                # the parent watches its child with EVFILT_PROC (NOTE_EXEC | NOTE_EXIT): tell it the exec happened
-                NOTE_EXEC = 0x20000000
-                for notes in self.knotes.values():
-                    for (ident, filt), kn in notes.items():
-                        if filt == -5:
-                            kn["fflags"] = NOTE_EXEC
-                self.trigger(-5, None, 0)
+                child = mgr.spawn(self.emu, resolved, argv or [path])
+                child.child_pid = getattr(cur, "child_pid", 0)
+                self.proc_event(self.NOTE_EXEC, 0)
             sched.exit_current()
             return
         if cur is not None and getattr(cur, "spawn_child", False) and mode not in (None, "follow"):
@@ -1434,7 +1490,13 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     def sys_rdup(self, uc):
         # ORBIS sys_603: duplicate a descriptor to the lowest free fd. The
         # module's fd-setup loop requires these to come back as 3, 4, 5, ...
-        fd = self._alloc_fd("rdup")
+        # A spawned child gets its own descriptor table (0..2 = the console, then 3, 4, 5 ...) and
+        # mini-syscore's child checks each rdup returns exactly 3, 4, 5...; psemu shares one table, so the
+        # sequence restarts at 3 whenever the child re-points stdio (dup2 onto 0..2) and never
+        # overwrites a descriptor the parent still holds.
+        fd = getattr(self, "_rdup_next", 3)
+        self._rdup_next = fd + 1
+        self.fds.setdefault(fd, "rdup")
         self.emu.log(f"  [rdup] -> fd {fd}")
         self._ret(uc, fd)
 
@@ -1632,6 +1694,14 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
 
     def sys_pread(self, uc):
         fd, buf, n, off = self._pio_args(uc)
+        dev = self.devs.get(fd)
+        if dev is not None and dev.seekable_size is not None:
+            try:
+                rv = dev.pread(uc, buf, n, off)
+            except Exception as e:
+                self.emu.log(f"  [pread] {dev.path}: {e} -> EINVAL")
+                return self._ret(uc, EINVAL, error=True)
+            return self._ret(uc, -rv, error=True) if rv < 0 else self._ret(uc, rv)
         f = self.files.get(fd)
         if f is None:
             return self._ret(uc, 0)
@@ -1707,6 +1777,10 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     def sys_close(self, uc):
         fd = self._args(uc)[0] & 0xFFFFFFFF
         self.fds.pop(fd, None)
+        if fd in self.kqueues:                   # a closed kqueue takes its registrations with it
+            self.kqueues.discard(fd)
+            self.knotes.pop(fd, None)
+            self.kq_pending.pop(fd, None)
         self.devs.pop(fd, None)
         self.files.pop(fd, None)
         self.shms.pop(fd, None)
@@ -1823,6 +1897,14 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     def sys_lseek(self, uc):
         fd, off, whence = self._args(uc)[:3]
         fd &= 0xFFFFFFFF
+        dev = self.devs.get(fd)
+        if dev is not None and dev.seekable_size is not None:
+            off = off - (1 << 64) if off >= (1 << 63) else off
+            base = {0: 0, 1: dev.pos, 2: dev.seekable_size}.get(whence & 0xFFFFFFFF, 0)
+            if base + off < 0:
+                return self._ret(uc, EINVAL, error=True)
+            dev.pos = base + off
+            return self._ret(uc, dev.pos)
         f = self.files.get(fd)
         if f is None:
             return self._ret(uc, 0)
@@ -1873,6 +1955,8 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     def sys_dup2(self, uc):
         # dup2(oldfd, newfd): make newfd refer to oldfd; return newfd.
         oldfd, newfd, *_ = self._args(uc)
+        if newfd == 0:
+            self._rdup_next = 3
         self.fds[newfd] = self.fds.get(oldfd, f"dup{oldfd}")
         if oldfd in self.devs:
             self.devs[newfd] = self.devs[oldfd]
