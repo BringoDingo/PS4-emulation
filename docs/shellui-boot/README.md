@@ -1144,3 +1144,23 @@ creation `0xce11002a`, `0x79640` per module group).
   `0xce11002a` should have produced module entries from process data psemu answers differently.
 Next: find what initialises Mbus on the real boot (writers of `0x5ceb2c`: only the lazy sites `0x462a4`, `0x46fc6`,
 `0x47b09`, `0x49444`) and check whether ShellCore's own startup reaches one of those before the ShellUI registers.
+
+### 2026-11-19 (end 9): the real boot log (psdevwiki "Bootprocess", 5.05-era kit log) against our run
+Reference: a real boot log (user-supplied text; not committed). What it fixes in our picture:
+* SceSysCore prints `[MbusBaseEnv] alloc_count/free_count/alloc_size` right after `nmount /data to /user/data`
+  and before `ExpandCpuSetMode`, then spawns orbis_audiod, GnmCompositor, and ShellCore starts. We never print
+  it. That text is in the Mbus kernel-event worker (`SceSysCore+0x71460`, started on thread 0x10005): it opens
+  `/dev/mbus`, registers it on a kqueue and, per event, `read(fd, buf, 0x30)` then dispatches through
+  `0x724c0` (switch on the u32 at +4, 0..0xb; sub 0 = "device disconnect", id at +8; sub 1 -> second switch on
+  the u32 at +0 and an `ioctl(0xc0288c01)` back to /dev/mbus; sub 3 = `0x7269a`). It prints the MbusBaseEnv stats
+  from that path. In psemu `/dev/mbus` is a generic stub that never signals, so the worker waits forever.
+* The ShellUI's LoginMgr then sees devices that exist from boot: ids 0x0002000000000000..2 (type 2, subtype 1),
+  0x1030f (type 2, subtype 13), later 0x9000000000001 (type 2, subtype 10) and the pad 0x40301 (type 1, subtype 2),
+  announced as SCE_MBUS_EVENT_DEVICE_ADDED / OWNER_CHANGED. Our device list answers only the emulated pad.
+  The `{1, 0x20000007}` / `{1, 0x20010008}` registrations and the module-0x107 lookup that fails are most
+  likely about these kernel-reported devices, which is why the group tables hold no module-7 entry.
+* Also seen against the real log: our SceSysCore gets `EVFILT_PROC NOTE_EXIT` for the pid it just added
+  (`Add event : pid=0x3eb` then `NOTE_EXIT received : pid=0x3eb`), real boot has no exit; `sysctlbyname: failed -1`
+  and `sceNetDuplicateIpStart failed 80410111` appear only in ours.
+Next step (not done): implement `/dev/mbus` as a real event source (needs the 0x30-byte event layout and the
+`0xc0288c01` ioctl reversed from `0x724c0`), delivering the boot devices above; fix the false NOTE_EXIT.
