@@ -1164,3 +1164,23 @@ Reference: a real boot log (user-supplied text; not committed). What it fixes in
   and `sceNetDuplicateIpStart failed 80410111` appear only in ours.
 Next step (not done): implement `/dev/mbus` as a real event source (needs the 0x30-byte event layout and the
 `0xc0288c01` ioctl reversed from `0x724c0`), delivering the boot devices above; fix the false NOTE_EXIT.
+
+### 2026-11-19 (end 10): /dev/mbus as an event source - mechanism in, semantics only partly known
+* `MbusDevice` (`/dev/mbus`): 0x30-byte messages `{u32 kind, u32 code, u64 id, ...}` (same layout as `/dev/mbus_av`),
+  `read` -> EAGAIN when empty, and `sys_kevent` now marks a read filter (-1) on a device fd ready when the device
+  has `ready()` data. Default behaviour is unchanged (no events). `PSEMU_MBUS_EVENTS="kind:code:id,..."` queues
+  experimental events at open time.
+* Gate: SceSysCore's worker (`0x71460`) only starts reading after `0x71bf0` (the lazy Mbus init, first reached by
+  `0xce11003b`) sets `[0x5cf904]`; until then it sleeps in a 100 ms cond-wait loop. With the init done it consumes
+  queued events (verified: kq delivers, read pops).
+* What a sweep of kind 2, codes 0..11 showed (SceSysCore's own messages): code 0 = `removeDevice` (log says
+  "device disconnect"), 1 = per-kind ioctl notification (kinds 0/1/5/12/13/15 only, else ignored), 2 =
+  `handleKmodEvent: unknown status 2`, 3 = `busTransition`, 5 = `ownerChangeEvent`, 9 = `functionChangeEvent`
+  (these three call `getDeviceType` -> `mbusGetDeviceInfoInternal` and fail `0x809b0005` for ids not in the
+  registry), 10/11 = jack connected/disconnected (kind and bytes +0x18..+0x1d carry the jack), 4 = control word at +8.
+  Device id = `(kind << 48) | id`.
+* None of the codes *creates* a device: all look the id up in SceSysCore's own registry (`0x4deb0` -> `0x5ffd0`)
+  and fail for unknown ids. So the boot devices (0x2000000000000..2, 0x1030f) get into that registry some other
+  way (not a kernel event). The module-7 gap is therefore not closed by delivering events alone; the registry's
+  producer (callers of `0x5ffd0`'s add counterpart, probably an IPMI method from another system process) is the
+  next thing to find. No guessed events are delivered by default.

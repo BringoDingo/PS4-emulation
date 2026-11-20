@@ -1626,6 +1626,12 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 # vision manager passes a request-message pointer this way)
                 kn["udata"] = udata
                 self.trigger(self.EVFILT_USER, ident)
+        for (ident_, filt_) in list(notes):          # a read filter on a device fd that already has data
+            dev_ = self.devs.get(ident_) if filt_ == -1 else None
+            if dev_ is not None and hasattr(dev_, "ready") and dev_.ready():
+                pend_ = self.kq_pending.setdefault(kq, [])
+                if (ident_, filt_) not in pend_:
+                    pend_.append((ident_, filt_))
         if nev and self.kq_pending.get(kq):
             return self.sys_kevent_deliver(uc, kq, evbuf, nev)
         if not nev:

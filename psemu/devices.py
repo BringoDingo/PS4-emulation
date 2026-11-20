@@ -526,6 +526,37 @@ class MbusAvDevice(Device):
         return -MBUS_EAGAIN       # no (more) events pending
 
 
+
+class MbusDevice(Device):
+    """/dev/mbus: the kernel side of the media bus. SceSysCore's event worker (SceSysCore+0x71460) watches it
+    with a kqueue read filter and reads 0x30-byte messages {u32 kind, u32 code, u64 id, ...} (the same layout as
+    /dev/mbus_av; kind 9 = the AV/jack bus, id = the device's index within the kind, which SceSysCore turns
+    into the device id (kind << 48) | id). Events are queued with push(); read() returns EAGAIN when empty and
+    ready() is what the kqueue read filter polls."""
+
+    def __init__(self, sc, path):
+        super().__init__(sc, path)
+        self.queue = []
+        self.fd = None
+        import os                                  # experiments: PSEMU_MBUS_EVENTS="kind:code:id,..."
+        for item in filter(None, os.environ.get("PSEMU_MBUS_EVENTS", "").split(",")):
+            k, c, i = (int(x, 0) for x in item.split(":"))
+            self.push(k, c, i)
+
+    def push(self, kind, code, ident=0, extra=b""):
+        ev = struct.pack("<IIQ", kind, code, ident) + extra
+        self.queue.append(ev.ljust(MBUS_EVENT_LEN, bytes(1)))
+        self.log(f"queue event kind={kind} code={code} id={ident:#x}")
+
+    def ready(self):
+        return bool(self.queue)
+
+    def read(self, uc, buf, n):
+        if not self.queue or n < MBUS_EVENT_LEN:
+            return -MBUS_EAGAIN
+        uc.mem_write(buf, self.queue.pop(0))
+        return MBUS_EVENT_LEN
+
 class AvStubDevice(Device):
     """AV plane device with no state model yet (logs, answers success)."""
 
@@ -785,6 +816,7 @@ DEVICES = {
     "/dev/dmem2": DmemDevice,
     "/dev/hdmi": HdmiDevice,
     "/dev/mbus_av": MbusAvDevice,
+    "/dev/mbus": MbusDevice,
     "/dev/av_control": AvControlDevice,
     "/dev/devact": DevActDevice,
 }
