@@ -22,6 +22,7 @@ layout is libkernel's: create(name, attr, init, max) returns the handle
 poll(h, need), signal(h, n), cancel(h, set_count, int *num_waiters).
 Waiters queue in arrival order (thread priorities are not modelled).
 """
+import os
 import struct
 
 from . import audioserver
@@ -679,6 +680,16 @@ class SyncSyscalls:
                     deadline_ns=None if timeout_us is None else sched.now_ns() + timeout_us * 1000,
                     timeout_ret=(ETIMEDOUT, True))
 
+    def _sema_trace(self, what, sem, note=""):
+        """PSEMU_TRACE_SEMA=<name substring>: log every poll/post of matching semaphores (who, when)."""
+        pat = os.environ.get("PSEMU_TRACE_SEMA")
+        if pat and pat in (sem.name or ""):
+            th = self.emu.sched.current
+            n = self.__dict__.setdefault("_semtr", {}).setdefault((what, note), 0) + 1
+            self._semtr[(what, note)] = n
+            if n <= 5 or n % 50 == 0:
+                self.emu.log(f"  [sema] {what} '{sem.name}' {note} by tid {th.tid:#x} at vt {self.emu.sched.now_ns() / 1e9:.3f}s (#{n})")
+
     def sys_osem_trywait(self, uc):
         # osem_trywait(handle, s32 need): sceKernelPollSema
         h, need = self._args(uc)[:2]
@@ -689,8 +700,10 @@ class SyncSyscalls:
         if need < 1 or need > sem.max:
             return self._ret(uc, EINVAL, error=True)
         if sem.count < need:
+            self._sema_trace("poll", sem, "busy")
             return self._ret(uc, EBUSY, error=True)
         sem.count -= need
+        self._sema_trace("poll", sem, "taken")
         self._ret(uc, 0)
 
     def sys_osem_post(self, uc):
@@ -703,6 +716,7 @@ class SyncSyscalls:
         if n < 1 or sem.count + n > sem.max:
             return self._ret(uc, EINVAL, error=True)
         sem.count += n
+        self._sema_trace("post", sem, f"+{n}")
         # hand tokens to waiters in order; one that needs more than is left
         # keeps waiting without holding up the ones behind it
         sched = self.emu.sched

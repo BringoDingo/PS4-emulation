@@ -1388,6 +1388,9 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         # ShellUI that stopped heart-beating). Unmodelled it "succeeded" while the process kept running.
         pid = self._args(uc)[0] & 0xFFFFFFFF
         mgr = getattr(self.emu, "manager", None)
+        if os.environ.get("PSEMU_NO_TERMINATE"):       # experiment: let the process live to see what it does next
+            self.emu.log(f"  [terminate] process {pid:#x}: kill ignored (PSEMU_NO_TERMINATE)")
+            return self._ret(uc, 0)
         if mgr is not None and mgr.terminate(pid):
             self.emu.log(f"  [terminate] process {pid:#x} stopped")
             return self._ret(uc, 0)

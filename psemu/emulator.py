@@ -952,7 +952,7 @@ class Emulator:
                 st = _s.unpack("<4Q", bytes(uc.mem_read(rsp + 8, 32)))
                 tid = emu.sched.current.tid if emu.sched and emu.sched.current else 0
                 ra = _s.unpack("<Q", bytes(uc.mem_read(rsp, 8)))[0]
-                emu.log(f"  [trace {label}] tid {tid:#x} ra {ra:#x} args " + " ".join(f"{x:#x}" for x in a)
+                emu.log(f"  [trace {label}] vt {emu.sched.now_ns() / 1e9:.3f}s tid {tid:#x} ra {ra:#x} args " + " ".join(f"{x:#x}" for x in a)
                         + " stack " + " ".join(f"{x:#x}" for x in st))
                 for spec in os.environ.get("PSEMU_TRACE_MEM", "").split(","):
                     # "rdi:56": also dump that many bytes at the pointer in that argument register

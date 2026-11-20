@@ -156,6 +156,13 @@ class ProcessManager:
                 d, e = min(dl, key=lambda x: x[0])
                 delta = d - e.sched.now_ns()
                 if delta > 0:
+                    if os.environ.get("PSEMU_TRACE_IDLE"):       # who made the machine skip idle time (by wait kind)
+                        t0 = next((t for t in e.sched.threads.values() if t.state == "blocked" and t.deadline == d), None)
+                        w = t0.wait if t0 is not None and isinstance(t0.wait, dict) else {}
+                        key = (e.path.replace(chr(92), "/").rsplit("/", 1)[-1], w.get("kind"), str(w.get("name") or w.get("sema") or w.get("evf") or ""),
+                               "%#x" % t0.tid if t0 else "?")
+                        acc = self.__dict__.setdefault("_idle_acc", {})
+                        acc[key] = acc.get(key, 0) + delta
                     self.system.clock_ns += delta
                 for q in self.procs:
                     if q[1] is not None and q[0].sched is not None:
@@ -181,6 +188,11 @@ class ProcessManager:
             pass
         for emu, _ in self.procs:
             print(f"  [sched] {emu.path.rsplit(chr(92),1)[-1]}: {getattr(emu,'_seg_wall',0):.1f} s in {getattr(emu,'_seg_n',0)} segments", flush=True)
+        acc = self.__dict__.get("_idle_acc")
+        if acc:
+            print("  [idle] virtual time skipped while every process waited (s, process, wait, name, tid):", flush=True)
+            for k, v in sorted(acc.items(), key=lambda kv: -kv[1])[:12]:
+                print(f"    {v / 1e9:9.1f}  {k}", flush=True)
         if os.environ.get("PSEMU_SHM_DUMP"):          # PSEMU_SHM_DUMP=<name>: the first words of that shm object at exit
             import ctypes
             for name, o in getattr(self.system, "shm_objs", {}).items():

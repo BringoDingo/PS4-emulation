@@ -1303,3 +1303,24 @@ ShellCore; `sceVisionManagerInitialize` 0x802e0000; `LOST PAD DATA` (no pad sour
 * **`SceSysAvControl` is a system process of the console** (mini-syscore starts it before SceSysCore): without it SceSysCore's
   `[Syscore Umd] Timeout detected ... AV control server` also terminated the ShellUI. `--also <elf>` starts extra system
   processes in spawn mode (`--also .../SceSysAvControl.elf`).
+
+### 2026-11-20: the ShellUI's keep-alive call found
+* **The protocol.** ShellCore's watchdog (`SceShellCore+0x2f1b10`, polled from its main loop about every 100 ms of guest time)
+  *posts* the semaphore `SceLncUtilKeepAliveShellUI` (max 1). If the post succeeds, the previous token was consumed = the
+  ShellUI is alive and the timer restarts; if it fails (the token is still there) the elapsed time grows, and after 1.0 s
+  the watchdog warns ("No heart beat of Shell UI ... N msec") and, with its enable flag set, kills the ShellUI.
+* **The consumer** is `eboot.bin+0x2720` (NPXS20001's eboot), called from the ShellUI's **main thread** (return address in
+  the managed/PSM side, tid 0x10001) once per UI iteration. It calls `libSceSystemService` export `ZucoOmNsb7w`
+  (`+0x4dd0` -> `+0x77e0`), which does `sceKernelPollSema` on the keep-alive semaphore and, when it gets the token, reports
+  its status (0x1558-byte struct) to SceLncService over IPMI. The opener is export `awS+eYVuXJA` (`+0x4db0` -> `+0x7670`:
+  LncService method `0x30016`, then the semaphore), called once from the ShellUI's start-up chain (`eboot+0x26d0`).
+* **Verified** (`PSEMU_NO_TERMINATE=1` ignores the kill; `PSEMU_TRACE_SEMA=KeepAlive` logs polls/posts): the ShellUI that
+  survives does poll the semaphore alternately taken/busy at ~40-140 ms intervals and the warnings stop - the keep-alive works;
+  it just starts late. In our run the first call happens at guest time ~640 s after the spawn (the real console: within the
+  first second), i.e. the main thread's start-up is what has to get faster/unblocked, not the keep-alive code.
+* Where the time goes (`PSEMU_TRACE_IDLE=1` prints the virtual time skipped while every process waited, by wait kind):
+  mostly the audio mix event flags (`sceAudioOutMix3f1`, ~200 s of 300), kevent waits of the ShellUI (~70 s),
+  `SceVideoCoreServer` (~40 s, an IPMI event wait; the service is hosted by the ShellUI itself through
+  libSceVideoCoreServerInterface) and `SceStickerCoreServer` (~18 s). Those waits expire on timeouts instead of being answered.
+Next: find what the ShellUI's main thread is waiting for during its first seconds (its blocked state at the moment of the kill)
+and answer it.
