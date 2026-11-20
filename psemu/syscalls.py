@@ -108,6 +108,7 @@ from .sys_sync import SYNC_SYSCALLS, SyncSyscalls
 
 import os
 import struct as _struct
+_TID_COUNTS = bool(os.environ.get("PSEMU_TID_COUNTS"))
 
 # sysctls looked up by name (sysctl.name2oid). Values as the PS4 kernel
 # (FreeBSD 9 based, 8 CPU cores) reports them.
@@ -215,6 +216,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     def __init__(self, emu):
         self.emu = emu            # back-reference for memory + stdout + stop
         self.counts = {}          # number -> times called
+        self.tid_counts = {}      # (tid, number) -> times (PSEMU_TID_COUNTS=1)
         self.trace = emu.trace
         # Sony kernel-object model: hand out unique ids for created objects.
         self.children = {}          # child pid -> None (running) or its exit status (waiting to be reaped)
@@ -340,6 +342,9 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         num = uc.reg_read(UC_X86_REG_RAX)
         name = SYSCALLS.get(num, f"sys_{num}")
         self.counts[num] = self.counts.get(num, 0) + 1
+        if _TID_COUNTS:                       # PSEMU_TID_COUNTS=1: per-thread syscall histogram in the summary
+            _t = self.emu.sched.current.tid if self.emu.sched and self.emu.sched.current else 0
+            self.tid_counts[(_t, num)] = self.tid_counts.get((_t, num), 0) + 1
         if num not in WAIT_SYSCALLS:  # real progress (not another wait) resets idle detection
             self._idle_waits = 0
         handler = getattr(self, f"sys_{name}", None)
@@ -574,6 +579,13 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             f["pos"] += len(chunk)
             return self._ret(uc, len(chunk))
         # no real input source yet -> EOF
+        k = self.__dict__.setdefault("_eof_reads", {})
+        k[fd] = k.get(fd, 0) + 1
+        if k[fd] in (1, 1000):
+            tid = self.emu.sched.current.tid if self.emu.sched and self.emu.sched.current else 0
+            self.emu.log(f"  [read] fd {fd:#x} is not open: EOF (tid {tid:#x}, {k[fd]} time(s), n={n & 0xFFFFFFFF:#x})")
+        if fd > 2 and os.environ.get("PSEMU_READ_EBADF", "1") != "0":
+            return self._ret(uc, 9, error=True)        # EBADF: the descriptor is not open (the kernel's answer)
         self._ret(uc, 0)
 
     # ---- sockets -------------------------------------------------------
@@ -1369,6 +1381,71 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         except Exception:
             return self._ret(uc, EFAULT, error=True)
         self._ret(uc, 0)
+
+    def sys_mdbg_call(self, uc):
+        # mdbg_call(a, b, c, ...): the kernel's debugger-service call; not modelled (returns 0). A thread that
+        # polls it in a loop is reported once (thread, caller) so the spinning code can be found.
+        from unicorn.x86_const import UC_X86_REG_RSP
+        n = self.counts.get(573, 0)
+        if n in (2000, 200000):
+            rsp = uc.reg_read(UC_X86_REG_RSP)
+            st = _struct.unpack("<6Q", bytes(uc.mem_read(rsp, 48)))
+            tid = self.emu.sched.current.tid if self.emu.sched and self.emu.sched.current else 0
+            dyn = getattr(self.emu, "dyn", None)
+            where = []
+            for w in st:
+                m = dyn.module_at(w) if dyn is not None and hasattr(dyn, "module_at") else None
+                if m:
+                    where.append(f"{m.name}+{w - m.base:#x}")
+            self.emu.log(f"  [mdbg_call] call #{n} tid {tid:#x} args={[hex(x) for x in self._args(uc)[:6]]} stack code ptrs: {where}")
+        self._ret(uc, 0)
+
+    def sys_select(self, uc):
+        # select(nfds, readfds, writefds, exceptfds, timeout): no fd is modelled as becoming readable yet
+        # except devices/sockets exposing ready(); with nothing ready the thread sleeps on the virtual clock
+        # for the timeout (a NULL timeout sleeps one second) and the sets come back empty - unmodelled it
+        # returned at once and a select()-as-sleep loop (SceSysCore) burned the whole CPU budget.
+        import struct
+        nfds, rd, wr, ex, tv = self._args(uc)[:5]
+        nfds &= 0xFFFFFFFF
+        ns = 1_000_000_000
+        if tv:
+            try:
+                sec, usec = struct.unpack("<qq", bytes(uc.mem_read(tv, 16)))
+                ns = max(0, sec) * 1_000_000_000 + max(0, usec) * 1000
+            except Exception:
+                ns = 0
+        nbytes = (min(nfds, 1024) + 7) // 8
+        ready = []
+        if rd and nbytes:
+            try:
+                bits = bytes(uc.mem_read(rd, nbytes))
+            except Exception:
+                return self._ret(uc, EFAULT, error=True)
+            for fd in range(min(nfds, 1024)):
+                if bits[fd >> 3] >> (fd & 7) & 1:
+                    dev = self.devs.get(fd)
+                    if dev is not None and hasattr(dev, "ready") and dev.ready():
+                        ready.append(fd)
+            if self.counts.get(93, 0) <= 3:
+                self.emu.log(f"  [select] nfds={nfds} read={[f for f in range(min(nfds,1024)) if bits[f >> 3] >> (f & 7) & 1]} "
+                             f"timeout={ns / 1e9:g}s ready={ready}")
+        if ready:
+            out = bytearray(nbytes)
+            for fd in ready:
+                out[fd >> 3] |= 1 << (fd & 7)
+            uc.mem_write(rd, bytes(out))
+            for p_ in (wr, ex):
+                if p_ and nbytes:
+                    uc.mem_write(p_, bytes(nbytes))
+            return self._ret(uc, len(ready))
+        for p_ in (rd, wr, ex):
+            if p_ and nbytes:
+                uc.mem_write(p_, bytes(nbytes))
+        self._ret(uc, 0)
+        sched = self.emu.sched
+        if sched is not None and ns:
+            sched.block({"kind": "sleep", "ns": ns}, deadline_ns=sched.now_ns() + ns, timeout_ret=(0, False))
 
     def sys_nanosleep(self, uc):
         # nanosleep(const timespec *rqtp, timespec *rmtp): sleep on the
@@ -2905,6 +2982,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         for num in sorted(self.counts):
             name = SYSCALLS.get(num, f"sys_{num}")
             lines.append(f"  {num:>4} {name:<18} x{self.counts[num]}")
+        if self.tid_counts:
+            for tid in sorted({t for t, _ in self.tid_counts}):
+                top = sorted(((n, c) for (t, n), c in self.tid_counts.items() if t == tid), key=lambda x: -x[1])[:4]
+                if top and top[0][1] > 2000:
+                    lines.append(f"  tid {tid:#x}: " + ", ".join(f"{SYSCALLS.get(n, n)} x{c}" for n, c in top))
         sync = self.sync_summary()
         if sync:
             lines.append(sync)

@@ -1244,3 +1244,18 @@ elements) - find which row the parse writes the module elements into and why the
   NOTE_EXIT for ShellCore's pid is gone); `debug.tentativeppid` sysctl added (the "sysctlbyname: failed -1" is gone).
 * The /dev/mbus event device and the registry investigation (end 10..12) were not needed for this; they stay as
   groundwork.
+
+### 2026-11-19 (end 14): what was eating the CPU after the ShellUI got through (SceSysCore spun at 80 %)
+With the spawned ShellUI past `initializeSystemAfterPsm`, SceSysCore itself used 80 of 100 wall-seconds (the ShellUI got 9).
+Three causes, all unmodelled kernel behaviour, fixed:
+* `select(2)` was a stub that returned 0 at once: SceSysCore's main loop uses `select(nfds, &rfds, 0, 0, &tv)` as a
+  timer. Now a real `sys_select`: ready fds (devices with `ready()`), otherwise sleep for the timeout on the virtual clock.
+* `/dev/deci_*` (the debug-console pipes) and `/dev/metadbg` (the meta-debugger event stream) were opened as plain
+  files; their reader threads got EOF forever. They are now blocking event devices (a read blocks, like
+  `/dev/notification*`).
+* `read()` on a descriptor that is not open returned 0 (EOF); the kernel answers EBADF. A SceSysCore thread
+  polling `{mdbg_call; read(garbage fd, 8)}` spun 480k times (`PSEMU_READ_EBADF=0` restores EOF). `mdbg_call` itself
+  is still a stub that returns 0; it reports the calling thread once when it is hammered (call #2000).
+New debug aids: `PSEMU_TID_COUNTS=1` (per-thread syscall histogram for threads above 2000 calls in the summary).
+Effect: SceSysCore 80 s -> 18 s of a 120 s run, the ShellUI 9 s -> 41 s; it now loads `BlankScene` and
+`TransitionScene` (`UISystem` initialised). Single-process chain unchanged (9000 command buffers, 0 failed).

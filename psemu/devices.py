@@ -915,7 +915,7 @@ class EventDevice(Device):
 
 
 def open_device(sc, path):
-    if path.startswith("/dev/notification"):
+    if path.startswith(("/dev/notification", "/dev/deci_", "/dev/metadbg")):   # deci_*: the debug console pipes SceSysCore drains
         return EventDevice(sc, path)
     if path.startswith("/dev/da") and path[7:8].isdigit():
         return BlockDevice(sc, path)
