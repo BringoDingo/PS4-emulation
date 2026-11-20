@@ -107,7 +107,7 @@ class ProcessManager:
             elif getattr(p[0], "parent", None) is not None and not getattr(p[0], "_exit_told", False):
                 p[0]._exit_told = True           # a child process finished: its parent's proc watch fires
                 parent = p[0].parent
-                parent.syscalls.proc_event(parent.syscalls.NOTE_EXIT, 0)
+                parent.syscalls.proc_event(parent.syscalls.NOTE_EXIT, 0, getattr(p[0], "child_pid", 0))
                 parent.syscalls.child_done(getattr(p[0], "child_pid", 0), 0)
         for p in self.procs:                    # one wall-clock budget for the whole machine
             ms = p[0].max_seconds

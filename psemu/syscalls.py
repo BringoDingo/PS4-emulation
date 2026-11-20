@@ -132,6 +132,9 @@ NAMED_SYSCTLS = {
     # name made ShellCore abort its init ("*CRITICAL ERROR* Failed to initialize DataTransfer") and shut down.
     # 0 = the console is not in backup/restore mode.
     "kern.backup_restore_mode": _struct.pack("<i", 0),
+    # SceSysCore's spawn path (sysctlbyname) asks for the pid the kernel reserved for the process about to be
+    # forked ("[SceSysCore] sysctlbyname: failed -1" without it); 0 = none reserved.
+    "debug.tentativeppid": _struct.pack("<i", 0),
     # The ShellUI's initializeSystemAfterPsm reads both (the shell's own init failed with 0x80f61308 when they were
     # missing): the current manufacturing mode (0 = a normal retail unit) and the console IDPS (16 bytes; a fixed
     # dummy value, not any real console's).
@@ -1431,13 +1434,15 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         waiters.append((sched.current, status_ptr))
         sched.block({"kind": "wait4"})
 
-    def proc_event(self, fflags, data=0):
-        """Raise an EVFILT_PROC event (a child exec'd / exited) on every proc watch of this process."""
+    def proc_event(self, fflags, data=0, pid=None):
+        """Raise an EVFILT_PROC event (a child exec'd / exited) on the proc watches of `pid` (the watch's ident is
+        the watched pid); pid None/0 = every watch (a child whose pid is unknown)."""
+        pid = pid or None
         for notes in self.knotes.values():
-            for (_ident, filt), kn in notes.items():
-                if filt == -5:
+            for (ident, filt), kn in notes.items():
+                if filt == -5 and (pid is None or ident == pid):
                     kn["fflags"] = fflags
-        self.trigger(-5, None, data)
+        self.trigger(-5, pid, data)
 
     def _app0_root(self, path):
         """The host directory behind '/app0' for a spawned app: the application's own directory, from the
@@ -1494,7 +1499,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 # execve fails (ENOENT) in the child, which then exits: the parent sees NOTE_EXIT
                 self.emu.log(f"  [execve] spawn '{path}': not found under {self.emu.fw_root} "
                              f"-> the child exits")
-                self.proc_event(self.NOTE_EXIT, 1 << 8)
+                self.proc_event(self.NOTE_EXIT, 1 << 8, getattr(cur, "child_pid", 0))
                 self.child_done(getattr(cur, "child_pid", 0), 1 << 8)
             else:
                 self.emu.log(f"  [execve] spawn '{path}' -> new process")
@@ -1504,7 +1509,7 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                     child.app_id = ipk.last_app_id        # what SceSysCore's AppMgr allocated for it
                 self.emu.log(f"  [execve]   -> {resolved}")
                 child.child_pid = getattr(cur, "child_pid", 0)
-                self.proc_event(self.NOTE_EXEC, 0)
+                self.proc_event(self.NOTE_EXEC, 0, getattr(cur, "child_pid", 0))
             sched.exit_current()
             return
         if cur is not None and getattr(cur, "spawn_child", False) and mode not in (None, "follow"):
