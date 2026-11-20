@@ -28,6 +28,9 @@ class System:
         self.evfs = {}            # name -> sys_sync.EventFlag
         self.sems = {}            # name -> sys_sync.Semaphore
         self.mounts = {}          # nmount fspath -> its name/value pairs
+        self.vfs = {}             # the writable file layer (guest path -> contents) every process sees
+        self.vdirs = {"/sqlite"}  # directories the guests created
+        self.vgone = set()        # firmware paths a guest deleted
         self.shm_objs = {}        # shm_open name -> object (size, shared host pages): one namespace per machine
         self.appinfo = {}         # pid -> the 0x48-byte AppInfo set through sysctl kern.proc.appinfo.<pid>
         self.clock_ns = 0         # virtual time skipped while everything slept (shared: one clock per machine)

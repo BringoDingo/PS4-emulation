@@ -1387,3 +1387,15 @@ init / user-login sequence), and whether the managed side's wait is for that reg
 Next: (1) make the virtual file system machine-wide; (2) give the console its first user through the real path - either seed
 a `user_list.dat` + `/user/home/<id>` in the format ShellCore writes, or find what makes ShellCore accept the creation
 request - and check that the ShellUI's main thread then gets past the Mono wait.
+
+### 2026-11-20 (end 5): the writable file layer is machine-wide - the ShellUI gets to its first real scene
+* `SyscallDispatcher.vfs / vdirs / vgone` (files and directories the guests create, change or delete) now live on `System` when
+  several processes run (properties; a lone process keeps its own). ShellCore and the ShellUI therefore see the same
+  `/system_data/priv/home/user_list.dat`, `/user/home/<id>/...`, databases and flags.
+* Result (guest clock 100x slow, `PSEMU_TIME_SCALE=0.01`, 100 s wall): no watchdog warning at all any more, and the ShellUI shows
+  its **DbRecoveryScene** (`DbRecoveryCheckRequest() = 0 : FirstBoot = True`, `DbRecoveryProgressPanel`, then
+  `OnFocusActiveSceneChanged [TopMenuBG] -> [DbRecoveryScene]`, `Scene [DbRecoveryScene : Scene] : Alive`); user id
+  `0x10000001` appears (`/user/home/10000001/topmenu/conf`). At the normal clock it is still killed after ~1 s of guest time
+  (speed).
+Open: the "DbCorruptionOccured 0x809c112c //priv/mms/notification.db" message of the recovery scene (the notification db is
+created per process from a seed), and what the first-boot recovery/preparation does next.

@@ -241,11 +241,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         # Writable file layer: guest path -> contents. Firmware files are copied
         # in on first open, so writes never touch the dump on disk; files the
         # guest creates (databases, journals, flags) live here for the run.
-        self.vfs = {}
+        self._vfs_local = {}
         # the SQLite temp-file directory (osStat("//sqlite") in the engine's orbis VFS) exists on a
         # console; without it the managed SQLite layer logs orbisTempFileDir ERROR at every open
-        self.vdirs = {"/sqlite"}  # directories the guest created (plus system dirs that must exist)
-        self.vgone = set()        # firmware paths the guest deleted
+        self._vdirs_local = {"/sqlite"}  # directories the guest created (plus system dirs that must exist)
+        self._vgone_local = set()        # firmware paths the guest deleted
         self.dirfds = set()       # fds opened on a directory
         self._cil_cache = {}      # .dll path -> CIL bytes extracted from .dll.sprx
         self.shms = {}            # fd -> shared-memory object (shm_open)
@@ -2123,6 +2123,24 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     # another system process would have created (opened here without O_CREAT)
     # get a one-page stand-in, like external event flags and semaphores.
     SHM_DEFAULT_SIZE = 0x1000
+
+    # The file system is the console's: with several processes the files one creates or changes (user_list.dat, the
+    # app database, save data...) are what the others read, so the writable layer lives on System; a lone process keeps
+    # its own.
+    @property
+    def vfs(self):
+        sysm = getattr(self.emu, "system", None)
+        return sysm.vfs if sysm is not None else self._vfs_local
+
+    @property
+    def vdirs(self):
+        sysm = getattr(self.emu, "system", None)
+        return sysm.vdirs if sysm is not None else self._vdirs_local
+
+    @property
+    def vgone(self):
+        sysm = getattr(self.emu, "system", None)
+        return sysm.vgone if sysm is not None else self._vgone_local
 
     @property
     def shm_objs(self):
