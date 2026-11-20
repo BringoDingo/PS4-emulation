@@ -1103,3 +1103,23 @@ Open: how `0x54c80` maps (kind 2, module `0x107`) to group `0x800`, and which re
 that group (the ShellUI sends none; either its registration depends on an answer psemu gave differently - e.g. the
 48-byte `0xce110029` / `0xce110028` outputs, all zero - or group `0x800` entries are created by SceSysCore itself when
 it spawns the app). Next step: trace `0x54c80`, `0x565a0`, `0x55fc0`, `0x558e0` and the `0x48a30` switch.
+
+### 2026-11-19 (end 7): the Mbus lookup miss decoded to the entry level
+(`PSEMU_TRACE_FUNCS` now also takes `PSEMU_TRACE_MEM="rdi:56,rsi:56"` to dump memory behind argument registers;
+`PSEMU_IPMI_TRACE=4` dumps SceMbusIpc's process table when `0xce11000d` is answered.)
+* SceMbusIpc keeps a process table (singleton, 0x30 entries x 0x20: `{valid, appId, pid, ...}`): entry 0 = app
+  `0x60000100` (ShellCore) with pid `0x3ed`?, entry 1 = app `0x60000201` (the ShellUI) with pid `0x3ef`. (ShellCore's
+  entry carrying `0x3ed`, the compositor's pid, rather than `0x3ee` is itself suspicious and not explained yet.)
+* The failing call reaches `ProcessMediaInfo::setModuleStateIndex` (`SceSysCore+0x760a0`) -> `0x79890`, a linear search of
+  the group's entries (stride 0x38) with the key compare at `0x59c10`: equal when pid is equal and `(module & 0xffff00ff)`
+  (negative -> -1) is equal. The lookup key is `(pid 0x3ef, module 0x107)`; the entry the registration created for
+  pid `0x3ef` has module **0**. The registration (`0xce110007` -> `0x7dfe0` -> `0x48a30`) builds its key with
+  `0x59b80(out, pid, module=0, ...)` in both calls (records `{1, 0x20000007, 0xff, 0|1, ...}`): module slots 0 and 1, never 7.
+* `0x48a30` first reads `sysctl [1,14,0x24,pid]` (libkernel_sys `8BrtU9maWG4`, 8 bytes out: the process's SDK version;
+  its fallback on failure is `0x2500000`). psemu answered that mib with the generic 4-byte `1000`; it now serves
+  `kern.proc.sdk_version.<pid>` = 5.05 (`0x05050001`). That did not change the outcome, so the module-0 key is not (only)
+  a consequence of the wrong SDK answer.
+Open: why the registration's module index is 0/1 where the lookup wants 7: either the client's record layout is read
+differently by SceSysCore (the layout may depend on a process attribute psemu still answers wrongly, e.g. the AppInfo
+fields after the app id, which SceSysCore itself sets), or entry creation for module 7 happens elsewhere (process
+creation `0xce11002a`, `0x79640` per module group).

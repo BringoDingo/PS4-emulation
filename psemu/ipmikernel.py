@@ -335,6 +335,18 @@ class IpmiKernel:
         pend = sess.pending.pop(token, None)
         if pend is None:
             return False
+        if sess.server.name == "SceMbusIpc" and os.environ.get("PSEMU_IPMI_TRACE") == "4" and pend["method"] == 0xce11000d:
+            try:
+                obj = struct.unpack("<Q", bytes(uc.mem_read(0x1005ceb50, 8)))[0]
+                arr = struct.unpack("<Q", bytes(uc.mem_read(obj, 8)))[0]
+                raw = bytes(uc.mem_read(arr, 0x30 * 0x20))
+                rows = [struct.unpack_from("<8I", raw, i * 0x20) for i in range(0x30)]
+                self.log(f"  [ipmi-k] Mbus module table obj {obj:#x} array {arr:#x}")
+                for i, r in enumerate(rows):
+                    if any(r):
+                        self.log(f"    [{i:2}] " + " ".join(f"{x:08x}" for x in r))
+            except Exception as e:
+                self.log(f"  [ipmi-k] Mbus table unreadable: {e}")
         res = 0
         try:
             raw = bytes(uc.mem_read(in_ptr, 0x18))

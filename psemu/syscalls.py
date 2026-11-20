@@ -2836,6 +2836,14 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
             give(NAMED_SYSCTLS[sname])
             return
 
+        if tuple(mib[:3]) == (1, 14, 36):
+            # kern.proc.sdk_version.<pid> (libkernel_sys 0x1a370, 8 bytes out): the system software version the
+            # process was built for. SceSysCore reads it when it registers a process with SceMbusIpc and picks the
+            # registration layout from it; the generic (1, 14) answer (a 4-byte 1000) selected the wrong one.
+            self.emu.log(f"  [sysctl] kern.proc.sdk_version.{mib[3] if len(mib) > 3 else '?'} -> 5.05")
+            give(_struct.pack("<II", 0x05050001, 0))
+            return
+
         if tuple(mib[:3]) == (1, 14, 35):
             # kern.proc.appinfo.<pid> (sceKernelGetAppInfo): the 0x48-byte AppInfo, app id first. SceSysCore's
             # process spawn SETS it (newp = the new process's AppInfo, the app id its AppMgr allocated); a read

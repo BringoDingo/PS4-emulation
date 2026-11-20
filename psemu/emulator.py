@@ -945,6 +945,14 @@ class Emulator:
                 tid = emu.sched.current.tid if emu.sched and emu.sched.current else 0
                 emu.log(f"  [trace {label}] tid {tid:#x} args " + " ".join(f"{x:#x}" for x in a)
                         + " stack " + " ".join(f"{x:#x}" for x in st))
+                for spec in os.environ.get("PSEMU_TRACE_MEM", "").split(","):
+                    # "rdi:56": also dump that many bytes at the pointer in that argument register
+                    try:
+                        rn, n = spec.split(":")
+                        ptr = a[("rdi", "rsi", "rdx", "rcx", "r8", "r9").index(rn)]
+                        emu.log(f"      {rn}={ptr:#x}: " + bytes(uc.mem_read(ptr, int(n, 0))).hex())
+                    except Exception:
+                        pass
 
             self.hle.register(lm.base + addr, trace, name="trace:" + item.strip(), mode="fixup")
             self.log(f"  [trace] hooked {item.strip()} at {lm.base + addr:#x}")
