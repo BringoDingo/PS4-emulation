@@ -24,6 +24,9 @@ from unicorn.x86_const import (UC_X86_REG_RAX, UC_X86_REG_RDI, UC_X86_REG_RSP,
                                UC_X86_REG_GS_BASE, UC_X86_REG_RBP)
 
 READY, RUNNING, BLOCKED, EXITED = "ready", "running", "blocked", "exited"
+import os as _os
+_tb = _os.environ.get("PSEMU_TRACE_BLOCK", "")
+_TRACE_BLOCK = (_tb.rsplit(":", 1)[0], int(_tb.rsplit(":", 1)[1], 0)) if ":" in _tb else None
 
 
 class Thread:
@@ -148,15 +151,48 @@ class Scheduler:
     def block(self, what, deadline_ns=None, timeout_ret=None):
         """Block the running thread (called from inside a syscall handler)."""
         t = self.current
+        if _TRACE_BLOCK and _TRACE_BLOCK[0] in self.emu.path and (t.tid == _TRACE_BLOCK[1] or _TRACE_BLOCK[1] < 0):
+            self._trace_block(t, what, deadline_ns)
         t.state = BLOCKED
+        t._blocked_at = self.now_ns()
         t.wait = what
         t.deadline = deadline_ns
         t.timeout_ret = timeout_ret
         self.request_switch()
 
+    def _trace_block(self, t, what, deadline_ns):
+        """PSEMU_TRACE_BLOCK=<process substring>:<tid>: log every time that thread blocks - what it waits for, for how
+        long, and the code addresses on its stack (who called)."""
+        try:
+            import struct as _s
+            from unicorn.x86_const import UC_X86_REG_RSP
+            uc = self.emu.uc
+            rsp = uc.reg_read(UC_X86_REG_RSP)
+            words = _s.unpack("<64Q", bytes(uc.mem_read(rsp, 512)))
+            dyn = getattr(self.emu, "dyn", None)
+            where = []
+            for w in words:
+                m = dyn.module_at(w) if dyn is not None and 0x10000 < w < 0x7fffffffffff else None
+                if m:
+                    where.append(f"{m.name}+{w - m.base:#x}")
+                if len(where) >= 6:
+                    break
+            kind = what.get("kind") if isinstance(what, dict) else what
+            nm = (what.get("name") or what.get("addr") or "") if isinstance(what, dict) else ""
+            dl = "" if deadline_ns is None else f" timeout {(deadline_ns - self.now_ns()) / 1e6:.0f}ms"
+            self.emu.log(f"  [block] vt {self.now_ns() / 1e9:.3f}s tid {t.tid:#x} waits {kind} {nm if not isinstance(nm, int) else hex(nm)}{dl}  <- " + " ".join(where))
+        except Exception as e:
+            self.emu.log(f"  [block] trace failed: {e!r}")
+
     def wake(self, t, value=0, error=False):
         if t.state != BLOCKED:
             return False
+        if _TRACE_BLOCK and _TRACE_BLOCK[0] in self.emu.path and (t.tid == _TRACE_BLOCK[1] or _TRACE_BLOCK[1] < 0):
+            held = (self.now_ns() - getattr(t, "_blocked_at", 0)) / 1e9
+            if held > 1.0:                                # a long wait ended: say by whom
+                k = t.wait.get("kind") if isinstance(t.wait, dict) else t.wait
+                by = "timeout/expiry" if getattr(self, "_expiring", False) else f"tid {self.current.tid:#x}" if self.current else "?"
+                self.emu.log(f"  [block] vt {self.now_ns() / 1e9:.3f}s tid {t.tid:#x} woke from {k} after {held:.1f}s by {by}")
         t.state = READY
         t.wait = None
         t.deadline = None
@@ -244,6 +280,7 @@ class Scheduler:
     def expire_timeouts(self):
         """Wake every blocked thread whose deadline has passed."""
         now = self.now_ns()
+        self._expiring = True
         for t in self.threads.values():
             if t.state == BLOCKED and t.deadline is not None and t.deadline <= now:
                 on_timeout = t.wait.get("on_timeout") if isinstance(t.wait, dict) else None
@@ -251,6 +288,7 @@ class Scheduler:
                     on_timeout(t)             # may set t.timeout_ret (e.g. events delivered)
                 ret = t.timeout_ret or (0, False)
                 self.wake(t, *ret)
+        self._expiring = False
 
     def next_deadline(self):
         d = [t.deadline for t in self.threads.values() if t.state == BLOCKED and t.deadline is not None]

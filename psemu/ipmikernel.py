@@ -84,6 +84,13 @@ class IpmiKernel:
             return False
         return name in self.servers and (self.routed is None or name in self.routed)
 
+    @staticmethod
+    def _vt(emu):
+        try:
+            return "%.3f" % (emu.sched.now_ns() / 1e9)
+        except Exception:
+            return "?"
+
     def _once(self, key, msg):
         if key not in self.unknown:
             self.unknown.add(key)
@@ -268,7 +275,7 @@ class IpmiKernel:
                 self.log("  [ipmi-k]   client stack: " + " ".join(ch[:40]))
             except Exception as e:
                 self.log(f"  [ipmi-k]   no stack: {e}")
-        self.log(f"  [ipmi-k] sync {name}.{method:#x} in={[x[:40].hex() if len(x) <= 40 else len(x) for x in ins]} out={[o[1] for o in outs]} flags {a[0x28:0x30].hex()} token {token}")
+        self.log(f"  [ipmi-k] vt {self._vt(emu)}s sync {name}.{method:#x} in={[x[:40].hex() if len(x) <= 40 else len(x) for x in ins]} out={[o[1] for o in outs]} flags {a[0x28:0x30].hex()} token {token}")
         emu.sched.block({"kind": "ipmi_invoke", "name": name, "method": method})
         return False
 
@@ -380,7 +387,7 @@ class IpmiKernel:
                     pend["emu"].uc.mem_write(info + 16, struct.pack("<Q", ln))
                     if trace:
                         self.log(f"  [ipmi-k]   out[{i}] copied {ln} bytes; client length now {ln}; data {bytes(uc.mem_read(sp, min(ln, 32))).hex()}")
-            self.log(f"  [ipmi-k] reply to {sess.server.name}.{pend['method']:#x}: result {res:#x}, {cnt} output(s)")
+            self.log(f"  [ipmi-k] vt {self._vt(emu)}s reply to {sess.server.name}.{pend['method']:#x}: result {res:#x}, {cnt} output(s)")
         except Exception as e:
             self.log(f"  [ipmi-k] reply (unreadable: {e})")
         pend["res"] = res

@@ -1324,3 +1324,27 @@ ShellCore; `sceVisionManagerInitialize` 0x802e0000; `LOST PAD DATA` (no pad sour
   libSceVideoCoreServerInterface) and `SceStickerCoreServer` (~18 s). Those waits expire on timeouts instead of being answered.
 Next: find what the ShellUI's main thread is waiting for during its first seconds (its blocked state at the moment of the kill)
 and answer it.
+
+### 2026-11-20 (end 2): the block in the ShellUI's start-up - the compositor frame wait
+* **Where the main thread stood** (`PSEMU_TRACE_BLOCK=eboot:0x10001` logs every block of a thread with its call stack and
+  timeout; long waits report who ended them). At the moment ShellCore's watchdog fires, the ShellUI main thread is not blocked
+  on a missing answer: it is in a native loop (`eboot+0xac3b0`) that does `usleep(1000)` until the compositor posts an event.
+  It polls `libSceComposite` export `9M7HkbwUs-E` (+0x29c0): test-and-clear of bit *n* of the u32 at **control block +0x1c**
+  (the shared `/SceCompositorControl` page; the server sets the bits). While it polls it never returns to the managed UI tick
+  (`platform.dll+0x6dadb`) that calls the keep-alive, so the heartbeat stops. Every 1 ms sleep with nothing else runnable also
+  advances the idle-skipped guest clock by 1 ms, so the 1 s watchdog window passes in 1000 polls.
+* **The stand-in compositor did not answer it.** The ring commands `libSceComposite` queues are served by
+  `GnmCompositorServer` (unixsock.py) on the ShellUI's vblank waits. Two fixes:
+  - `0x13` (queued by `+0x15a0`, `(n << 8) | 0x13`): "sync event n" - the bit is set when the ring reaches it (in-order ring).
+  - `Flip` (`0x14`) now also sets bit 1 (the frame wait polls bit 1): `PSEMU_FLIP_BIT1=0` turns this off.
+  With bit 1 on every flip the main loop leaves the wait, the keep-alive polls run every ~100 ms (taken each time ShellCore
+  posts), 113 flips go through and the ShellUI mounts its theme ("Mount finished [ANONYMOUS]").
+* **A regression of my own shm change, fixed:** `GnmCompositorServer._locate` took the control block's address from the shm
+  object's `addr`, which since the machine-wide shm is the *last mapper's* address (GnmCompositor's, not the ShellUI's) - the
+  stand-in then read the ring at an address that is not mapped in the ShellUI, so the ring was never served in spawn runs.
+  It now uses this process's own mapping (`shm_maps`). `PSEMU_COMP_LOG=<n>` raises the ring log limit (default 40).
+* **Time dilation is still needed** to fit the first second: `PSEMU_TIME_SCALE=0.01` (guest clock 100x slower than the wall
+  clock) makes the first keep-alive arrive inside the watchdog window (vt 0.4 s); at 1.0 the emulated ShellUI needs ~40 s of wall
+  time for what the console does in ~1 s.
+* **Next stall** (still killed at ~1.0 s of guest time): right after "Mount finished" the main thread blocks in an IPMI call to
+  `SceUserService` (from `libSceUserService`, via `app.exe.sprx`), then in a Mono `sem_wait`; the keep-alive stops again.

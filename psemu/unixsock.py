@@ -217,7 +217,7 @@ class CompositorRing:
         self.server = server
         self.read = 1                 # next slot to consume
         self.count = {}               # command -> times seen
-        self.log_left = 40            # keep the log readable
+        self.log_left = int(os.environ.get("PSEMU_COMP_LOG", "40"))   # keep the log readable
         self.failed = False
         self.frames = 0
 
@@ -226,9 +226,10 @@ class CompositorRing:
         obj = sc.shm_objs.get("/SceCompositorControl")
         dyn = sc.emu.dyn
         lm = dyn.by_name("libSceComposite") if dyn else None
-        if not obj or not obj.get("addr") or lm is None:
+        mine = sc.shm_maps.get(id(obj)) if obj else None      # where THIS process mapped the (machine-wide) object
+        if not obj or mine is None or lm is None:
             return None
-        return obj["addr"], lm.base + self.CLIENT_GLOBALS + self.CLIENT_WIDX
+        return mine[0], lm.base + self.CLIENT_GLOBALS + self.CLIENT_WIDX
 
     # Fields the real compositor server publishes in the shared control block for
     # its clients. libSceComposite+0x2d20 is `int get(u64 *out)` returning the u64
@@ -236,6 +237,7 @@ class CompositorRing:
     # divides by it (an unpublished 0 faults with #DE in `div`). It is the GPU
     # timestamp frequency; the exact units are not confirmed, a nonzero tick rate
     # is what the divisions need.
+    CTRL_EVENT_BITS = 0x1C
     CTRL_TIMESTAMP_FREQ = 0x10
     GPU_TIMESTAMP_FREQ = 100_000_000
 
@@ -292,10 +294,21 @@ class CompositorRing:
         elif cmd == 0x14:
             self.frames += 1
             detail = f"Flip (frame {self.frames})"
+            if os.environ.get("PSEMU_FLIP_BIT1", "1") != "0":          # the client's frame wait polls bit 1 of control+0x1c (libSceComposite+0x29c0) and ends when a flip was processed
+                cur = struct.unpack("<I", bytes(uc.mem_read(ctrl + self.CTRL_EVENT_BITS, 4)))[0]
+                uc.mem_write(ctrl + self.CTRL_EVENT_BITS, struct.pack("<I", cur | 2))
             # the pixel stats only feed this log line (capped) and the frame dumps: read the
             # 8 MB target only when one of them will actually use it
             if self.log_left > 0 or self._frame_due():
                 detail += self._present()
+        elif cmd == 0x13:
+            # libSceComposite+0x15a0 queues it, then the client polls bit `operand` of the u32 at control+0x1c
+            # (libSceComposite+0x29c0: test-and-clear) with a 1 ms sleep between tries. The server sets the bit once
+            # the commands before it have run: the ring is consumed in order, so that is now.
+            bit = operand & 0x1F
+            cur = struct.unpack("<I", bytes(uc.mem_read(ctrl + self.CTRL_EVENT_BITS, 4)))[0]
+            uc.mem_write(ctrl + self.CTRL_EVENT_BITS, struct.pack("<I", cur | (1 << bit)))
+            detail = f"SyncEvent({bit}): bit set at control+{self.CTRL_EVENT_BITS:#x}"
         elif cmd == 0x15:
             detail = f"PostEvent({operand & 0xF})"
             self._post_event(uc, operand & 0xF)
