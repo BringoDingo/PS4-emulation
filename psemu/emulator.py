@@ -1002,6 +1002,8 @@ class Emulator:
         cand = os.path.join(self.fw_root, name)
         if os.path.isfile(cand):
             return cand
+        if name.startswith(("system/vsh/app/", "system_ex/app/")) and os.environ.get("PSEMU_EXACT_APP_PATHS", "1") != "0":
+            return None             # an app directory is looked up exactly: the console has no such file there
         base = os.path.basename(name)
         # basename index of the firmware tree, built once (first hit in walk order
         # wins, as before); falls back to a case-insensitive match because the

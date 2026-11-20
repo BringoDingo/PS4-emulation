@@ -1224,3 +1224,23 @@ position, length and first bytes.)
 Next: follow `0x57800`/`0x578e0`/`0x57120`/`0x57980` for the app-type-5 row: which element is written into the list
 that `0x57980` later copies (it reads u32 +0 of stride-0x18 nodes at `[row+8]`, the parse writes stride-0x10
 elements) - find which row the parse writes the module elements into and why the type-5 row stays empty.
+
+### 2026-11-19 (end 13): ROOT CAUSE of the Mbus `0xce11000d` failure - ShellCore saw NPXS20001 as a DAEMON
+* `app_info.dat` is a table of app kinds (verified by parsing it with the reader's own grammar down to the last
+  byte): kind 5 (ShellUI) has modules 0x100..0x107, so a ShellUI process gets `{pid, 0x107}` - **if** SceSysCore's
+  app type for it is SHELL_UI (5). Ours was 2 (DAEMON): row 2's modules are {0}, hence `{pid, 0}` entries and
+  "not registered pid(0x3f0:0x7)".
+* Why DAEMON: ShellCore opened `/system/vsh/app/NPXS20001/sce_sys/param.sfo`, which does not exist in the 5.05 dump
+  (the app lives in `system_ex/app/NPXS20001`), but `Emulator.resolve_path` fell back to a basename search and
+  returned the system_ex file. A real kernel answers ENOENT, ShellCore then uses `/system_ex/app/...` and classifies the
+  app as SCE_LNC_APP_TYPE_SHELL_UI. Fix: app directories (`system/vsh/app/`, `system_ex/app/`) are looked up
+  exactly (no basename fallback); `PSEMU_EXACT_APP_PATHS=0` restores the old behaviour.
+* Result: `[SceLncService] appType={SCE_LNC_APP_TYPE_SHELL_UI}`, `appParam: appType = 0x5`, `fullPath =
+  /system_ex/app/NPXS20001/eboot.bin`, processSpawn flags `1, 1, 1` as in the real log. `0xce11000d` succeeds,
+  `initializeSystemAfterPsm` passes, the ShellUI initialises its UI system (UISystem timer, RenderingSettings
+  1920x1080, PGraphicsDevice, compositor index 0, SystemSound, SoundScriptManager) and runs its pad loop
+  (`LOST PAD DATA` messages). Single-process regression chain: no change (8500 command buffers, 0 failed).
+* Also in this stretch: EVFILT_PROC events now only reach the watch of the pid that exited/exec'd (the false
+  NOTE_EXIT for ShellCore's pid is gone); `debug.tentativeppid` sysctl added (the "sysctlbyname: failed -1" is gone).
+* The /dev/mbus event device and the registry investigation (end 10..12) were not needed for this; they stay as
+  groundwork.
