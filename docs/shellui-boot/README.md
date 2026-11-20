@@ -1123,3 +1123,24 @@ Open: why the registration's module index is 0/1 where the lookup wants 7: eithe
 differently by SceSysCore (the layout may depend on a process attribute psemu still answers wrongly, e.g. the AppInfo
 fields after the app id, which SceSysCore itself sets), or entry creation for module 7 happens elsewhere (process
 creation `0xce11002a`, `0x79640` per module group).
+
+### 2026-11-19 (end 8): the module-0 registration key is a search key, the real gap is the module entry
+(`PSEMU_TRACE_MEM` now takes `rdi.0x10:N`: dump N bytes at the qword stored at `[rdi+0x10]`.)
+* Correction to end 7: `0x48a30` builds its key with `xor edx,edx; call 0x59b80`, so module 0 in the registration
+  key is only a *search* key for the process entry; it says nothing about the module the entry should have.
+* SceMbusIpc keeps 17 group objects (`0x2000124 8a0`, stride 0xae0; `[g]` = capacity 0x30, `[g+0x10]` = entry array,
+  entry = 0x38 bytes `{u32 pid, u32 module, ...}`, free entry = pid/module -1). For ShellUI's pid the entries in the
+  groups used by `0xce11000d` (group 0 for kind 1, group 9 for kind 2) are `{pid, module 0}`, byte-identical to
+  ShellCore's. The lookup key `{pid, 0x107}` (compare masks `& 0xffff00ff`) can never equal them.
+* Call order at SceSysCore (ShellUI): `0xce110007` x2 (record 0x20000007 / 0x20010008; handled while the
+  Mbus init flag `0x5ceb2c` is still 0, so `0x48a30` takes its fallback path `0x5e420`, not the group tables) ->
+  `0xce11002a` (process add) -> `0xce110028` x5 -> `0xce11003b` (handler `0x80350`, this is what lazily initialises
+  Mbus: `0x47ac0` -> `0x71bf0`, flag := 1) -> `0xce11002f {0x20000, pid}` (handler `0x7fa00`, permission check then
+  `0x51de0`, which only enables group `0x20000` globally) -> `0xce11000d {kind, 0x107, 0, pid}` -> `0x809b00ff`.
+* So the group entry for module 7 has to be created between the registrations and `0xce11000d`; nothing on that
+  path calls the entry-add functions (`0x799f0`, `0x75fe0`). Either the registration with the flag at 0 is supposed
+  to land in the group tables (the init order differs from the real console: on hardware Mbus is probably
+  initialised before any client registers, e.g. by a method ShellCore calls that psemu's ShellCore never reaches) or
+  `0xce11002a` should have produced module entries from process data psemu answers differently.
+Next: find what initialises Mbus on the real boot (writers of `0x5ceb2c`: only the lazy sites `0x462a4`, `0x46fc6`,
+`0x47b09`, `0x49444`) and check whether ShellCore's own startup reaches one of those before the ShellUI registers.

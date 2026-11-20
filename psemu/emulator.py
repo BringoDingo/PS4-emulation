@@ -949,7 +949,12 @@ class Emulator:
                     # "rdi:56": also dump that many bytes at the pointer in that argument register
                     try:
                         rn, n = spec.split(":")
+                        off = None
+                        if "." in rn:                        # "rdi.0x10:n": dump at the qword stored at [reg+0x10]
+                            rn, off = rn.split(".")
                         ptr = a[("rdi", "rsi", "rdx", "rcx", "r8", "r9").index(rn)]
+                        if off is not None:
+                            ptr = int.from_bytes(bytes(uc.mem_read(ptr + int(off, 0), 8)), "little")
                         emu.log(f"      {rn}={ptr:#x}: " + bytes(uc.mem_read(ptr, int(n, 0))).hex())
                     except Exception:
                         pass
