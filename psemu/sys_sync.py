@@ -483,7 +483,7 @@ class SyncSyscalls:
             if timeout_p:
                 self._wr32(self.emu.uc, timeout_p, 0)
         sched.block({"kind": "evf_wait", "evf": ef.handle, "name": ef.name, "bits": bits,
-                     "mode": mode, "result": result, "timeout_p": timeout_p,
+                     "mode": mode, "result": result, "timeout_p": timeout_p, "emu": self.emu,
                      "on_timeout": on_timeout},
                     deadline_ns=None if timeout_us is None else sched.now_ns() + timeout_us * 1000,
                     timeout_ret=(ETIMEDOUT, True))
@@ -544,13 +544,16 @@ class SyncSyscalls:
                 ef.waiters.remove(t)
                 continue
             if ef.satisfied(w["bits"], w["mode"]):
-                self._evf_result(uc, w["result"], ef.bits)
+                # a named flag is machine-wide: the waiter may belong to another process, whose address space
+                # receives the result (and whose scheduler is woken)
+                wemu = w.get("emu") or self.emu
+                self._evf_result(wemu.uc, w["result"], ef.bits)
                 if w["timeout_p"] and t.deadline is not None:
-                    left = max(0, t.deadline - sched.now_ns()) // 1000
-                    self._wr32(uc, w["timeout_p"], left)
+                    left = max(0, t.deadline - wemu.sched.now_ns()) // 1000
+                    self._wr32(wemu.uc, w["timeout_p"], left)
                 ef.consume(w["bits"], w["mode"])
                 ef.waiters.remove(t)
-                sched.wake(t, 0)
+                wemu.sched.wake(t, 0)
 
     def sys_evf_set(self, uc):
         h, bits = self._args(uc)[:2]
@@ -672,7 +675,7 @@ class SyncSyscalls:
             if timeout_p:
                 self._wr32(self.emu.uc, timeout_p, 0)
         sched.block({"kind": "sema_wait", "sema": sem.handle, "name": sem.name, "need": need,
-                     "timeout_p": timeout_p, "on_timeout": on_timeout},
+                     "timeout_p": timeout_p, "emu": self.emu, "on_timeout": on_timeout},
                     deadline_ns=None if timeout_us is None else sched.now_ns() + timeout_us * 1000,
                     timeout_ret=(ETIMEDOUT, True))
 

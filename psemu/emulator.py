@@ -59,6 +59,11 @@ def _align_down(x, a=PAGE4K):
 PROC_SLICE_S = 0.008
 IDLE = -1          # _run_segment result: every thread is waiting for another process
 
+
+# Guest time per host second (WHP backend). The emulated machine is far slower than the console, and the
+# shell's watchdogs (ShellCore kills a ShellUI whose heartbeat is 1.5 s late) count guest time: running the guest
+# clock slower than the wall clock gives the guest the same headroom a real console has. 1.0 = real time.
+TIME_SCALE = float(os.environ.get("PSEMU_TIME_SCALE", "1") or 1)
 
 class Emulator:
     PROC_SLICE = PROC_SLICE_S      # wall seconds a process runs before the next one gets the CPU
@@ -488,7 +493,7 @@ class Emulator:
         if self.whp:
             # no instruction counter on hardware: virtual time follows the wall clock, expressed
             # in "instructions" at the scheduler's NS_PER_INSN so now_ns() stays one formula
-            return int((self._time() - self._t0 - self._excl) * 1e9)
+            return int((self._time() - self._t0 - self._excl) * 1e9 * TIME_SCALE)
         n = self.native
         return n.s.count if n is not None else self._insn_py
 
@@ -1114,6 +1119,12 @@ class Emulator:
                 return None
             if self._stop_reason is None:
                 self._stop_reason = f"UcError: {e} at rip=0x{rip:x}"
+                try:                       # where in the emulator (a syscall handler, a hook) the access failed
+                    import traceback
+                    self.log("  [UcError] " + " <- ".join(
+                        f"{f.name}:{f.lineno}" for f in reversed(traceback.extract_tb(e.__traceback__)[-6:])))
+                except Exception:
+                    pass
             return None
         if native is not None:
             self.sched.slice_left -= ns.count - before

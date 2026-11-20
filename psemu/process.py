@@ -15,6 +15,9 @@ regression-tested before the harder pieces land.
 """
 
 
+import os
+
+
 class System:
     """Kernel state every process on the machine sees: one kernel-handle space and the named
     event flags / semaphores (the same Python object in every process's table, so a bit one process
@@ -79,6 +82,36 @@ class ProcessManager:
         emu.log = lambda *a, **k: plog(f"[{tag}]", *a)
         return self.add(emu)
 
+    def _process_gone(self, p):
+        """A process finished (or was terminated): its IPMI sessions and servers go away, and its parent's
+        EVFILT_PROC watch and wait4() see the exit."""
+        emu = p[0]
+        if getattr(emu, "_exit_told", False):
+            return
+        emu._exit_told = True
+        sysm = getattr(self, "system", None)
+        ipk = getattr(sysm, "ipmi", None)
+        if ipk is not None:
+            ipk.process_gone(emu)
+        for objs in ((sysm.evfs, sysm.sems) if sysm is not None else ()):      # its threads no longer wait on shared objects
+            for o in objs.values():
+                o.waiters[:] = [t for t in o.waiters
+                                if not (isinstance(t.wait, dict) and t.wait.get("emu") is emu)]
+        if getattr(emu, "parent", None) is not None:
+            parent = emu.parent
+            parent.syscalls.proc_event(parent.syscalls.NOTE_EXIT, 0, getattr(emu, "child_pid", 0))
+            parent.syscalls.child_done(getattr(emu, "child_pid", 0), 0)
+
+    def terminate(self, pid):
+        """sceKernelTerminateProcess: stop the process with this pid. True when there was one running."""
+        for p in self.procs:
+            if p[1] is not None and getattr(p[0], "child_pid", 0) == pid:
+                p[1] = None
+                p[0]._stop_reason = p[0]._stop_reason or f"terminated (pid {pid:#x})"
+                self._process_gone(p)
+                return True
+        return False
+
     def others_alive(self, emu):
         return any(p[0] is not emu and p[1] is not None for p in self.procs)
 
@@ -105,11 +138,8 @@ class ProcessManager:
                     progressed = True
             if p[1] is not None:
                 alive = True
-            elif getattr(p[0], "parent", None) is not None and not getattr(p[0], "_exit_told", False):
-                p[0]._exit_told = True           # a child process finished: its parent's proc watch fires
-                parent = p[0].parent
-                parent.syscalls.proc_event(parent.syscalls.NOTE_EXIT, 0, getattr(p[0], "child_pid", 0))
-                parent.syscalls.child_done(getattr(p[0], "child_pid", 0), 0)
+            else:
+                self._process_gone(p)
         for p in self.procs:                    # one wall-clock budget for the whole machine
             ms = p[0].max_seconds
             if p[1] is not None and ms is not None and p[0]._time() - p[0]._t0 >= ms:
@@ -151,6 +181,14 @@ class ProcessManager:
             pass
         for emu, _ in self.procs:
             print(f"  [sched] {emu.path.rsplit(chr(92),1)[-1]}: {getattr(emu,'_seg_wall',0):.1f} s in {getattr(emu,'_seg_n',0)} segments", flush=True)
+        if os.environ.get("PSEMU_SHM_DUMP"):          # PSEMU_SHM_DUMP=<name>: the first words of that shm object at exit
+            import ctypes
+            for name, o in getattr(self.system, "shm_objs", {}).items():
+                if o.get("host") and os.environ["PSEMU_SHM_DUMP"] in name:
+                    n = min(o["host_size"], 0x4000)
+                    raw = ctypes.string_at(o["host"], n)
+                    print(f"  [shm] {name}: {n:#x} bytes; +0 {raw[:32].hex()}; " +
+                          ("+0x3590 " + raw[0x3590:0x35b0].hex() if n > 0x35b0 else ""), flush=True)
         for emu, _ in self.procs:
             emu.end_run()
         return [emu._stop_reason for emu, _ in self.procs]

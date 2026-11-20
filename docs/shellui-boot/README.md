@@ -1276,3 +1276,30 @@ Open: shm objects created by one process are still a per-process stand-in in the
 process -> stand-in", 0x1000 bytes): ShellCore and ShellUI map `/ScePsmSharedDmem_00000000` separately, so nothing
 written through the shared dmem is visible to the other side; `sceKernelIccGetThermalAlert` -> 0x80020002 in a loop in
 ShellCore; `sceVisionManagerInitialize` 0x802e0000; `LOST PAD DATA` (no pad source yet in the spawned ShellUI).
+
+### 2026-11-19 (end 16): why the ShellUI dies after ~1.1 s, and what was fixed on the way
+* **Named shm objects are machine-wide** (`System.shm_objs`): one namespace, the same host pages mapped into every
+  process that opens the object (`Emulator.map_anon(host_ptr=...)`, `mem_map_ptr`). ShellCore and the ShellUI now see each
+  other's `/ScePsmSharedDmem_00000000`, `/SceShellCoreUtil`, `/SceCompositorControl` ... no more per-process stand-ins for
+  objects another process created.
+* **The thread that is hot at exit and the mutex owner** are in the end-of-run thread summary (`running at module+off`,
+  `owner=`); `PSEMU_SHM_DUMP=<substr>` dumps shm contents at exit.
+* **The ShellUI is killed by ShellCore's watchdog.** `SceShellCore+0x2f1b10` polls the LNC app record of the running ShellUI
+  (`0x328bc0`: record found by `[rec+0x88]==1`; pid at `+0`, heartbeat counter at `+0x3598`); when the counter has not changed for
+  1 s it logs "No heart beat of Shell UI has been observed for N msec" and, with its enable flag (`+0x28`, set by the
+  constructor `0x2f19c0`), "Killing Shell UI since HP3D has timed out" -> `BlockingKill` -> `SceSysCoreApp2 0xaa12000d` ->
+  `sceKernelTerminateProcess`. The counter is fed by a keep-alive the ShellUI sends to SceLncService (strings
+  `SCE_LNCUTIL_KEEP_ALIVE_SHELL_UI`); in our run the ShellUI does not send one within its first second (the real boot log
+  shows the same 1012 ms warning, then the keep-alive arrives). Not solved: find the keep-alive call and why it is late
+  (emulation speed vs a real missing dependency). `PSEMU_TIME_SCALE=<f>` (WHP) slows the guest clock against the wall
+  clock; at 0.1 the kill still came after the first 1 s window, so it is not only speed.
+* **Fixed because the relaunch exposed them:** `sceKernelTerminateProcess` (652) now really stops the process
+  (`ProcessManager.terminate`), so the killed ShellUI no longer keeps running next to its replacement; a finished or killed
+  process's IPMI sessions are closed (the server gets a type-3 disconnect packet: libSceIpmi's server loop dispatches 1 =
+  connect, 3 = disconnect, 0x41.. = requests) and its servers are removed - the restarted ShellUI was refused by
+  `SceCompAppProxyUtil` ("one client of type 2" slot still held); named event flags/semaphores are machine-wide, so a
+  waiter from another process is woken in its own address space (an `evf_set` in the new ShellUI wrote the dead one's
+  result pointer into the wrong address space: `UC_ERR_WRITE_UNMAPPED`) and dead processes' waiters are dropped.
+* **`SceSysAvControl` is a system process of the console** (mini-syscore starts it before SceSysCore): without it SceSysCore's
+  `[Syscore Umd] Timeout detected ... AV control server` also terminated the ShellUI. `--also <elf>` starts extra system
+  processes in spawn mode (`--also .../SceSysAvControl.elf`).

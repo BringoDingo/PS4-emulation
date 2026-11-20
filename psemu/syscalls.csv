@@ -49,7 +49,7 @@ number,ps4_exported_names,freebsd9_name,freebsd9_status,called_by,psemu_handler
 89,getdtablesize,,,sZuwaDPATKs,0
 90,_dup2 dup2,,,W8f1adVl+48 wdUufa9g-D8,1
 92,_fcntl fcntl,,,8nY19bKoiZk t0fXUzq61Z4,0
-93,,,,,0
+93,select,,,,0
 95,,,,,0
 96,setpriority,,,TUC9xC1YQjs,0
 97,socket,,,TU-d9PfIHPM,0

@@ -169,6 +169,22 @@ class IpmiKernel:
         if result_ptr:
             uc.mem_write(result_ptr, struct.pack("<I", 0))
 
+    PKT_DISCONNECT = 0x03          # libSceIpmi's server loop: type 3 = the client's session is gone (SendDisconnectRes)
+
+    def process_gone(self, emu):
+        """A process ended: the sessions of its clients are closed (the server gets a disconnect packet and frees
+        the slot - a restarted ShellUI is otherwise refused as a second client) and the servers it hosted vanish."""
+        for sid, sess in list(self.sessions.items()):
+            if sess.client_emu is emu and sess.state in ("connected", "connecting") and sess.server.emu is not emu:
+                data = struct.pack("<Q", getattr(sess, "ctx", 0)) + bytes(0x40)
+                self._enqueue(sess.server, self.PKT_DISCONNECT, sid, data)
+                self.log(f"  [ipmi-k] client process of session {sid:#x} ({sess.server.name}) ended: disconnect queued")
+                sess.state = "closed"
+        for name, srv in list(self.servers.items()):
+            if srv.emu is emu:
+                del self.servers[name]
+                self.log(f"  [ipmi-k] server '{name}' went away with its process")
+
     def _enqueue(self, srv, ptype, sid, data):
         pkt = (ptype, sid, data)
         if srv.waiters:

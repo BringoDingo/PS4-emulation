@@ -42,6 +42,9 @@ def main():
     ap.add_argument("--max-seconds", type=float, default=None,
                     help="wall-clock budget; the stop condition on --backend whp, where there "
                          "is no instruction count")
+    ap.add_argument("--also", action="append", default=[], metavar="ELF",
+                    help="spawn mode: start this system process next to the first one (the console's init "
+                         "program, mini-syscore, starts SceSysAvControl before SceSysCore)")
     ap.add_argument("--then", default=None, metavar="APP_EBOOT",
                     help="whp: after the first process (SceSysCore) has initialized its core "
                          "services, chain-load this app (e.g. .../NPXS20001/eboot.bin)")
@@ -75,6 +78,9 @@ def main():
         from .process import ProcessManager
         pm = ProcessManager()
         pm.add(emu, start)
+        for extra in args.also:
+            child = pm.spawn(emu, extra, [extra])
+            child.child_pid = pm.system.alloc_pid()
         pm.run()
     else:
         emu.run(start=start)

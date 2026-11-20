@@ -98,7 +98,7 @@ SYSCALLS = {
     454: "_umtx_op", 477: "mmap", 478: "lseek",
     # Sony / ORBIS specific (names best-effort; numbers vary by firmware)
     532: "regmgr_call", 572: "virtual_query", 533: "rtprio_thread", 557: "namedobj_create",
-    587: "get_authinfo", 599: "mdbg_service", 603: "rdup",
+    587: "get_authinfo", 652: "terminate_process", 599: "mdbg_service", 603: "rdup",
 }
 
 
@@ -1382,6 +1382,16 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         except Exception:
             return self._ret(uc, EFAULT, error=True)
         self._ret(uc, 0)
+
+    def sys_terminate_process(self, uc):
+        # sceKernelTerminateProcess(pid, ...): SceSysCore kills an application (the ShellCore watchdog restarts a
+        # ShellUI that stopped heart-beating). Unmodelled it "succeeded" while the process kept running.
+        pid = self._args(uc)[0] & 0xFFFFFFFF
+        mgr = getattr(self.emu, "manager", None)
+        if mgr is not None and mgr.terminate(pid):
+            self.emu.log(f"  [terminate] process {pid:#x} stopped")
+            return self._ret(uc, 0)
+        self._ret(uc, 3, error=True)          # ESRCH
 
     def sys_mdbg_call(self, uc):
         # mdbg_call(a, b, c, ...): the kernel's debugger-service call; not modelled (returns 0). A thread that

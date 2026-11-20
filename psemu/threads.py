@@ -289,10 +289,27 @@ class Scheduler:
     def describe(self):
         def what(w):
             if isinstance(w, dict):
-                return ", ".join(f"{k}={v:#x}" if isinstance(v, int) else f"{k}={v}"
-                                 for k, v in w.items() if not callable(v))
+                txt = ", ".join(f"{k}={v:#x}" if isinstance(v, int) else f"{k}={v}"
+                                for k, v in w.items() if not callable(v))
+                if w.get("kind") in ("mutex_wait", "mutex_lock") and isinstance(w.get("addr"), int):
+                    try:                      # struct umutex: u32 owner tid at +0
+                        txt += ", owner=%#x" % int.from_bytes(bytes(self.emu.uc.mem_read(w["addr"], 4)), "little")
+                    except Exception:
+                        pass
+                return txt
             return str(w)
-        return "; ".join(f"{t.tid:#x} {t.name}: {t.state}" +
+        def where(t):
+            # the thread that is on the CPU when the run ends: say where (module+offset)
+            if t is not self.current or t.state != RUNNING:
+                return ""
+            try:
+                from unicorn.x86_const import UC_X86_REG_RIP
+                rip = self.emu.uc.reg_read(UC_X86_REG_RIP)
+                m = self.emu.dyn.module_at(rip) if getattr(self.emu, "dyn", None) else None
+                return f" at {m.name}+{rip - m.base:#x}" if m else f" at {rip:#x}"
+            except Exception:
+                return ""
+        return "; ".join(f"{t.tid:#x} {t.name}: {t.state}" + where(t) +
                          (f" ({what(t.wait)})" if t.wait else "")
                          for t in self.threads.values())
 
