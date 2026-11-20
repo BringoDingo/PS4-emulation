@@ -566,6 +566,8 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                     uc.mem_write(buf, chunk)
             except Exception:
                 return self._ret(uc, EFAULT, error=True)
+            if os.environ.get("PSEMU_TRACE_READ") and str(f.get("path", "")).endswith(os.environ["PSEMU_TRACE_READ"]):
+                self.emu.log(f"  [read-trace] fd {fd} pos {f['pos']:#x} n {n & 0xFFFFFFFF:#x} -> {chunk[:24].hex()}")
             f["pos"] += len(chunk)
             return self._ret(uc, len(chunk))
         # no real input source yet -> EOF

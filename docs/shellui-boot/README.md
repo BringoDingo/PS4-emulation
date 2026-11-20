@@ -1204,3 +1204,23 @@ Next step (not done): implement `/dev/mbus` as a real event source (needs the 0x
 Next: trace the return values and effects of `0x6e430`, `0x6cd30`, `0x6c500`, `0x88370`, `0x8a110` inside `0x5e420`
 (a type-1/2 module record is created there; the group entry's module field must become 7 at that point) and compare
 with what `0xce11000d` searches.
+
+### 2026-11-19 (end 12): trace of the registration path - the per-pid module entries come from app_info.dat rows
+(Tracer now logs the return address `ra`; `PSEMU_TRACE_READ=<name suffix>` logs every read of a file with
+position, length and first bytes.)
+* `0x5e420` (the flag-0 registration of `0xce110007`) only records global module/state groups
+  (`0x6cd30`/`0x6c500`/`0x88370`/`0x8a110`; `0x5f7b0` is a no-op for types 1/2). It never sees the pid, so it
+  cannot create the `{pid, module}` entries the lookup needs. Registration is not where module 7 gets attached.
+* The per-process entries are created at spawn by `0x4e110` (= mbusAddProcess; called from `0x4e0b9`/`0x8141e`,
+  args `(appId, pid, type, ..., &appParam)`; for ShellUI `type 2`, appParam byte 5 = the app type, matching the real
+  log's `appType = 0x5` for NPXS20001). It asks `0x56640(table, appType, out)` for the app type's module list and
+  registers one `{pid, module}` entry per element (`0x59bd0` + `0x76ca0`), module = u32 at +0 of each 0x18-byte node
+  (`0x57980`). The global `[0x5ceb58]` = 0x10d (set from the dat header by `0x56e50`) only selects the path.
+* In our run the node list for app type 5 (and for ShellCore's type 0) contains module **0**, so the entries are
+  `{pid, 0}`. A real ShellUI must get module 7 here (the dat holds elements `{kind 2, 7, 1}` = 0x107).
+* The dat is parsed without a logged error (12 `readModuleInfo` calls, 21 `setModuleInfo`, 100 `0x57800`, 367
+  element writes `0x57120`, all reads are plain sequential file reads with the expected bytes - verified with
+  `PSEMU_TRACE_READ`). So the zeros are produced by the parse code itself on our run, not by a failed read.
+Next: follow `0x57800`/`0x578e0`/`0x57120`/`0x57980` for the app-type-5 row: which element is written into the list
+that `0x57980` later copies (it reads u32 +0 of stride-0x18 nodes at `[row+8]`, the parse writes stride-0x10
+elements) - find which row the parse writes the module elements into and why the type-5 row stays empty.
