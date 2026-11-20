@@ -1184,3 +1184,23 @@ Next step (not done): implement `/dev/mbus` as a real event source (needs the 0x
   way (not a kernel event). The module-7 gap is therefore not closed by delivering events alone; the registry's
   producer (callers of `0x5ffd0`'s add counterpart, probably an IPMI method from another system process) is the
   next thing to find. No guessed events are delivered by default.
+
+### 2026-11-19 (end 11): where the Mbus device/module registry comes from (investigation, not solved)
+* SceSysCore reads `/system_ex/mbus/app_info.dat` (8472 B, a serialized dump of the module tables, contains module
+  `0x107` at 0x17c and 0x540) at start-up through `readModuleInfo` (`0x56a10`: 0x18-byte header, 0x10-byte
+  records via `read()`), filling `setModuleInfo`/`setModuleStateInfo` (`0x573a0`, `0x57800`). Those reads happen in
+  our run (tid 0x10001, many small reads); nothing failed visibly.
+* Process entries are created by SceSysCore itself at spawn: `0x16360` (called from `0x14ed8`/`0x16b87`, args
+  `(table, pid, flag byte)`) runs for ShellCore (pid 0x3eb) and ShellUI (0x3f0).
+* No function in `0x5e000-0x68000` runs except `0x5e420` (the type/state registrar used by `0xce110007` while the
+  Mbus init flag is 0), and no event/IPMI method on our path calls `registerDevice` (`0x61990`, callers `0x50196`,
+  `0x681e4`), `connectDevice` (`0x61590`, callers inside `0x5e420`'s family), `mbusOnDeviceAttach` (`0x50110`,
+  caller `0x74d3c` = the kernel-event code `addDevice` path) or `mbusAddProcess` (`0x4ea20`, no direct callers).
+* The lazy Mbus init is triggered by the *first LoginMgr call*: handlers `0x46290` = `mbusDeviceBindingModeDecided`,
+  `0x466e0` = `mbusResolveByUserId`, `0x47ac0` = `mbusSetUserColor` (we reach it through `0xce11003b`); so on
+  hardware too the registrations (`0xce110007`) precede the init, and the lookup `0xce11000d` must be satisfied by
+  what `0x5e420` records, not by the group tables built at init. In our run `0x5e420` is entered for type 1 and 2
+  but the group lookup (`0x79890`) still sees entries with module 0.
+Next: trace the return values and effects of `0x6e430`, `0x6cd30`, `0x6c500`, `0x88370`, `0x8a110` inside `0x5e420`
+(a type-1/2 module record is created there; the group entry's module field must become 7 at that point) and compare
+with what `0xce11000d` searches.
