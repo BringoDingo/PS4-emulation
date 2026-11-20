@@ -267,7 +267,7 @@ class Emulator:
                 return True
         return False
 
-    def map_anon(self, size, addr_hint=0, prot=None, align=0):
+    def map_anon(self, size, addr_hint=0, prot=None, align=0, host_ptr=None):
         """Map `size` bytes of anonymous RWX memory, honouring addr_hint when
         it is free and page-aligned, otherwise bump-allocating. `align` (a power of two)
         forces the address to that alignment (an unaligned hint is ignored). Returns the
@@ -304,7 +304,10 @@ class Emulator:
             addr = a
             self._mmap_next = a + size
         try:
-            self.vm.map(addr, size, prot)
+            if host_ptr:                    # the pages of a machine-wide shared object (shm_open)
+                self.uc.mem_map_ptr(addr, size, prot, host_ptr)
+            else:
+                self.vm.map(addr, size, prot)
         except Exception as e:
             self.log(f"  [mmap] mem_map failed: {e}")
             return 0xFFFFFFFFFFFFFFFF

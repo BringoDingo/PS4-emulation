@@ -249,7 +249,8 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         self.dirfds = set()       # fds opened on a directory
         self._cil_cache = {}      # .dll path -> CIL bytes extracted from .dll.sprx
         self.shms = {}            # fd -> shared-memory object (shm_open)
-        self.shm_objs = {}        # name -> {"name", "size", "addr"} POSIX shm objects
+        self._shm_local = {}      # name -> {"name", "size", ...} POSIX shm objects (single process; see shm_objs)
+        self.shm_maps = {}        # name -> (addr, span): where THIS process mapped each object
         self.vmas = []            # mmapped ranges (see _add_vma), for virtual_query
         self.knotes = {}          # kq fd -> {(ident, filter): knote dict}
         self.kq_pending = {}      # kq fd -> [(ident, filter)] triggered, not yet returned
@@ -2110,6 +2111,15 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     # get a one-page stand-in, like external event flags and semaphores.
     SHM_DEFAULT_SIZE = 0x1000
 
+    @property
+    def shm_objs(self):
+        """The named shm objects: machine-wide when several processes run (their pages are shared host
+        memory mapped into every address space), else this process's own."""
+        sysm = getattr(self.emu, "system", None)
+        if sysm is not None:
+            return sysm.shm_objs
+        return self._shm_local
+
     def sys_shm_open(self, uc):
         path_ptr, flags, mode = self._args(uc)[:3]
         flags &= 0xFFFFFFFF
@@ -2129,6 +2139,25 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         self.emu.log(f"  [shm_open] '{name}' flags={flags:#x} -> fd {fd} "
                      f"size={obj['size']:#x}{note}")
         self._ret(uc, fd)
+
+    def _shm_host(self, obj, span):
+        """Host memory (page aligned, zeroed) behind a shm object, at least `span` bytes: the same pages are mapped
+        into every process that maps the object. Growing it copies the old contents."""
+        import ctypes
+        host, hsize = obj.get("host"), obj.get("host_size", 0)
+        if host is None or hsize < span:
+            try:
+                from .whp_uc import _valloc
+                new = _valloc(span)
+            except Exception:
+                buf = (ctypes.c_ubyte * (span + 0x1000))()
+                obj.setdefault("_keep", []).append(buf)
+                new = (ctypes.addressof(buf) + 0xFFF) & ~0xFFF
+            if host is not None:
+                ctypes.memmove(new, host, hsize)
+            obj["host"], obj["host_size"] = new, span
+            host = new
+        return host
 
     def sys_ftruncate(self, uc):
         fd, length = self._args(uc)[:2]
@@ -2355,23 +2384,27 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
         dev = self.devs.get(fd) if not flags & MAP_ANON else None
         shm = self.shms.get(fd) if not flags & MAP_ANON else None
         if shm is not None:
-            if shm["addr"] is None:
+            span = (max(length, shm["size"], 0x1000) + 0x3FFF) & ~0x3FFF
+            mine = self.shm_maps.get(id(shm))
+            if mine is None or span > mine[1]:
                 # Orbis maps with 16 KiB granularity: a 0xf28-byte shm still covers 0x4000 bytes.
                 # libSceAudioOut relies on it: its per-port table (8 x 0x250 bytes at +0x20 of a
                 # 0xf28-byte block) reaches past the first 4 KiB page.
-                span = (max(length, shm["size"], 0x1000) + 0x3FFF) & ~0x3FFF
                 # Always read+write: later mappers of the same object may ask
                 # for more access than the first one did (client maps it
                 # read-only, the owner read-write) and all share this memory.
-                got = self.emu.map_anon(span, addr_hint=addr,
-                                        prot=UC_PROT_READ | UC_PROT_WRITE)
+                host = self._shm_host(shm, span)
+                got = self.emu.map_anon(span, addr_hint=addr, prot=UC_PROT_READ | UC_PROT_WRITE,
+                                        host_ptr=host)
                 if got == 0xFFFFFFFFFFFFFFFF:
                     return self._ret(uc, ENOMEM, error=True)
-                shm["addr"], shm["span"] = got, span
+                mine = (got, span)
+                self.shm_maps[id(shm)] = mine
+                shm["addr"], shm["span"] = got, span          # (the last mapper's; kept for the old checks)
                 self._add_vma(got, span, prot, flags, 0, False)
-            if length <= shm.get("span", 0):
-                self.emu.log(f"  [mmap] shm '{shm['name']}' -> 0x{shm['addr']:x} (len={length:#x})")
-                return self._ret(uc, shm["addr"])
+            if length <= mine[1]:
+                self.emu.log(f"  [mmap] shm '{shm['name']}' -> 0x{mine[0]:x} (len={length:#x})")
+                return self._ret(uc, mine[0])
         fil = self.files.get(fd) if not flags & MAP_ANON else None
         if fil is not None:
             # File-backed mmap: anonymous pages with the file's bytes copied in
@@ -2787,7 +2820,8 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     def sys_munmap(self, uc):
         addr, length, *_ = self._args(uc)
         for obj in list(self.shm_objs.values()) + list(self.shms.values()):
-            if obj.get("addr") is not None and obj["addr"] <= addr < obj["addr"] + obj["span"]:
+            mine = self.shm_maps.get(id(obj))
+            if mine is not None and mine[0] <= addr < mine[0] + mine[1]:
                 # A shared-memory object's pages belong to the object, not to
                 # one mapper: keep them so its contents survive and the next
                 # mmap of the object sees the same memory.
