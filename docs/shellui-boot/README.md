@@ -1259,3 +1259,20 @@ Three causes, all unmodelled kernel behaviour, fixed:
 New debug aids: `PSEMU_TID_COUNTS=1` (per-thread syscall histogram for threads above 2000 calls in the summary).
 Effect: SceSysCore 80 s -> 18 s of a 120 s run, the ShellUI 9 s -> 41 s; it now loads `BlankScene` and
 `TransitionScene` (`UISystem` initialised). Single-process chain unchanged (9000 command buffers, 0 failed).
+
+### 2026-11-19 (end 15): the ShellUI's authority id; PsmSharedDmem serves it; the UI loads its scenes
+* ShellCore's `ScePsmSharedDmem` server (Create `0x34560000`, Lock `0x34560003`) only serves a caller whose
+  `get_authinfo` authority id is the ShellUI's: `SceShellCore+0x612a70` compares it with `0x380000000000000f`. psemu
+  answered the generic `0x38000000000000ff` for every non-ShellCore process, so the ShellUI's first call was refused
+  (`0x81668204`, "LockSharedDmem: SharedMemory is not created"). Now `AUTHORITY_IDS_BY_TITLE` gives NPXS20001 (looked up
+  through the process's `app_root`) `0x380000000000000f`; Create makes `/ScePsmSharedDmem_00000000`, Lock returns 0.
+* The ShellUI now loads its whole scene list (BlankScene, TransitionScene, PSMenu, QuickMenu, SystemFG,
+  Notification, VoiceRecognition, SystemOverlay, TopMenuBG, Navigation, StackScene, ShellAppBG, ShellAppScreen,
+  SystemErrorDialog). It ends the run waiting in `sceVisionManagerInitialize -> 0x802e0000` (no camera) with the main
+  thread on a mutex.
+* What stopped other processes in the run (all known, unchanged): coredump.elf `unmapped 19 at 0x4300203a40f5`;
+  SceVdecProxy `int 0x44` (/dev/uvd); SceVencProxy `exit(-1)`; fs_cleaner `exit(0)`.
+Open: shm objects created by one process are still a per-process stand-in in the others ("owned by another system
+process -> stand-in", 0x1000 bytes): ShellCore and ShellUI map `/ScePsmSharedDmem_00000000` separately, so nothing
+written through the shared dmem is visible to the other side; `sceKernelIccGetThermalAlert` -> 0x80020002 in a loop in
+ShellCore; `sceVisionManagerInitialize` 0x802e0000; `LOST PAD DATA` (no pad source yet in the spawned ShellUI).

@@ -2292,6 +2292,11 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
     AUTHORITY_IDS = {
         "sceshellcore": 0x3800000000000010,
     }
+    # system applications (all run as eboot.bin) by title id: ShellCore's PsmSharedDmem service only serves a
+    # caller whose authority id is the ShellUI's (SceShellCore+0x612a70 compares it with 0x380000000000000f)
+    AUTHORITY_IDS_BY_TITLE = {
+        "npxs20001": 0x380000000000000F,
+    }
     DEFAULT_AUTHORITY_ID = 0x38000000000000FF
 
     def sys_get_authinfo(self, uc):
@@ -2315,7 +2320,8 @@ class SyscallDispatcher(DynlibSyscalls, SyncSyscalls):
                 if getattr(q[0], 'child_pid', 0) == _pid:
                     target = q[0]
         name = os.path.splitext(os.path.basename(getattr(target, "path", "") or ""))[0].lower()
-        paid = self.AUTHORITY_IDS.get(name, self.DEFAULT_AUTHORITY_ID)
+        title = os.path.basename(str(getattr(target, "app_root", "") or "").rstrip("/\\")).lower()
+        paid = self.AUTHORITY_IDS_BY_TITLE.get(title) or self.AUTHORITY_IDS.get(name, self.DEFAULT_AUTHORITY_ID)
         if __import__('os').environ.get('PSEMU_IPMI_TRACE'):
             self.emu.log(f'  [authinfo] pid {_pid & 0xFFFFFFFF} -> {name} paid {paid:#x}')
         caps = [0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0, 0]
