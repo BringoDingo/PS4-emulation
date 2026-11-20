@@ -168,14 +168,14 @@ class Scheduler:
             from unicorn.x86_const import UC_X86_REG_RSP
             uc = self.emu.uc
             rsp = uc.reg_read(UC_X86_REG_RSP)
-            words = _s.unpack("<64Q", bytes(uc.mem_read(rsp, 512)))
+            words = _s.unpack("<256Q", bytes(uc.mem_read(rsp, 2048)))
             dyn = getattr(self.emu, "dyn", None)
             where = []
             for w in words:
                 m = dyn.module_at(w) if dyn is not None and 0x10000 < w < 0x7fffffffffff else None
                 if m:
                     where.append(f"{m.name}+{w - m.base:#x}")
-                if len(where) >= 6:
+                if len(where) >= int(_os.environ.get("PSEMU_BLOCK_FRAMES", "6")):
                     break
             kind = what.get("kind") if isinstance(what, dict) else what
             nm = (what.get("name") or what.get("addr") or "") if isinstance(what, dict) else ""

@@ -1348,3 +1348,24 @@ and answer it.
   time for what the console does in ~1 s.
 * **Next stall** (still killed at ~1.0 s of guest time): right after "Mount finished" the main thread blocks in an IPMI call to
   `SceUserService` (from `libSceUserService`, via `app.exe.sprx`), then in a Mono `sem_wait`; the keep-alive stops again.
+
+### 2026-11-20 (end 3): the SceUserService call is not what stalls the ShellUI
+(`PSEMU_TRACE_REGS="rax,r12"` prints extra registers at a hook; `PSEMU_TRACE_SEMA_ALL=1` logs every keep-alive post/poll;
+`PSEMU_BLOCK_FRAMES=n` sets the stack depth of block traces.)
+* **Every SceUserService request the ShellUI makes is answered within 1-2 ms of guest time** (0x3000f, 0x3000c, 0x30008,
+  0x30006, 0x30004, 0x3000d). The "blocked in ipmi_invoke SceUserService" at the end of the first second was just the call in
+  flight when the watchdog fired.
+* **The watchdog's real timeline** (guest clock 100x slow, hook at `SceShellCore+0x2f1c6b`, regs `rax` = last good heartbeat,
+  `r12` = now): ShellCore posts the keep-alive semaphore every 100 ms; each post that succeeds (the ShellUI took the previous
+  token) resets the timer. Resets at vt 0.399, 0.600, 0.700, 0.801, 0.901, 1.001; from 1.001 on every post fails (nobody
+  polls) and the kill comes 1.001 s later, at vt ~2.0. So the keep-alive was healthy for ~0.6 s of guest time and then the
+  ShellUI main thread stopped ticking at vt ~1.0 - it did not miss its first heartbeat.
+* **What the main thread does at vt ~1.0:** after the last UserService call (0x3000d, from managed
+  `Sce.Vsh.UserServiceWrapper` -> `app.exe`) it enters a Mono-internal semaphore wait with no usable timeout
+  (`libmonosgen+0x4e78d0 <- 0x13f12b <- 0x4dc720 <- 0x4eabf8 <- 0x247d41 <- 0x21e3d8`) and never returns; other ShellUI threads
+  are all parked (cv/sem/evf/IPMI waits). Candidate cause: the one UserService answer that is an error - `0x30002` (a
+  registration with the names "User1" / "sceUserServ...", in=2 chunks) returns `0x80960001` (SCE_USER_SERVICE_ERROR_NOT_
+  INITIALIZED) from ShellCore's own server at vt 0.503. A failed event-callback registration would leave the managed side
+  waiting for an event that can never arrive.
+Next: why ShellCore's UserService server answers 0x30002 with NOT_INITIALIZED (what state it expects before it: the client's
+init / user-login sequence), and whether the managed side's wait is for that registration.

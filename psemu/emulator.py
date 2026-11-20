@@ -954,6 +954,16 @@ class Emulator:
                 ra = _s.unpack("<Q", bytes(uc.mem_read(rsp, 8)))[0]
                 emu.log(f"  [trace {label}] vt {emu.sched.now_ns() / 1e9:.3f}s tid {tid:#x} ra {ra:#x} args " + " ".join(f"{x:#x}" for x in a)
                         + " stack " + " ".join(f"{x:#x}" for x in st))
+                rn_env = os.environ.get("PSEMU_TRACE_REGS", "")     # e.g. "rax,r12,rcx": extra registers at the hook
+                if rn_env:
+                    import unicorn.x86_const as _xc
+                    vals = []
+                    for rn_ in rn_env.split(","):
+                        try:
+                            vals.append(f"{rn_}={uc.reg_read(getattr(_xc, 'UC_X86_REG_' + rn_.upper())):#x}")
+                        except Exception:
+                            pass
+                    emu.log("      regs " + " ".join(vals))
                 for spec in os.environ.get("PSEMU_TRACE_MEM", "").split(","):
                     # "rdi:56": also dump that many bytes at the pointer in that argument register
                     try:

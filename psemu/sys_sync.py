@@ -687,7 +687,7 @@ class SyncSyscalls:
             th = self.emu.sched.current
             n = self.__dict__.setdefault("_semtr", {}).setdefault((what, note), 0) + 1
             self._semtr[(what, note)] = n
-            if n <= 5 or n % 50 == 0:
+            if n <= 5 or n % 50 == 0 or os.environ.get("PSEMU_TRACE_SEMA_ALL"):
                 self.emu.log(f"  [sema] {what} '{sem.name}' {note} by tid {th.tid:#x} at vt {self.emu.sched.now_ns() / 1e9:.3f}s (#{n})")
 
     def sys_osem_trywait(self, uc):
