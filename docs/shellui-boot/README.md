@@ -1369,3 +1369,21 @@ and answer it.
   waiting for an event that can never arrive.
 Next: why ShellCore's UserService server answers 0x30002 with NOT_INITIALIZED (what state it expects before it: the client's
 init / user-login sequence), and whether the managed side's wait is for that registration.
+
+### 2026-11-20 (end 4): why the ShellUI's UserService registration fails - the console has no user
+* ShellCore's own `SceUserService` server (the real one, now that processes talk over IPMI) reports **no user at all**:
+  `0x3000f` (GetUserIdList) returns twenty `-1`, `0x3000c` (GetForegroundUser) returns `-1`. The single-process HLE used to
+  hide this by reporting one placeholder user ("Player1", `_ipmi_user_id_list`).
+* Why it is empty: ShellCore reads `/system_data/priv/home/user_list.dat`, finds nothing (first boot), and writes a fresh
+  empty 72-byte list (`0x40`-byte header + two u32). Per-user data would live under `/user/home/%08x/` (savedata, mms, trophy,
+  webkit ...). On a real console a user exists from the first-time setup; in the real boot log the ShellUI registers
+  `userId(0x10000000)` for its notification tables and later prints `#LOGIN MGR# ... UserId:0x000000ff` (no one logged in).
+* The failing request is `SceUserService.0x30002`, sent by the libSceUserService function at `+0x2c90` -> `+0x530`
+  (`{int userId = 0; u64; u8 flag}` + a 17-byte NUL-terminated name buffer holding "User1"): userId 0 is not in ShellCore's
+  empty user table, so the server answers `0x80960001` (user service not initialized / unknown user).
+* **Files are not shared between processes**: `SyscallDispatcher.vfs` (the in-memory file system for created and modified files)
+  is per process, so a file one process writes (`user_list.dat`, anything under `/user`, `/system_data`) is invisible to the others.
+  That has to become machine-wide (on `System`, like the shm objects) for ShellCore and the ShellUI to agree on users.
+Next: (1) make the virtual file system machine-wide; (2) give the console its first user through the real path - either seed
+a `user_list.dat` + `/user/home/<id>` in the format ShellCore writes, or find what makes ShellCore accept the creation
+request - and check that the ShellUI's main thread then gets past the Mono wait.
