@@ -1399,3 +1399,23 @@ request - and check that the ShellUI's main thread then gets past the Mono wait.
   (speed).
 Open: the "DbCorruptionOccured 0x809c112c //priv/mms/notification.db" message of the recovery scene (the notification db is
 created per process from a seed), and what the first-boot recovery/preparation does next.
+
+### 2026-11-20 (end 6): the DbRecoveryScene is a symptom - the managed DB accessor cannot use sqlite3
+* **The recovery scene is the "rebuild a corrupted database" UI.** Over a 360 s run (clock 100x slow) the ShellUI sits in
+  `DbRecoveryScene : Alive` with nothing happening: no progress, no watchdog kill, no further scene. It is shown because
+  `[DbItemAccessor] err = SCE_DBRECOVERY_ERROR_POPUP_ACCESSOR_ERROR (0x809C112C) DbFilePath = //priv/mms/notification.db` made
+  `dbRecoverySetCorruptionFlag` mark the database corrupt (a `notification.db-corrupt` marker file is written) - the database
+  itself is a normal freshly created sqlite file (4-8 KB, journal written and unlinked).
+* **Why the accessor fails (managed code -> native sqlite3).** `Sce.Vsh.Db.Shared.ConnectionManager` opens the database through
+  `Sce.Vsh.SQLite` / `Mono.Data.Sqlite`, which `DllImport("sqlite3")`. Mono resolves that through the PSM fallback loader:
+  `libScePsm` registers `mono_dl_fallback_register` (open `libScePsm+0x1dbb80`, symbol `+0x1dbd80`) once per native library, and
+  the eboot adds ~110 more tables (libSceBootManager, ..., `sqlite3`, `sqlite_aux`, ...); the sqlite3 table's names are in the
+  eboot's rodata (`sqlite3_open`, `sqlite3_open_v2`, ...). Each `mono_dl_open` of a name (`./lib/libsqlite3`, `libsqlite3`,
+  `libsqlite3.so`, `sqlite3`) calls the open callback ~60 times (once per table; 9,400 calls in a 120 s run), and the symbol
+  callback is then asked for `sqlite3_open_v2`, `sqlite3_busy_timeout`, `sqlite3_prepare_v2`, `sqlite3_errmsg16` ... with the
+  sqlite3 table as user data. After that Mono still probes `libsqlite3.la`/`libsqlite3.so.la` on disk (six ENOENT opens), i.e.
+  at least one lookup came back empty. Not yet established: which one, and why (the tracer does not log return values yet).
+* Open questions: does the open callback return a handle for `sqlite3`; does the table's function-pointer column hold the
+  eboot's own sqlite code or imports that psemu leaves unresolved?
+Next: add return-value logging to the function tracer (hook the return address), run it on the open/symbol callbacks for the sqlite3
+table, then make the lookup succeed (the table's functions exist inside the eboot, which already runs sqlite natively for AppDb).
